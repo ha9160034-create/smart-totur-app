@@ -1,9 +1,7 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -12,7 +10,14 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
+import {
+  setAudioModeAsync,
+  useAudioPlayer,
+  useAudioPlayerStatus,
+} from "expo-audio";
 import { SmartBoardCanvas } from "./src/components/SmartBoardCanvas";
 import type { ExplainSlideResponse } from "./src/types/schema";
 
@@ -20,10 +25,11 @@ import type { ExplainSlideResponse } from "./src/types/schema";
 // Configuration: Replace with your machine's LAN IP (run backend with --host 0.0.0.0)
 // Android Emulator can use "http://10.0.2.2:8000"
 // ---------------------------------------------------------------------------
-const API_BASE_URL = "http://YOUR_LOCAL_IP:8000";
-const REQUEST_TIMEOUT_MS = 60_000;
+const API_BASE_URL = "http://192.168.0.138:8000";
+const REQUEST_TIMEOUT_MS = 90_000;
 
 type BoardMode = "auto" | "whiteboard" | "pdf_overlay";
+type PlaybackSpeed = 1.0 | 1.25 | 1.5;
 
 interface PickedPdf {
   uri: string;
@@ -31,11 +37,22 @@ interface PickedPdf {
   mimeType: string;
 }
 
+interface StepAudioPayload {
+  step_id: number;
+  audio_base64: string | null;
+}
+
+interface ExplainSlideWithAudioResponse extends ExplainSlideResponse {
+  step_audio?: StepAudioPayload[];
+}
+
 const BOARD_MODES: Array<{ value: BoardMode; label: string }> = [
   { value: "auto", label: "Auto" },
   { value: "pdf_overlay", label: "PDF Overlay" },
   { value: "whiteboard", label: "Whiteboard" },
 ];
+
+const PLAYBACK_SPEEDS: PlaybackSpeed[] = [1.0, 1.25, 1.5];
 
 export default function App() {
   const [pdfFile, setPdfFile] = useState<PickedPdf | null>(null);
@@ -45,16 +62,173 @@ export default function App() {
 
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ExplainSlideResponse | null>(null);
+  const [result, setResult] = useState<ExplainSlideWithAudioResponse | null>(
+    null
+  );
   const [stepIndex, setStepIndex] = useState<number>(0);
+
+  // Audio-Visual Sync Engine State (expo-audio)
+  const player = useAudioPlayer(null);
+  const status = useAudioPlayerStatus(player);
+  const [audioLoading, setAudioLoading] = useState<boolean>(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(1.0);
+  const [replayToken, setReplayToken] = useState<number>(0);
+
+  const loadGenRef = useRef<number>(0);
+  const handledFinishGenRef = useRef<number>(-1);
+  const playbackSpeedRef = useRef<PlaybackSpeed>(1.0);
 
   const steps = result?.plan.steps ?? [];
   const currentStep = steps[stepIndex] ?? null;
+
+  const currentStepAudioB64 = useMemo(() => {
+    if (!result || !currentStep) return null;
+    const byIndex = result.step_audio?.[stepIndex];
+    if (byIndex?.audio_base64) return byIndex.audio_base64;
+    const byId = result.step_audio?.find(
+      (item) => item.step_id === currentStep.step_id
+    );
+    return byId?.audio_base64 ?? null;
+  }, [result, currentStep, stepIndex]);
 
   const slideAspectRatio = useMemo(() => {
     if (!result || result.slide_height <= 0) return 16 / 9;
     return result.slide_width / result.slide_height;
   }, [result]);
+
+  // Configure expo-audio session on mount so iOS plays audio even with mute switch on
+  useEffect(() => {
+    setAudioModeAsync({ playsInSilentMode: true }).catch(() => {
+      // Non-fatal if audio mode configuration is restricted
+    });
+  }, []);
+
+  // Write current step's Base64 MP3 to cache and play via expo-audio in sync with SmartBoardCanvas
+  useEffect(() => {
+    const gen = ++loadGenRef.current;
+    handledFinishGenRef.current = -1;
+    let cancelled = false;
+
+    const loadAndPlayStepAudio = async () => {
+      try {
+        player.pause();
+      } catch {
+        // Ignore if player has no loaded source yet
+      }
+
+      if (!currentStep || !currentStepAudioB64) {
+        if (!cancelled && gen === loadGenRef.current) {
+          setAudioLoading(false);
+        }
+        return;
+      }
+
+      if (!FileSystem.cacheDirectory) {
+        if (!cancelled && gen === loadGenRef.current) {
+          setAudioLoading(false);
+        }
+        return;
+      }
+
+      setAudioLoading(true);
+      try {
+        const cleanBase64 = currentStepAudioB64.includes("base64,")
+          ? currentStepAudioB64.split("base64,")[1]
+          : currentStepAudioB64;
+
+        const fileUri = `${FileSystem.cacheDirectory}step_${currentStep.step_id}.mp3`;
+        await FileSystem.writeAsStringAsync(fileUri, cleanBase64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+
+        // Abort if user switched steps or started a new slide while writing file
+        if (cancelled || gen !== loadGenRef.current) return;
+
+        player.replace({ uri: fileUri });
+        player.setPlaybackRate(playbackSpeedRef.current);
+        player.play();
+
+        if (!cancelled && gen === loadGenRef.current) {
+          setAudioLoading(false);
+        }
+      } catch (err) {
+        if (!cancelled && gen === loadGenRef.current) {
+          setAudioLoading(false);
+          console.warn("Step audio playback error:", err);
+        }
+      }
+    };
+
+    void loadAndPlayStepAudio();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [result, stepIndex, currentStep, currentStepAudioB64, player]);
+
+  // Watch status.didJustFinish to automatically advance to the next TeachingStep
+  useEffect(() => {
+    if (!status.didJustFinish || audioLoading) return;
+    if (handledFinishGenRef.current === loadGenRef.current) return;
+
+    handledFinishGenRef.current = loadGenRef.current;
+    if (stepIndex < steps.length - 1) {
+      setStepIndex((prev) =>
+        prev === stepIndex && prev < steps.length - 1 ? prev + 1 : prev
+      );
+    }
+  }, [status.didJustFinish, audioLoading, stepIndex, steps.length]);
+
+  const handleTogglePlayPause = () => {
+    if (!currentStepAudioB64 || audioLoading) return;
+
+    try {
+      if (status.playing) {
+        player.pause();
+      } else {
+        const atEnd =
+          status.didJustFinish ||
+          (status.duration > 0 && status.currentTime >= status.duration - 0.15);
+        if (atEnd) {
+          handledFinishGenRef.current = -1;
+          player.seekTo(0);
+        }
+        player.setPlaybackRate(playbackSpeedRef.current);
+        player.play();
+      }
+    } catch (err) {
+      console.warn("Toggle play/pause failed:", err);
+    }
+  };
+
+  const handleReplayStep = () => {
+    if (!result || !currentStep) return;
+    handledFinishGenRef.current = -1;
+    setReplayToken((t) => t + 1);
+
+    if (currentStepAudioB64) {
+      try {
+        player.seekTo(0);
+        player.setPlaybackRate(playbackSpeedRef.current);
+        player.play();
+      } catch (err) {
+        console.warn("Replay step audio failed:", err);
+      }
+    }
+  };
+
+  const handleCycleSpeed = () => {
+    const idx = PLAYBACK_SPEEDS.indexOf(playbackSpeed);
+    const nextSpeed = PLAYBACK_SPEEDS[(idx + 1) % PLAYBACK_SPEEDS.length];
+    playbackSpeedRef.current = nextSpeed;
+    setPlaybackSpeed(nextSpeed);
+
+    try {
+      player.setPlaybackRate(nextSpeed);
+    } catch {
+      // Speed will apply when the next step loads
+    }
+  };
 
   const handlePickPdf = async () => {
     setError(null);
@@ -88,75 +262,107 @@ export default function App() {
       return;
     }
 
-    const parsedPage = parseInt(pageInput.trim(), 10);
-    if (!Number.isFinite(parsedPage) || parsedPage < 1) {
+    const pageNumber = parseInt(pageInput.trim(), 10);
+    if (!Number.isFinite(pageNumber) || pageNumber < 1) {
       setError("Enter a valid 1-based page number (e.g. 1, 2, 3).");
       return;
+    }
+
+    // Pause any playing audio before fetching the new slide
+    loadGenRef.current += 1;
+    handledFinishGenRef.current = loadGenRef.current;
+    try {
+      player.pause();
+    } catch {
+      // Ignore if idle
     }
 
     setLoading(true);
     setError(null);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
     try {
+      const asset = pdfFile;
       const formData = new FormData();
-      // React Native FormData expects { uri, name, type } for local files
       formData.append("file", {
-        uri: pdfFile.uri,
-        name: pdfFile.name,
-        type: pdfFile.mimeType || "application/pdf",
-      } as unknown as Blob);
-      formData.append("page_number", String(parsedPage));
+        uri: asset.uri,
+        name: asset.name ?? "lecture.pdf",
+        type: "application/pdf",
+      } as any);
+      formData.append("page_number", String(pageNumber));
       formData.append("board_mode", boardMode);
       formData.append("use_deep_model", String(useDeepModel));
 
-      // IMPORTANT: Do NOT set Content-Type manually; fetch must generate multipart boundary
-      const response = await fetch(`${API_BASE_URL}/api/explain`, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-      });
+      const data = await new Promise<ExplainSlideWithAudioResponse>(
+        (resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("POST", `${API_BASE_URL}/api/explain`);
+          xhr.timeout = REQUEST_TIMEOUT_MS;
+          // IMPORTANT: Do NOT set Content-Type manually; XHR must generate the multipart boundary
+          xhr.setRequestHeader("Accept", "application/json");
 
-      const rawText = await response.text();
-      let payload: unknown;
-      try {
-        payload = JSON.parse(rawText);
-      } catch {
-        throw new Error(
-          `Unexpected non-JSON response (HTTP ${response.status}): ${rawText.slice(0, 140)}`
-        );
-      }
+          xhr.onload = () => {
+            const rawText = xhr.responseText ?? "";
+            let payload: unknown;
+            try {
+              payload = JSON.parse(rawText);
+            } catch {
+              reject(
+                new Error(
+                  `Unexpected non-JSON response (HTTP ${xhr.status}): ${rawText.slice(0, 140)}`
+                )
+              );
+              return;
+            }
 
-      if (!response.ok) {
-        const detail =
-          typeof payload === "object" &&
-          payload !== null &&
-          "detail" in payload &&
-          typeof (payload as { detail: unknown }).detail === "string"
-            ? (payload as { detail: string }).detail
-            : `Server error (HTTP ${response.status})`;
-        throw new Error(detail);
-      }
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(payload as ExplainSlideWithAudioResponse);
+              return;
+            }
 
-      const data = payload as ExplainSlideResponse;
+            const detail =
+              typeof payload === "object" &&
+                payload !== null &&
+                "detail" in payload &&
+                typeof (payload as { detail: unknown }).detail === "string"
+                ? (payload as { detail: string }).detail
+                : `Server error (HTTP ${xhr.status})`;
+            reject(new Error(detail));
+          };
+
+          xhr.onerror = () => {
+            reject(
+              new Error(
+                `Network request failed. Verify API_BASE_URL (${API_BASE_URL}) and Wi-Fi firewall.`
+              )
+            );
+          };
+
+          xhr.ontimeout = () => {
+            reject(
+              new Error(
+                `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Verify API_BASE_URL (${API_BASE_URL}) and Wi-Fi firewall.`
+              )
+            );
+          };
+
+          xhr.onabort = () => {
+            reject(new Error("Request was aborted."));
+          };
+
+          xhr.send(formData);
+        }
+      );
+
       if (!data.plan?.steps?.length) {
         throw new Error("Server returned a LecturePlan with zero steps.");
       }
 
       setResult(data);
       setStepIndex(0);
+      setReplayToken((t) => t + 1);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        setError(
-          `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Verify API_BASE_URL (${API_BASE_URL}) and Wi-Fi firewall.`
-        );
-      } else {
-        setError(err instanceof Error ? err.message : "Network request failed.");
-      }
+      setError(err instanceof Error ? err.message : "Network request failed.");
     } finally {
-      clearTimeout(timer);
       setLoading(false);
     }
   };
@@ -166,182 +372,226 @@ export default function App() {
   const isLastStep = steps.length > 0 && stepIndex === steps.length - 1;
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" />
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar barStyle="dark-content" />
 
-      {/* Top Controls Bar */}
-      <View style={styles.controlsCard}>
-        <View style={styles.topRow}>
-          <Pressable style={styles.pickBtn} onPress={handlePickPdf}>
-            <Text style={styles.pickBtnText} numberOfLines={1}>
-              {pdfFile ? `PDF: ${pdfFile.name}` : "Select Lecture PDF"}
-            </Text>
-          </Pressable>
-
-          <View style={styles.pageBox}>
-            <Text style={styles.pageLabel}>Page</Text>
-            <TextInput
-              value={pageInput}
-              onChangeText={setPageInput}
-              keyboardType="number-pad"
-              maxLength={4}
-              style={styles.pageInput}
-              placeholder="1"
-            />
-          </View>
-        </View>
-
-        {/* Board Mode Selector + Deep Model Toggle */}
-        <View style={styles.modeRow}>
-          <View style={styles.segmentGroup}>
-            {BOARD_MODES.map((m) => {
-              const active = boardMode === m.value;
-              return (
-                <Pressable
-                  key={m.value}
-                  onPress={() => setBoardMode(m.value)}
-                  style={[styles.segmentBtn, active && styles.segmentBtnActive]}
-                >
-                  <Text
-                    style={[
-                      styles.segmentText,
-                      active && styles.segmentTextActive,
-                    ]}
-                  >
-                    {m.label}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-
-          <View style={styles.deepToggle}>
-            <Text style={styles.deepLabel}>Deep</Text>
-            <Switch
-              value={useDeepModel}
-              onValueChange={setUseDeepModel}
-              trackColor={{ false: "#CBD5E1", true: "#93C5FD" }}
-              thumbColor={useDeepModel ? "#2563EB" : "#F8FAFC"}
-            />
-          </View>
-        </View>
-
-        <Pressable
-          style={[
-            styles.explainBtn,
-            (!pdfFile || loading) && styles.explainBtnDisabled,
-          ]}
-          onPress={handleExplain}
-          disabled={!pdfFile || loading}
-        >
-          {loading ? (
-            <View style={styles.loadingRow}>
-              <ActivityIndicator size="small" color="#FFFFFF" />
-              <Text style={styles.explainBtnText}>Analyzing slide...</Text>
-            </View>
-          ) : (
-            <Text style={styles.explainBtnText}>Explain Page</Text>
-          )}
-        </Pressable>
-
-        {error && (
-          <View style={styles.errorBanner}>
-            <Text style={styles.errorText}>{error}</Text>
-          </View>
-        )}
-      </View>
-
-      {/* Main 60fps SmartBoardCanvas Viewport */}
-      <View style={styles.canvasWrapper}>
-        {result && currentStep ? (
-          <>
-            <View style={styles.planMetaBar}>
-              <Text style={styles.planTitle} numberOfLines={1}>
-                {result.plan.title}
+        {/* Top Controls Bar */}
+        <View style={styles.controlsCard}>
+          <View style={styles.topRow}>
+            <Pressable style={styles.pickBtn} onPress={handlePickPdf}>
+              <Text style={styles.pickBtnText} numberOfLines={1}>
+                {pdfFile ? `PDF: ${pdfFile.name}` : "Select Lecture PDF"}
               </Text>
-              <Text style={styles.modeBadge}>
-                {currentStep.mode === "pdf_overlay" ? "PDF OVERLAY" : "WHITEBOARD"}{" "}
-                • {stepIndex + 1}/{steps.length}
-              </Text>
-            </View>
+            </Pressable>
 
-            <View style={styles.canvasStage}>
-              <SmartBoardCanvas
-                steps={steps}
-                currentStepIndex={stepIndex}
-                slideImageUri={result.slide_image_data_uri}
-                slideAspectRatio={slideAspectRatio}
+            <View style={styles.pageBox}>
+              <Text style={styles.pageLabel}>Page</Text>
+              <TextInput
+                value={pageInput}
+                onChangeText={setPageInput}
+                keyboardType="number-pad"
+                maxLength={4}
+                style={styles.pageInput}
+                placeholder="1"
               />
             </View>
-          </>
-        ) : (
-          <View style={styles.placeholderStage}>
-            <Text style={styles.placeholderTitle}>
-              AI Smart Whiteboard Test Harness
-            </Text>
-            <Text style={styles.placeholderSub}>
-              Pick a PDF lecture, enter a page number, and tap "Explain Page" to
-              verify Skia bbox overlays & 6-slot whiteboard geometry.
-            </Text>
           </View>
-        )}
-      </View>
 
-      {/* Bottom Speech Transcript + Step Navigation */}
-      {result && currentStep && (
-        <View style={styles.footerCard}>
-          <ScrollView
-            style={styles.speechScroll}
-            showsVerticalScrollIndicator={false}
+          {/* Board Mode Selector + Deep Model Toggle */}
+          <View style={styles.modeRow}>
+            <View style={styles.segmentGroup}>
+              {BOARD_MODES.map((m) => {
+                const active = boardMode === m.value;
+                return (
+                  <Pressable
+                    key={m.value}
+                    onPress={() => setBoardMode(m.value)}
+                    style={[styles.segmentBtn, active && styles.segmentBtnActive]}
+                  >
+                    <Text
+                      style={[
+                        styles.segmentText,
+                        active && styles.segmentTextActive,
+                      ]}
+                    >
+                      {m.label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={styles.deepToggle}>
+              <Text style={styles.deepLabel}>Deep</Text>
+              <Switch
+                value={useDeepModel}
+                onValueChange={setUseDeepModel}
+                trackColor={{ false: "#CBD5E1", true: "#93C5FD" }}
+                thumbColor={useDeepModel ? "#2563EB" : "#F8FAFC"}
+              />
+            </View>
+          </View>
+
+          <Pressable
+            style={[
+              styles.explainBtn,
+              (!pdfFile || loading) && styles.explainBtnDisabled,
+            ]}
+            onPress={handleExplain}
+            disabled={!pdfFile || loading}
           >
-            <Text style={styles.speechAr}>{currentStep.speech_ar}</Text>
-
-            {currentStep.en_terms.length > 0 && (
-              <Text style={styles.enTermsText}>
-                EN Terms: {currentStep.en_terms.join(" • ")}
-              </Text>
-            )}
-
-            {isLastStep && !!result.plan.quiz_question_ar && (
-              <View style={styles.quizBox}>
-                <Text style={styles.quizLabel}>سؤال تطبيقي:</Text>
-                <Text style={styles.quizText}>
-                  {result.plan.quiz_question_ar}
+            {loading ? (
+              <View style={styles.loadingRow}>
+                <ActivityIndicator size="small" color="#FFFFFF" />
+                <Text style={styles.explainBtnText}>
+                  Analyzing & voicing slide...
                 </Text>
               </View>
+            ) : (
+              <Text style={styles.explainBtnText}>Explain Page</Text>
             )}
-          </ScrollView>
+          </Pressable>
 
-          <View style={styles.navRow}>
-            <Pressable
-              style={[styles.navBtn, !canGoPrev && styles.navBtnDisabled]}
-              onPress={() => canGoPrev && setStepIndex((i) => i - 1)}
-              disabled={!canGoPrev}
-            >
-              <Text style={styles.navBtnText}>السابق</Text>
-            </Pressable>
-
-            <Text style={styles.stepCounter}>
-              Step {currentStep.step_id} / {steps.length}
-            </Text>
-
-            <Pressable
-              style={[
-                styles.navBtn,
-                styles.navBtnPrimary,
-                !canGoNext && styles.navBtnDisabled,
-              ]}
-              onPress={() => canGoNext && setStepIndex((i) => i + 1)}
-              disabled={!canGoNext}
-            >
-              <Text style={[styles.navBtnText, styles.navBtnPrimaryText]}>
-                التالي
-              </Text>
-            </Pressable>
-          </View>
+          {error && (
+            <View style={styles.errorBanner}>
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          )}
         </View>
-      )}
-    </SafeAreaView>
+
+        {/* Main 60fps SmartBoardCanvas Viewport */}
+        <View style={styles.canvasWrapper}>
+          {result && currentStep ? (
+            <>
+              <View style={styles.planMetaBar}>
+                <Text style={styles.planTitle} numberOfLines={1}>
+                  {result.plan.title}
+                </Text>
+                <Text style={styles.modeBadge}>
+                  {currentStep.mode === "pdf_overlay"
+                    ? "PDF OVERLAY"
+                    : "WHITEBOARD"}{" "}
+                  • {stepIndex + 1}/{steps.length}
+                </Text>
+              </View>
+
+              <View style={styles.canvasStage}>
+                <SmartBoardCanvas
+                  key={`board-${result.page_number}-${replayToken}`}
+                  steps={steps}
+                  currentStepIndex={stepIndex}
+                  slideImageUri={result.slide_image_data_uri}
+                  slideAspectRatio={slideAspectRatio}
+                />
+              </View>
+            </>
+          ) : (
+            <View style={styles.placeholderStage}>
+              <Text style={styles.placeholderTitle}>
+                AI Smart Whiteboard Tutor
+              </Text>
+              <Text style={styles.placeholderSub}>
+                Pick a PDF lecture, enter a page number, and tap "Explain Page"
+                for a thorough 5–8 step explanation with synchronized Iraqi
+                voice & Skia whiteboard animations.
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* Bottom Speech Transcript + Synchronized Audio & Step Controls */}
+        {result && currentStep && (
+          <View style={styles.footerCard}>
+            <ScrollView
+              style={styles.speechScroll}
+              showsVerticalScrollIndicator={false}
+            >
+              <Text style={styles.speechAr}>{currentStep.speech_ar}</Text>
+
+              {currentStep.en_terms.length > 0 && (
+                <Text style={styles.enTermsText}>
+                  EN Terms: {currentStep.en_terms.join(" • ")}
+                </Text>
+              )}
+
+              {isLastStep && !!result.plan.quiz_question_ar && (
+                <View style={styles.quizBox}>
+                  <Text style={styles.quizLabel}>سؤال تطبيقي:</Text>
+                  <Text style={styles.quizText}>
+                    {result.plan.quiz_question_ar}
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+
+            {/* Audio Sync Transport Controls: Play/Pause, Replay, Speed */}
+            <View style={styles.audioBar}>
+              <Pressable
+                style={[
+                  styles.audioBtn,
+                  styles.audioPlayBtn,
+                  (!currentStepAudioB64 || audioLoading) &&
+                  styles.navBtnDisabled,
+                ]}
+                onPress={handleTogglePlayPause}
+                disabled={!currentStepAudioB64 || audioLoading}
+              >
+                {audioLoading ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.audioPlayBtnText}>
+                    {status.playing ? "⏸ Pause" : "▶ Play"}
+                  </Text>
+                )}
+              </Pressable>
+
+              <Pressable style={styles.audioBtn} onPress={handleReplayStep}>
+                <Text style={styles.audioBtnText}>↺ Replay Step</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.audioBtn, styles.speedBtn]}
+                onPress={handleCycleSpeed}
+              >
+                <Text style={styles.speedBtnText}>
+                  {playbackSpeed.toFixed(playbackSpeed === 1.25 ? 2 : 1)}x
+                </Text>
+              </Pressable>
+            </View>
+
+            {/* Step Navigation Controls: Previous / Next */}
+            <View style={styles.navRow}>
+              <Pressable
+                style={[styles.navBtn, !canGoPrev && styles.navBtnDisabled]}
+                onPress={() => canGoPrev && setStepIndex((i) => i - 1)}
+                disabled={!canGoPrev}
+              >
+                <Text style={styles.navBtnText}>السابق</Text>
+              </Pressable>
+
+              <Text style={styles.stepCounter}>
+                Step {currentStep.step_id} / {steps.length}
+              </Text>
+
+              <Pressable
+                style={[
+                  styles.navBtn,
+                  styles.navBtnPrimary,
+                  !canGoNext && styles.navBtnDisabled,
+                ]}
+                onPress={() => canGoNext && setStepIndex((i) => i + 1)}
+                disabled={!canGoNext}
+              >
+                <Text style={[styles.navBtnText, styles.navBtnPrimaryText]}>
+                  التالي
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -349,7 +599,6 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     backgroundColor: "#F1F5F9",
-    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight ?? 12 : 0,
   },
   controlsCard: {
     backgroundColor: "#FFFFFF",
@@ -531,10 +780,10 @@ const styles = StyleSheet.create({
     borderTopColor: "#E2E8F0",
     paddingHorizontal: 12,
     paddingVertical: 10,
-    gap: 10,
+    gap: 8,
   },
   speechScroll: {
-    maxHeight: 125,
+    maxHeight: 115,
   },
   speechAr: {
     fontSize: 15,
@@ -570,6 +819,47 @@ const styles = StyleSheet.create({
     textAlign: "right",
     writingDirection: "rtl",
     marginTop: 2,
+  },
+  audioBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  audioBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  audioPlayBtn: {
+    backgroundColor: "#0F766E",
+    borderColor: "#0F766E",
+  },
+  audioPlayBtnText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  audioBtnText: {
+    color: "#0F172A",
+    fontSize: 12.5,
+    fontWeight: "600",
+  },
+  speedBtn: {
+    flex: 0,
+    minWidth: 62,
+    backgroundColor: "#EFF6FF",
+    borderColor: "#BFDBFE",
+  },
+  speedBtnText: {
+    color: "#1D4ED8",
+    fontSize: 12.5,
+    fontWeight: "700",
   },
   navRow: {
     flexDirection: "row",

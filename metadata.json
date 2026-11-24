@@ -1,6 +1,0 @@
-{
-  "name": "AI Smart Whiteboard Tutor",
-  "description": "AI Smart Whiteboard Tutor for Intelligent Medical Systems students — FastAPI + PyMuPDF + Gemini structured LecturePlan backend and mobile schema contract.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

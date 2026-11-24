@@ -104,6 +104,54 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   },
 };
 
+function getColorToken(color?: VisualAction["color"]): ColorToken {
+  return (color && COLOR_MAP[color]) || COLOR_MAP.blue;
+}
+
+// ---------------------------------------------------------------------------
+// Modern Skia Path Helpers (Compatible with Immutable SkPath / PathBuilder)
+// ---------------------------------------------------------------------------
+function makeEmptyPath() {
+  if (typeof Skia?.PathBuilder?.Make === "function") {
+    return Skia.PathBuilder.Make().build();
+  }
+  return Skia.Path.Make();
+}
+
+function makePathFromBuilder(
+  draw: (builder: {
+    moveTo: (x: number, y: number) => unknown;
+    lineTo: (x: number, y: number) => unknown;
+    quadTo: (x1: number, y1: number, x2: number, y2: number) => unknown;
+    addOval: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
+  }) => void
+) {
+  if (typeof Skia?.PathBuilder?.Make === "function") {
+    const builder = Skia.PathBuilder.Make();
+    draw(builder);
+    return builder.build();
+  }
+
+  // Fallback for older mutable SkPath versions
+  const legacyPath = Skia.Path.Make() as unknown as {
+    moveTo?: (x: number, y: number) => unknown;
+    lineTo?: (x: number, y: number) => unknown;
+    quadTo?: (x1: number, y1: number, x2: number, y2: number) => unknown;
+    addOval?: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
+  };
+  if (typeof legacyPath?.moveTo === "function") {
+    draw(
+      legacyPath as {
+        moveTo: (x: number, y: number) => unknown;
+        lineTo: (x: number, y: number) => unknown;
+        quadTo: (x1: number, y1: number, x2: number, y2: number) => unknown;
+        addOval: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
+      }
+    );
+  }
+  return legacyPath as ReturnType<typeof Skia.Path.Make>;
+}
+
 // ---------------------------------------------------------------------------
 // Pure Geometry Math: Aspect-Ratio Contain & [0-1000] BBox Mapping
 // ---------------------------------------------------------------------------
@@ -208,8 +256,9 @@ function computeWhiteboardSlots(
 }
 
 function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
-  const path = Skia.Path.Make();
-  if (from.width <= 0 || to.width <= 0) return path;
+  if (!from || !to || from.width <= 0 || to.width <= 0) {
+    return makeEmptyPath();
+  }
 
   const fromCx = from.x + from.width / 2;
   const fromCy = from.y + from.height / 2;
@@ -248,29 +297,29 @@ function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
   const midX = (startX + endX) / 2;
   const midY = (startY + endY) / 2;
   const isDiagonal = Math.abs(startX - endX) > 12 && Math.abs(startY - endY) > 12;
-  const ctrlX = isDiagonal ? midX : midX;
+  const ctrlX = midX;
   const ctrlY = isDiagonal ? startY : midY;
-
-  path.moveTo(startX, startY);
-  path.quadTo(ctrlX, ctrlY, endX, endY);
 
   // Arrowhead aligned with incoming tangent vector
   const angle = Math.atan2(endY - ctrlY, endX - ctrlX);
   const headLen = 10;
   const spread = Math.PI / 6;
 
-  path.moveTo(endX, endY);
-  path.lineTo(
-    endX - headLen * Math.cos(angle - spread),
-    endY - headLen * Math.sin(angle - spread)
-  );
-  path.moveTo(endX, endY);
-  path.lineTo(
-    endX - headLen * Math.cos(angle + spread),
-    endY - headLen * Math.sin(angle + spread)
-  );
+  return makePathFromBuilder((builder) => {
+    builder.moveTo(startX, startY);
+    builder.quadTo(ctrlX, ctrlY, endX, endY);
 
-  return path;
+    builder.moveTo(endX, endY);
+    builder.lineTo(
+      endX - headLen * Math.cos(angle - spread),
+      endY - headLen * Math.sin(angle - spread)
+    );
+    builder.moveTo(endX, endY);
+    builder.lineTo(
+      endX - headLen * Math.cos(angle + spread),
+      endY - headLen * Math.sin(angle + spread)
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +329,11 @@ function resolveWhiteboardActions(
   steps: TeachingStep[],
   currentStepIndex: number
 ): ResolvedAction[] {
+  const safeSteps = Array.isArray(steps) ? steps : [];
   let accumulated: ResolvedAction[] = [];
 
   for (let i = 0; i <= currentStepIndex; i++) {
-    const step = steps[i];
+    const step = safeSteps[i];
     if (!step) continue;
 
     if (step.mode !== "whiteboard") {
@@ -293,8 +343,10 @@ function resolveWhiteboardActions(
     }
 
     const isCurrent = i === currentStepIndex;
-    for (let j = 0; j < step.actions.length; j++) {
-      const action = step.actions[j];
+    const actions = Array.isArray(step.actions) ? step.actions : [];
+    for (let j = 0; j < actions.length; j++) {
+      const action = actions[j];
+      if (!action) continue;
       if (action.type === "clear_board") {
         accumulated = [];
         continue;
@@ -327,9 +379,15 @@ const AnimatedHighlightRect: React.FC<{
   color: string;
   progress: SharedValue<number>;
 }> = ({ rect, color, progress }) => {
-  const animatedWidth = useDerivedValue(() => rect.width * progress.value, [
-    rect.width,
-  ]);
+  const targetWidth = useSharedValue(rect.width);
+  useEffect(() => {
+    targetWidth.value = rect.width;
+  }, [rect.width, targetWidth]);
+
+  const animatedWidth = useDerivedValue(
+    () => targetWidth.value * progress.value
+  );
+
   return (
     <RoundedRect
       x={rect.x}
@@ -348,17 +406,16 @@ const AnimatedCircleAnnotation: React.FC<{
   progress: SharedValue<number>;
 }> = ({ rect, strokeColor, progress }) => {
   const ovalPath = useMemo(() => {
-    const p = Skia.Path.Make();
     const pad = 4;
-    p.addOval(
-      Skia.XYWHRect(
-        rect.x - pad,
-        rect.y - pad,
-        rect.width + pad * 2,
-        rect.height + pad * 2
-      )
+    const ovalRect = Skia.XYWHRect(
+      rect.x - pad,
+      rect.y - pad,
+      rect.width + pad * 2,
+      rect.height + pad * 2
     );
-    return p;
+    return makePathFromBuilder((builder) => {
+      builder.addOval(ovalRect);
+    });
   }, [rect.x, rect.y, rect.width, rect.height]);
 
   return (
@@ -403,7 +460,7 @@ const AnimatedArrowPath: React.FC<{
 const CodeBlockView: React.FC<{ action: VisualAction }> = ({ action }) => {
   const lines = (action.text ?? "").split("\n");
   const highlighted = new Set(action.highlight_lines ?? []);
-  const token = COLOR_MAP[action.color];
+  const token = getColorToken(action.color);
 
   return (
     <View style={styles.codeContainer}>
@@ -443,7 +500,7 @@ const CodeBlockView: React.FC<{ action: VisualAction }> = ({ action }) => {
 };
 
 const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
-  if (items.length === 0) return null;
+  if (!items || items.length === 0) return null;
   const primary = items[0].action;
 
   if (primary.type === "wb_code") {
@@ -451,7 +508,7 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
   }
 
   if (primary.type === "wb_heading") {
-    const token = COLOR_MAP[primary.color];
+    const token = getColorToken(primary.color);
     return (
       <View style={styles.headingBox}>
         <Text
@@ -459,14 +516,14 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
           adjustsFontSizeToFit
           style={[styles.headingText, { color: token.text }]}
         >
-          {primary.text}
+          {primary.text ?? ""}
         </Text>
       </View>
     );
   }
 
   if (primary.type === "wb_equation") {
-    const token = COLOR_MAP[primary.color];
+    const token = getColorToken(primary.color);
     return (
       <ScrollView
         contentContainerStyle={styles.equationBox}
@@ -474,14 +531,14 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
         nestedScrollEnabled
       >
         <Text style={[styles.equationText, { color: token.text }]}>
-          {primary.text}
+          {primary.text ?? ""}
         </Text>
       </ScrollView>
     );
   }
 
   if (primary.type === "wb_flow_card") {
-    const token = COLOR_MAP[primary.color];
+    const token = getColorToken(primary.color);
     return (
       <ScrollView
         contentContainerStyle={styles.flowCardBox}
@@ -489,7 +546,7 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
         nestedScrollEnabled
       >
         <Text style={[styles.flowCardText, { color: token.text }]}>
-          {primary.text}
+          {primary.text ?? ""}
         </Text>
       </ScrollView>
     );
@@ -503,14 +560,14 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
       nestedScrollEnabled
     >
       {items.map((item) => {
-        const token = COLOR_MAP[item.action.color];
+        const token = getColorToken(item.action.color);
         return (
           <View key={item.key} style={styles.bulletRow}>
             <View
               style={[styles.bulletDot, { backgroundColor: token.stroke }]}
             />
             <Text style={[styles.bulletText, { color: token.text }]}>
-              {item.action.text}
+              {item.action.text ?? ""}
             </Text>
           </View>
         );
@@ -534,11 +591,12 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
 
   // Sync external aspect ratio prop if it changes across slides
   useEffect(() => {
-    setDetectedAspect(slideAspectRatio);
+    setDetectedAspect(slideAspectRatio > 0 ? slideAspectRatio : 16 / 9);
   }, [slideAspectRatio]);
 
-  const safeIndex = Math.max(0, Math.min(currentStepIndex, steps.length - 1));
-  const currentStep = steps[safeIndex];
+  const safeSteps = useMemo(() => (Array.isArray(steps) ? steps : []), [steps]);
+  const safeIndex = Math.max(0, Math.min(currentStepIndex, safeSteps.length - 1));
+  const currentStep = safeSteps[safeIndex];
 
   // Reanimated shared value driving 60fps Skia path drawing for the active step
   const stepProgress = useSharedValue(0);
@@ -570,8 +628,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
 
   // Compute accumulated whiteboard actions & slot geometry
   const wbActions = useMemo(
-    () => resolveWhiteboardActions(steps, safeIndex),
-    [steps, safeIndex]
+    () => resolveWhiteboardActions(safeSteps, safeIndex),
+    [safeSteps, safeIndex]
   );
 
   const groupedBySlot = useMemo(() => {
@@ -603,18 +661,20 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
 
   // Single-draw-call subtle engineering grid path for 60fps whiteboard background
   const gridPath = useMemo(() => {
-    const p = Skia.Path.Make();
-    if (canvasSize.width <= 0 || canvasSize.height <= 0) return p;
+    if (canvasSize.width <= 0 || canvasSize.height <= 0) {
+      return makeEmptyPath();
+    }
     const spacing = 28;
-    for (let x = spacing; x < canvasSize.width; x += spacing) {
-      p.moveTo(x, 0);
-      p.lineTo(x, canvasSize.height);
-    }
-    for (let y = spacing; y < canvasSize.height; y += spacing) {
-      p.moveTo(0, y);
-      p.lineTo(canvasSize.width, y);
-    }
-    return p;
+    return makePathFromBuilder((builder) => {
+      for (let x = spacing; x < canvasSize.width; x += spacing) {
+        builder.moveTo(x, 0);
+        builder.lineTo(x, canvasSize.height);
+      }
+      for (let y = spacing; y < canvasSize.height; y += spacing) {
+        builder.moveTo(0, y);
+        builder.lineTo(canvasSize.width, y);
+      }
+    });
   }, [canvasSize.width, canvasSize.height]);
 
   if (!currentStep) {
@@ -629,8 +689,9 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   // MODE 1: PDF OVERLAY (Aspect-Ratio Locked Slide + 60fps Transparent Skia)
   // =========================================================================
   if (currentStep.mode === "pdf_overlay") {
-    const pdfActions = currentStep.actions.filter(
+    const pdfActions = (currentStep.actions ?? []).filter(
       (a) =>
+        a &&
         (a.type === "pdf_highlight" || a.type === "pdf_circle") &&
         a.bbox != null
     );
@@ -659,9 +720,9 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
               resizeMode="contain"
               style={StyleSheet.absoluteFill}
               onLoad={(event) => {
-                const { width, height } = event.nativeEvent.source;
-                if (width > 0 && height > 0) {
-                  setDetectedAspect(width / height);
+                const source = event?.nativeEvent?.source;
+                if (source && source.width > 0 && source.height > 0) {
+                  setDetectedAspect(source.width / source.height);
                 }
               }}
             />
@@ -689,7 +750,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
           <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
             {pdfActions.map((action, idx) => {
               const screenRect = mapBboxToScreenRect(action.bbox!, contentRect);
-              const token = COLOR_MAP[action.color];
+              const token = getColorToken(action.color);
               const key = `pdf-${currentStep.step_id}-${idx}-${action.type}`;
 
               if (action.type === "pdf_highlight") {
@@ -744,9 +805,10 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
           {/* Slot Card Vector Surfaces */}
           {Array.from(groupedBySlot.entries()).map(([slot, items]) => {
             const rect = slotRects[slot];
-            if (rect.width <= 0 || rect.height <= 0) return null;
-            const primary = items[0].action;
-            const token = COLOR_MAP[primary.color];
+            if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+            const primary = items[0]?.action;
+            if (!primary) return null;
+            const token = getColorToken(primary.color);
             const isCode = primary.type === "wb_code";
             const radius = primary.type === "wb_heading" ? 10 : 14;
 
@@ -778,7 +840,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
           {arrowActions.map((item) => {
             const fromRect = slotRects[item.action.connect_from_slot!];
             const toRect = slotRects[item.action.slot!];
-            const token = COLOR_MAP[item.action.color];
+            if (!fromRect || !toRect) return null;
+            const token = getColorToken(item.action.color);
             return (
               <AnimatedArrowPath
                 key={`arrow-${item.key}`}
@@ -797,7 +860,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
       {canvasSize.width > 0 &&
         Array.from(groupedBySlot.entries()).map(([slot, items]) => {
           const rect = slotRects[slot];
-          if (rect.width <= 0 || rect.height <= 0) return null;
+          if (!rect || rect.width <= 0 || rect.height <= 0) return null;
           const isNew = items.some((i) => i.isCurrentStep);
 
           return (
