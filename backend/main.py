@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,7 +15,7 @@ from google.genai import types as genai_types
 from pydantic import ValidationError
 
 from prompts import build_tutor_system_prompt
-from schema import LecturePlan
+from schema import ExplainSlideResponse, LecturePlan
 
 load_dotenv()
 
@@ -132,10 +133,10 @@ def _render_pdf_page_in_memory(
     page_number: int,
     dpi: int,
     max_dim_px: int,
-) -> tuple[bytes, int]:
+) -> tuple[bytes, int, int, int]:
     """
     Render a single 1-based PDF page into in-memory JPEG bytes using PyMuPDF.
-    Returns (jpeg_bytes, total_pages). Runs in a worker thread to avoid blocking ASGI.
+    Returns (jpeg_bytes, total_pages, width_px, height_px). Runs in a worker thread.
     """
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         if doc.needs_pass:
@@ -163,8 +164,9 @@ def _render_pdf_page_in_memory(
         # alpha=False prevents transparent slide backgrounds from turning black in JPEG
         pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=False)
         jpeg_bytes = pix.tobytes(output="jpeg", jpg_quality=88)
+        width_px, height_px = pix.width, pix.height
 
-    return jpeg_bytes, total_pages
+    return jpeg_bytes, total_pages, width_px, height_px
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +222,8 @@ async def health_check() -> dict[str, object]:
 
 @app.post(
     "/api/explain",
-    response_model=LecturePlan,
-    summary="Generate a structured LecturePlan for a single PDF slide page",
+    response_model=ExplainSlideResponse,
+    summary="Generate a structured LecturePlan + aligned slide image for a single PDF page",
 )
 async def explain_slide(
     file: UploadFile = File(..., description="Lecture PDF file"),
@@ -234,7 +236,7 @@ async def explain_slide(
         False,
         description="False -> FAST_TUTOR_MODEL (default 85%), True -> DEEP_TUTOR_MODEL (complex 15%)",
     ),
-) -> LecturePlan:
+) -> ExplainSlideResponse:
     if _genai_client is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -255,7 +257,7 @@ async def explain_slide(
 
     # 2. Convert requested PDF page to in-memory JPEG bytes (offloaded from event loop)
     try:
-        image_bytes, total_pages = await asyncio.to_thread(
+        image_bytes, total_pages, slide_width, slide_height = await asyncio.to_thread(
             _render_pdf_page_in_memory,
             pdf_bytes,
             page_number,
@@ -356,4 +358,14 @@ async def explain_slide(
             detail="AI response failed LecturePlan schema validation.",
         ) from exc
 
-    return _sanitize_plan(plan, board_mode)
+    sanitized_plan = _sanitize_plan(plan, board_mode)
+    encoded_b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    return ExplainSlideResponse(
+        plan=sanitized_plan,
+        slide_image_data_uri=f"data:image/jpeg;base64,{encoded_b64}",
+        slide_width=slide_width,
+        slide_height=slide_height,
+        page_number=page_number,
+        total_pages=total_pages,
+    )

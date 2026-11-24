@@ -88,3 +88,17 @@ class LecturePlan(BaseModel):
         ...,
         description="One practical application question in Iraqi Arabic at the end of the explanation."
     )
+
+
+class ExplainSlideResponse(BaseModel):
+    """API response envelope pairing the locked LecturePlan with the exact rendered slide image."""
+    plan: LecturePlan
+    slide_image_data_uri: str = Field(
+        ...,
+        description="Base64 JPEG data URI (data:image/jpeg;base64,...) of the exact image analyzed by Gemini."
+    )
+    slide_width: int = Field(..., gt=0, description="Rendered slide width in pixels.")
+    slide_height: int = Field(..., gt=0, description="Rendered slide height in pixels.")
+    page_number: int = Field(..., ge=1)
+    total_pages: int = Field(..., ge=1)
+

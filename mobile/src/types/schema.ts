@@ -47,3 +47,13 @@ export interface LecturePlan {
   steps: TeachingStep[];
   quiz_question_ar: string;
 }
+
+export interface ExplainSlideResponse {
+  plan: LecturePlan;
+  slide_image_data_uri: string;
+  slide_width: number;
+  slide_height: number;
+  page_number: number;
+  total_pages: number;
+}
+
