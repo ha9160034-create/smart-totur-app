@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 
 BoardMode = Literal["auto", "whiteboard", "pdf_overlay"]
 
@@ -109,8 +109,25 @@ _BOARD_MODE_OVERRIDES: dict[BoardMode, str] = {
 }
 
 
-def build_tutor_system_prompt(board_mode: BoardMode = "auto") -> str:
-    """Return the locked professor system prompt with the active board_mode directive."""
+def build_tutor_system_prompt(
+    board_mode: BoardMode = "auto",
+    rag_context: Optional[str] = None,
+) -> str:
+    """Return the locked professor system prompt with the active board_mode and optional RAG context."""
     if board_mode not in _BOARD_MODE_OVERRIDES:
         raise ValueError(f"Unsupported board_mode: {board_mode!r}")
-    return f"{BASE_TUTOR_SYSTEM_PROMPT}\n\n{_BOARD_MODE_OVERRIDES[board_mode]}"
+
+    prompt = f"{BASE_TUTOR_SYSTEM_PROMPT}\n\n{_BOARD_MODE_OVERRIDES[board_mode]}"
+
+    cleaned_context = (rag_context or "").strip()
+    if cleaned_context:
+        prompt += (
+            "\n\n### RELATED CONTEXT FROM OTHER PAGES OF THIS LECTURE (FULL-DOCUMENT RAG):\n"
+            "Use the excerpts below from other slides in the same PDF to connect the current slide "
+            "to earlier definitions, prerequisites, or follow-up mechanisms naturally in your Iraqi "
+            "professor explanation (e.g., 'كما ذَكَرنا في صَفحة ...'), while keeping all visual "
+            "`bbox` highlights and whiteboard diagrams strictly focused on the CURRENT slide:\n"
+            f"{cleaned_context}"
+        )
+
+    return prompt
