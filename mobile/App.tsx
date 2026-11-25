@@ -70,26 +70,18 @@ export default function App() {
   // Audio-Visual Sync Engine State (expo-audio)
   const player = useAudioPlayer(null);
   const status = useAudioPlayerStatus(player);
-  const [audioLoading, setAudioLoading] = useState<boolean>(false);
+  const [stepAudioUris, setStepAudioUris] = useState<Array<string | null>>([]);
   const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(1.0);
   const [replayToken, setReplayToken] = useState<number>(0);
 
-  const loadGenRef = useRef<number>(0);
-  const handledFinishGenRef = useRef<number>(-1);
+  // Atomic lock: prevents stale status.didJustFinish from advancing a step more than once
+  const advancedFromStepRef = useRef<number | null>(null);
   const playbackSpeedRef = useRef<PlaybackSpeed>(1.0);
+  const cacheSessionRef = useRef<number>(0);
 
   const steps = result?.plan.steps ?? [];
   const currentStep = steps[stepIndex] ?? null;
-
-  const currentStepAudioB64 = useMemo(() => {
-    if (!result || !currentStep) return null;
-    const byIndex = result.step_audio?.[stepIndex];
-    if (byIndex?.audio_base64) return byIndex.audio_base64;
-    const byId = result.step_audio?.find(
-      (item) => item.step_id === currentStep.step_id
-    );
-    return byId?.audio_base64 ?? null;
-  }, [result, currentStep, stepIndex]);
+  const currentStepAudioUri = stepAudioUris[stepIndex] ?? null;
 
   const slideAspectRatio = useMemo(() => {
     if (!result || result.slide_height <= 0) return 16 / 9;
@@ -103,84 +95,55 @@ export default function App() {
     });
   }, []);
 
-  // Write current step's Base64 MP3 to cache and play via expo-audio in sync with SmartBoardCanvas
+  // Load and play the pre-cached MP3 URI synchronously whenever stepIndex or result changes
   useEffect(() => {
-    const gen = ++loadGenRef.current;
-    handledFinishGenRef.current = -1;
-    let cancelled = false;
+    // Lock auto-advance for this step until the new track actually starts playing
+    advancedFromStepRef.current = stepIndex;
 
-    const loadAndPlayStepAudio = async () => {
-      try {
-        player.pause();
-      } catch {
-        // Ignore if player has no loaded source yet
-      }
+    try {
+      player.pause();
+    } catch {
+      // Ignore if player has no loaded source yet
+    }
 
-      if (!currentStep || !currentStepAudioB64) {
-        if (!cancelled && gen === loadGenRef.current) {
-          setAudioLoading(false);
-        }
-        return;
-      }
+    if (!result || !currentStep || !currentStepAudioUri) {
+      return;
+    }
 
-      if (!FileSystem.cacheDirectory) {
-        if (!cancelled && gen === loadGenRef.current) {
-          setAudioLoading(false);
-        }
-        return;
-      }
+    try {
+      player.replace({ uri: currentStepAudioUri });
+      player.setPlaybackRate(playbackSpeedRef.current);
+      player.play();
+    } catch (err) {
+      console.warn("Step audio playback error:", err);
+    }
+  }, [result, stepIndex, currentStep, currentStepAudioUri, player]);
 
-      setAudioLoading(true);
-      try {
-        const cleanBase64 = currentStepAudioB64.includes("base64,")
-          ? currentStepAudioB64.split("base64,")[1]
-          : currentStepAudioB64;
-
-        const fileUri = `${FileSystem.cacheDirectory}step_${currentStep.step_id}.mp3`;
-        await FileSystem.writeAsStringAsync(fileUri, cleanBase64, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-
-        // Abort if user switched steps or started a new slide while writing file
-        if (cancelled || gen !== loadGenRef.current) return;
-
-        player.replace({ uri: fileUri });
-        player.setPlaybackRate(playbackSpeedRef.current);
-        player.play();
-
-        if (!cancelled && gen === loadGenRef.current) {
-          setAudioLoading(false);
-        }
-      } catch (err) {
-        if (!cancelled && gen === loadGenRef.current) {
-          setAudioLoading(false);
-          console.warn("Step audio playback error:", err);
-        }
-      }
-    };
-
-    void loadAndPlayStepAudio();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [result, stepIndex, currentStep, currentStepAudioB64, player]);
-
-  // Watch status.didJustFinish to automatically advance to the next TeachingStep
+  // Unlock auto-advance ONLY after the active step genuinely starts playing with didJustFinish cleared
   useEffect(() => {
-    if (!status.didJustFinish || audioLoading) return;
-    if (handledFinishGenRef.current === loadGenRef.current) return;
+    if (status.playing && !status.didJustFinish) {
+      advancedFromStepRef.current = null;
+    }
+  }, [status.playing, status.didJustFinish]);
 
-    handledFinishGenRef.current = loadGenRef.current;
+  // Watch status.didJustFinish to advance strictly once per completed TeachingStep
+  useEffect(() => {
+    if (!result || steps.length === 0) return;
+    if (!status.didJustFinish) return;
+    if (advancedFromStepRef.current !== null) return;
+
+    // Atomically lock this step so subsequent re-renders cannot double-advance
+    advancedFromStepRef.current = stepIndex;
+
     if (stepIndex < steps.length - 1) {
       setStepIndex((prev) =>
         prev === stepIndex && prev < steps.length - 1 ? prev + 1 : prev
       );
     }
-  }, [status.didJustFinish, audioLoading, stepIndex, steps.length]);
+  }, [result, status.didJustFinish, stepIndex, steps.length]);
 
   const handleTogglePlayPause = () => {
-    if (!currentStepAudioB64 || audioLoading) return;
+    if (!currentStepAudioUri) return;
 
     try {
       if (status.playing) {
@@ -190,7 +153,7 @@ export default function App() {
           status.didJustFinish ||
           (status.duration > 0 && status.currentTime >= status.duration - 0.15);
         if (atEnd) {
-          handledFinishGenRef.current = -1;
+          advancedFromStepRef.current = stepIndex;
           player.seekTo(0);
         }
         player.setPlaybackRate(playbackSpeedRef.current);
@@ -203,10 +166,10 @@ export default function App() {
 
   const handleReplayStep = () => {
     if (!result || !currentStep) return;
-    handledFinishGenRef.current = -1;
+    advancedFromStepRef.current = stepIndex;
     setReplayToken((t) => t + 1);
 
-    if (currentStepAudioB64) {
+    if (currentStepAudioUri) {
       try {
         player.seekTo(0);
         player.setPlaybackRate(playbackSpeedRef.current);
@@ -215,6 +178,12 @@ export default function App() {
         console.warn("Replay step audio failed:", err);
       }
     }
+  };
+
+  const handleSelectStep = (nextIndex: number) => {
+    if (nextIndex < 0 || nextIndex >= steps.length) return;
+    advancedFromStepRef.current = nextIndex;
+    setStepIndex(nextIndex);
   };
 
   const handleCycleSpeed = () => {
@@ -268,9 +237,8 @@ export default function App() {
       return;
     }
 
-    // Pause any playing audio before fetching the new slide
-    loadGenRef.current += 1;
-    handledFinishGenRef.current = loadGenRef.current;
+    // Pause any playing audio and lock auto-advance before fetching the new slide
+    advancedFromStepRef.current = 0;
     try {
       player.pause();
     } catch {
@@ -357,6 +325,41 @@ export default function App() {
         throw new Error("Server returned a LecturePlan with zero steps.");
       }
 
+      // Pre-cache all step MP3 files to FileSystem.cacheDirectory upfront before playback starts
+      const cacheSessionId = ++cacheSessionRef.current;
+      const cacheDir = FileSystem.cacheDirectory;
+      const cachedUris = await Promise.all(
+        data.plan.steps.map(async (step, idx): Promise<string | null> => {
+          if (!cacheDir) return null;
+          const byIndex = data.step_audio?.[idx];
+          const rawBase64 =
+            byIndex?.audio_base64 ??
+            data.step_audio?.find((item) => item.step_id === step.step_id)
+              ?.audio_base64 ??
+            null;
+          if (!rawBase64) return null;
+
+          try {
+            const cleanBase64 = rawBase64.includes("base64,")
+              ? rawBase64.split("base64,")[1]
+              : rawBase64;
+            const fileUri = `${cacheDir}slide_${cacheSessionId}_step_${step.step_id}_${idx}.mp3`;
+            await FileSystem.writeAsStringAsync(fileUri, cleanBase64, {
+              encoding: FileSystem.EncodingType.Base64,
+            });
+            return fileUri;
+          } catch (writeErr) {
+            console.warn(
+              `Failed to cache audio for step ${step.step_id}:`,
+              writeErr
+            );
+            return null;
+          }
+        })
+      );
+
+      advancedFromStepRef.current = 0;
+      setStepAudioUris(cachedUris);
       setResult(data);
       setStepIndex(0);
       setReplayToken((t) => t + 1);
@@ -531,19 +534,14 @@ export default function App() {
                 style={[
                   styles.audioBtn,
                   styles.audioPlayBtn,
-                  (!currentStepAudioB64 || audioLoading) &&
-                  styles.navBtnDisabled,
+                  !currentStepAudioUri && styles.navBtnDisabled,
                 ]}
                 onPress={handleTogglePlayPause}
-                disabled={!currentStepAudioB64 || audioLoading}
+                disabled={!currentStepAudioUri}
               >
-                {audioLoading ? (
-                  <ActivityIndicator size="small" color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.audioPlayBtnText}>
-                    {status.playing ? "⏸ Pause" : "▶ Play"}
-                  </Text>
-                )}
+                <Text style={styles.audioPlayBtnText}>
+                  {status.playing ? "⏸ Pause" : "▶ Play"}
+                </Text>
               </Pressable>
 
               <Pressable style={styles.audioBtn} onPress={handleReplayStep}>
@@ -564,7 +562,7 @@ export default function App() {
             <View style={styles.navRow}>
               <Pressable
                 style={[styles.navBtn, !canGoPrev && styles.navBtnDisabled]}
-                onPress={() => canGoPrev && setStepIndex((i) => i - 1)}
+                onPress={() => canGoPrev && handleSelectStep(stepIndex - 1)}
                 disabled={!canGoPrev}
               >
                 <Text style={styles.navBtnText}>السابق</Text>
@@ -580,7 +578,7 @@ export default function App() {
                   styles.navBtnPrimary,
                   !canGoNext && styles.navBtnDisabled,
                 ]}
-                onPress={() => canGoNext && setStepIndex((i) => i + 1)}
+                onPress={() => canGoNext && handleSelectStep(stepIndex + 1)}
                 disabled={!canGoNext}
               >
                 <Text style={[styles.navBtnText, styles.navBtnPrimaryText]}>

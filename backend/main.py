@@ -42,8 +42,8 @@ MAX_PDF_SIZE_MB: int = max(1, int(os.getenv("MAX_PDF_SIZE_MB", "25")))
 MAX_PDF_SIZE_BYTES: int = MAX_PDF_SIZE_MB * 1024 * 1024
 MAX_RENDER_DIM_PX: int = max(1024, int(os.getenv("MAX_RENDER_DIM_PX", "2048")))
 
-# Iraqi Neural TTS Configuration (edge-tts, 100% in-memory)
-TTS_VOICE: str = os.getenv("TTS_VOICE", "ar-IQ-BasselNeural").strip()
+# Strictly locked Iraqi Arabic neural voice (edge-tts, 100% in-memory; never ar-EG-* or ar-SA-*)
+TTS_VOICE: str = "ar-IQ-BasselNeural"
 TTS_TIMEOUT_SEC: float = max(5.0, float(os.getenv("TTS_TIMEOUT_SEC", "15.0")))
 
 _raw_cors = os.getenv("CORS_ORIGINS", "*").strip()
@@ -63,11 +63,12 @@ async def lifespan(_app: FastAPI):
     if GEMINI_API_KEY:
         _genai_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info(
-            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | dpi=%d",
+            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | dpi=%d | tts_voice=%s",
             FAST_TUTOR_MODEL,
             DEEP_TUTOR_MODEL,
             FALLBACK_TUTOR_MODEL,
             PDF_RENDER_DPI,
+            TTS_VOICE,
         )
     else:
         logger.warning("GEMINI_API_KEY is not set; /api/explain will fail until configured.")
@@ -232,13 +233,13 @@ class ExplainSlideWithAudioResponse(ExplainSlideResponse):
     )
 
 
-async def _synthesize_step_audio_b64(text: str, voice: str = TTS_VOICE) -> Optional[str]:
-    """Generate MP3 speech purely in memory via edge-tts and return raw Base64."""
+async def _synthesize_step_audio_b64(text: str) -> Optional[str]:
+    """Generate MP3 speech purely in memory via edge-tts strictly using ar-IQ-BasselNeural."""
     cleaned = (text or "").strip()
     if not cleaned:
         return None
     try:
-        communicate = edge_tts.Communicate(text=cleaned, voice=voice)
+        communicate = edge_tts.Communicate(text=cleaned, voice=TTS_VOICE)
         audio_chunks: list[bytes] = []
         async for chunk in communicate.stream():
             if chunk.get("type") == "audio" and chunk.get("data"):
@@ -247,7 +248,7 @@ async def _synthesize_step_audio_b64(text: str, voice: str = TTS_VOICE) -> Optio
             return None
         return base64.b64encode(b"".join(audio_chunks)).decode("ascii")
     except Exception as exc:
-        logger.warning("edge-tts synthesis failed (voice=%s): %s", voice, exc)
+        logger.warning("edge-tts synthesis failed (voice=%s): %s", TTS_VOICE, exc)
         return None
 
 
@@ -255,7 +256,7 @@ async def _synthesize_plan_audio(plan: LecturePlan) -> list[StepAudioPayload]:
     """Synthesize all TeachingStep narrations concurrently using asyncio.gather."""
     tasks = [
         asyncio.wait_for(
-            _synthesize_step_audio_b64(step.speech_ar, TTS_VOICE),
+            _synthesize_step_audio_b64(step.speech_ar),
             timeout=TTS_TIMEOUT_SEC,
         )
         for step in plan.steps
@@ -371,8 +372,9 @@ async def explain_slide(
     user_instruction = (
         f"Explain slide page {page_number} of {total_pages} from this lecture PDF thoroughly. "
         f"Do NOT summarize briefly: break down every concept, diagram component, equation, or code line into "
-        f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in natural Iraqi academic Arabic "
-        f"(keeping all scientific terms in English). Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
+        f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in clear, natural Iraqi academic Arabic "
+        f"(لهجة عراقية بيضاء مفهومة) with light Arabic diacritics (تشكيل خفيف) on ambiguous words, avoiding heavy slang spellings "
+        f"and keeping all scientific terms in English. Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
     )
 
     logger.info(
