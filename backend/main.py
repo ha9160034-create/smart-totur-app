@@ -8,6 +8,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
 import edge_tts
 import fitz  # PyMuPDF
@@ -22,8 +23,12 @@ from google.genai import types as genai_types
 from pydantic import BaseModel, Field, ValidationError
 
 import db
-from prompts import build_qa_system_prompt, build_tutor_system_prompt
-from schema import ExplainSlideResponse, LecturePlan
+from prompts import (
+    build_free_tutor_system_prompt,
+    build_qa_system_prompt,
+    build_tutor_system_prompt,
+)
+from schema import ExplainSlideResponse, FreeAskRequest, LecturePlan, VisualAction
 
 load_dotenv()
 
@@ -42,6 +47,7 @@ GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 FAST_TUTOR_MODEL: str = os.getenv("FAST_TUTOR_MODEL", "gemini-3.5-flash-lite").strip()
 DEEP_TUTOR_MODEL: str = os.getenv("DEEP_TUTOR_MODEL", "gemini-3.1-flash-lite").strip()
 FALLBACK_TUTOR_MODEL: str = os.getenv("FALLBACK_TUTOR_MODEL", "gemini-3.1-flash-lite").strip()
+GROUNDING_MODEL: str = os.getenv("GROUNDING_MODEL", FAST_TUTOR_MODEL).strip() or FAST_TUTOR_MODEL
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip()
 EMBEDDING_DIM: int = 768
 
@@ -1647,4 +1653,209 @@ async def ask_slide_question(payload: AskSlideRequest) -> ExplainSlideWithAudioR
         step_audio=step_audio,
         cached=False,
         lecture_id=payload.lecture_id,
+    )
+
+
+def _extract_grounding_sources(response: Any, max_sources: int = 5) -> list[str]:
+    """Extract clean, deduplicated source titles/domains from Gemini grounding_metadata.grounding_chunks."""
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return []
+    gm = getattr(candidates[0], "grounding_metadata", None)
+    if gm is None:
+        return []
+    chunks = getattr(gm, "grounding_chunks", None) or []
+
+    sources: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        if web is None:
+            continue
+        title = str(getattr(web, "title", None) or "").strip()
+        uri = str(getattr(web, "uri", None) or "").strip()
+
+        label = ""
+        if title and not title.lower().startswith("http"):
+            label = title[:70]
+        elif uri:
+            host = (urlparse(uri).netloc or "").lower().removeprefix("www.")
+            label = host[:70]
+
+        if not label:
+            continue
+        norm = label.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        sources.append(label)
+        if len(sources) >= max_sources:
+            break
+    return sources
+
+
+async def _ground_question_with_search(question: str) -> tuple[str, list[str]]:
+    """
+    Stage 1 Web Source Grounding using active Gemini 3.x models with GoogleSearch().
+    Fails open gracefully to ('', []) on 429 quota limits, timeouts, or upstream errors
+    so /api/ask-free always completes cleanly.
+    """
+    if _genai_client is None:
+        return "", []
+
+    search_chain: list[str] = []
+    for m in (GROUNDING_MODEL, FALLBACK_TUTOR_MODEL):
+        if m and m not in search_chain:
+            search_chain.append(m)
+
+    grounding_prompt = (
+        "Provide concise, verified factual notes, exact formulas/units, dates, or key definitions "
+        "needed to accurately teach a student the following question. Keep the summary concise "
+        "(under 220 words) and strictly factual.\n\n"
+        f"Question: {question}"
+    )
+    gen_config = genai_types.GenerateContentConfig(
+        tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+        temperature=0.2,
+        max_output_tokens=768,
+    )
+
+    for model_name in search_chain:
+        try:
+            resp = await asyncio.wait_for(
+                _genai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=[grounding_prompt],
+                    config=gen_config,
+                ),
+                timeout=12.0,
+            )
+            facts = (getattr(resp, "text", None) or "").strip()
+            sources = _extract_grounding_sources(resp)
+            if facts or sources:
+                logger.info(
+                    "Search grounding succeeded | model=%s | facts_chars=%d | sources=%d",
+                    model_name,
+                    len(facts),
+                    len(sources),
+                )
+                return facts, sources
+        except Exception as exc:
+            logger.warning(
+                "Search grounding skipped on model=%s (failing open gracefully): %s",
+                model_name,
+                str(exc)[:180],
+            )
+            continue
+
+    return "", []
+
+
+@app.post(
+    "/api/ask-free",
+    response_model=ExplainSlideWithAudioResponse,
+    summary="Standalone Free-Form AI Tutor (No-PDF Mode) with two-stage web source grounding & bilingual audio",
+)
+async def ask_free_question(payload: FreeAskRequest) -> ExplainSlideWithAudioResponse:
+    if _genai_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfiguration: GEMINI_API_KEY is missing.",
+        )
+
+    cleaned_question = payload.question.strip()
+    if not cleaned_question:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Question cannot be empty.",
+        )
+
+    # Stage 1: Optional Google Search Grounding (fails open safely to ("", []))
+    grounded_facts = ""
+    sources: list[str] = []
+    if payload.search_sources:
+        grounded_facts, sources = await _ground_question_with_search(cleaned_question)
+
+    # Stage 2: Structured LecturePlan generation in strict whiteboard-only zero-wipe mode
+    is_followup = bool(payload.history)
+    model_chain = _build_model_fallback_chain(use_deep_model=False)
+    system_prompt = build_free_tutor_system_prompt(
+        grounded_facts=grounded_facts,
+        sources=sources,
+        history=payload.history,
+    )
+    step_target = "1 to 3 focused follow-up steps" if is_followup else "4 to 6 rich teaching steps"
+    user_instruction = (
+        f"Student question: \"{cleaned_question}\"\n"
+        f"Teach this clearly from scratch on the whiteboard in {step_target} using warm White Saudi Educational Arabic "
+        f"(no harakat or raw symbols in speech_ar, Arabic classifier nouns before English terms). "
+        f"Use mode='whiteboard' for every step, NEVER emit clear_board or bbox, choose subject-appropriate visual tools "
+        f"(wb_equation, wb_diagram, wb_table, wb_flow_card, wb_note; use wb_code ONLY for programming topics), "
+        f"and return a valid LecturePlan JSON."
+    )
+
+    logger.info(
+        "Free Q&A | followup=%s | search=%s | grounded_sources=%d | q=%r",
+        is_followup,
+        payload.search_sources,
+        len(sources),
+        cleaned_question[:80],
+    )
+
+    plan, used_model = await _generate_plan_with_fallback(
+        image_bytes=None,
+        system_prompt=system_prompt,
+        user_instruction=user_instruction,
+        model_chain=model_chain,
+    )
+
+    sanitized_plan = _sanitize_plan(
+        plan,
+        "whiteboard",
+        strip_clear_board=True,
+    )
+
+    # Attach verified grounding sources and guarantee a clean closing citation wb_note when sources exist
+    if sources:
+        sanitized_plan.sources = sources
+        if sanitized_plan.steps:
+            last_step = sanitized_plan.steps[-1]
+            has_source_note = any(
+                a.type == "wb_note"
+                and a.text
+                and ("source" in a.text.lower() or "مصادر" in a.text or "مصدر" in a.text)
+                for a in last_step.actions
+            )
+            if not has_source_note:
+                last_step.actions.append(
+                    VisualAction(
+                        type="wb_note",
+                        color="blue",
+                        slot="bottom_summary",
+                        text=f"Sources: {' • '.join(sources[:4])}",
+                    )
+                )
+
+    # Stage 3: Synthesize bilingual Arabic + English WordBoundary-synced MP3 audio concurrently
+    step_audio = await _synthesize_plan_audio(sanitized_plan)
+
+    logger.info(
+        "Completed Free Q&A | used_model=%s | steps=%d | sources=%d | audio_ready=%d/%d",
+        used_model,
+        len(sanitized_plan.steps),
+        len(sanitized_plan.sources or []),
+        sum(1 for a in step_audio if a.audio_base64),
+        len(step_audio),
+    )
+
+    return ExplainSlideWithAudioResponse(
+        plan=sanitized_plan,
+        slide_image_data_uri="",
+        slide_width=1280,
+        slide_height=720,
+        page_number=1,
+        total_pages=1,
+        step_audio=step_audio,
+        cached=False,
+        lecture_id=None,
     )

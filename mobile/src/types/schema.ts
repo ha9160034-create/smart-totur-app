@@ -95,6 +95,7 @@ export interface LecturePlan {
   needs_deep_reasoning: boolean;
   steps: TeachingStep[];
   quiz_question_ar: string;
+  sources?: string[] | null;
 }
 
 export interface ExplainSlideResponse {

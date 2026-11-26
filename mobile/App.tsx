@@ -282,10 +282,13 @@ function TutorWorkspace() {
   const [recentLectures, setRecentLectures] = useState<LectureSummary[]>([]);
   const [supabaseConfigured, setSupabaseConfigured] = useState<boolean>(true);
 
-  // Interactive Slide Q&A ("Ask the Professor") State
+  // Interactive Slide Q&A & Standalone Free-Form AI Tutor (No-PDF Mode) State
   const [askExpanded, setAskExpanded] = useState<boolean>(false);
   const [askInput, setAskInput] = useState<string>("");
   const [askLoading, setAskLoading] = useState<boolean>(false);
+  const [isFreeMode, setIsFreeMode] = useState<boolean>(false);
+  const [freeSearchEnabled, setFreeSearchEnabled] = useState<boolean>(true);
+  const [homeAskInput, setHomeAskInput] = useState<string>("");
 
   // Audio-Visual Sync Engine State (expo-audio at 50ms update cadence for smooth progressive drawing)
   const player = useAudioPlayer(null, { updateInterval: 50 });
@@ -302,6 +305,8 @@ function TutorWorkspace() {
   const cacheSessionRef = useRef<number>(0);
   // Per-lecture page summary map for seamless cross-page continuity (Page N-1 -> Page N)
   const pageSummariesRef = useRef<Map<number, string>>(new Map());
+  // Multi-turn history for standalone Free Q&A whiteboard sessions
+  const freeHistoryRef = useRef<Array<{ question: string; summary: string }>>([]);
 
   const steps = result?.plan.steps ?? [];
   const currentStep = steps[stepIndex] ?? null;
@@ -538,6 +543,8 @@ function TutorWorkspace() {
   };
 
   const handleCycleBoardMode = () => {
+    // Safeguard #1: Keep whiteboard locked in Free Q&A mode (no empty PDF canvas)
+    if (isFreeMode) return;
     const idx = BOARD_MODE_CYCLE.indexOf(boardMode);
     setBoardMode(BOARD_MODE_CYCLE[(idx + 1) % BOARD_MODE_CYCLE.length]);
   };
@@ -643,6 +650,63 @@ function TutorWorkspace() {
     setReplayToken((t) => t + 1);
   };
 
+  const handleStartFreeAsk = async () => {
+    if (loading || askLoading) return;
+    const cleanedQuestion = homeAskInput.trim();
+    if (!cleanedQuestion) return;
+
+    Keyboard.dismiss();
+    shouldAutoPlayRef.current = false;
+    setIsPlaying(false);
+    advancedFromStepRef.current = 0;
+    try {
+      player.pause();
+    } catch {
+      // Ignore if idle
+    }
+
+    setLoading(true);
+    setError(null);
+    setIsFreeMode(true);
+    setBoardMode("whiteboard");
+    freeHistoryRef.current = [];
+
+    try {
+      const data = await postJson<ExplainSlideWithAudioResponse>(
+        `${API_BASE_URL}/api/ask-free`,
+        {
+          question: cleanedQuestion,
+          search_sources: freeSearchEnabled,
+          history: [],
+        },
+        REQUEST_TIMEOUT_MS
+      );
+
+      if (!data.plan?.steps?.length) {
+        throw new Error("Server returned an empty explanation.");
+      }
+
+      const turnSummary = [
+        data.plan.title,
+        ...data.plan.steps.slice(0, 4).map((s) => s.speech_ar.trim().slice(0, 95)),
+      ]
+        .filter(Boolean)
+        .join(" | ")
+        .slice(0, 420);
+      freeHistoryRef.current = [{ question: cleanedQuestion, summary: turnSummary }];
+
+      setHomeAskInput("");
+      await activateSlideResponse(data);
+    } catch (err) {
+      setIsFreeMode(false);
+      setError(
+        err instanceof Error ? err.message : "Failed to answer question."
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleAskQuestion = async () => {
     if (!result || askLoading) return;
     const cleanedQuestion = askInput.trim();
@@ -663,28 +727,56 @@ function TutorWorkspace() {
 
     try {
       const existingSteps = result.plan.steps;
-      const contextLines = [
-        `Slide Title: ${result.plan.title}`,
-        ...existingSteps
-          .slice(-6)
-          .map((s) => `Step ${s.step_id}: ${s.speech_ar}`),
-      ];
-      const currentPlanContext = contextLines.join("\n").slice(0, 1800);
+      let qaData: ExplainSlideWithAudioResponse;
 
-      const qaData = await postJson<ExplainSlideWithAudioResponse>(
-        `${API_BASE_URL}/api/ask`,
-        {
-          lecture_id: result.lecture_id ?? null,
-          page_number: result.page_number,
-          question: cleanedQuestion,
-          board_mode: boardMode,
-          current_plan_context: currentPlanContext,
-        },
-        REQUEST_TIMEOUT_MS
-      );
+      if (isFreeMode) {
+        qaData = await postJson<ExplainSlideWithAudioResponse>(
+          `${API_BASE_URL}/api/ask-free`,
+          {
+            question: cleanedQuestion,
+            search_sources: freeSearchEnabled,
+            history: freeHistoryRef.current,
+          },
+          REQUEST_TIMEOUT_MS
+        );
+      } else {
+        const contextLines = [
+          `Slide Title: ${result.plan.title}`,
+          ...existingSteps
+            .slice(-6)
+            .map((s) => `Step ${s.step_id}: ${s.speech_ar}`),
+        ];
+        const currentPlanContext = contextLines.join("\n").slice(0, 1800);
+
+        qaData = await postJson<ExplainSlideWithAudioResponse>(
+          `${API_BASE_URL}/api/ask`,
+          {
+            lecture_id: result.lecture_id ?? null,
+            page_number: result.page_number,
+            question: cleanedQuestion,
+            board_mode: boardMode,
+            current_plan_context: currentPlanContext,
+          },
+          REQUEST_TIMEOUT_MS
+        );
+      }
 
       if (!qaData.plan?.steps?.length) {
         throw new Error("Server returned an empty Q&A explanation.");
+      }
+
+      if (isFreeMode) {
+        const turnSummary = [
+          qaData.plan.title,
+          ...qaData.plan.steps.slice(0, 3).map((s) => s.speech_ar.trim().slice(0, 95)),
+        ]
+          .filter(Boolean)
+          .join(" | ")
+          .slice(0, 420);
+        freeHistoryRef.current = [
+          ...freeHistoryRef.current.slice(-5),
+          { question: cleanedQuestion, summary: turnSummary },
+        ];
       }
 
       // Renumber incoming Q&A step_ids sequentially after existing steps for clean canvas keys
@@ -733,6 +825,7 @@ function TutorWorkspace() {
             steps: [...prev.plan.steps, ...renumberedSteps],
             quiz_question_ar:
               qaData.plan.quiz_question_ar || prev.plan.quiz_question_ar,
+            sources: qaData.plan.sources ?? prev.plan.sources,
           },
           step_audio: [
             ...(prev.step_audio ?? []),
@@ -793,6 +886,8 @@ function TutorWorkspace() {
       pageSummariesRef.current.clear();
     }
 
+    setIsFreeMode(false);
+    freeHistoryRef.current = [];
     setLoading(true);
     setError(null);
     setPageInput(String(cachedPage.page_number));
@@ -841,6 +936,8 @@ function TutorWorkspace() {
       // Ignore if idle
     }
 
+    setIsFreeMode(false);
+    freeHistoryRef.current = [];
     setLoading(true);
     setError(null);
 
@@ -966,7 +1063,7 @@ function TutorWorkspace() {
       <View style={styles.canvasFullScreen}>
         {result && currentStep ? (
           <SmartBoardCanvas
-            key={`board-${result.page_number}`}
+            key={isFreeMode ? "board-free-qa" : `board-${result.page_number}`}
             steps={steps}
             currentStepIndex={stepIndex}
             slideImageUri={result.slide_image_data_uri}
@@ -981,48 +1078,112 @@ function TutorWorkspace() {
             bottomInset={bottomHudInset}
           />
         ) : (
-          <View style={styles.emptyPaperStage}>
-            <View
-              style={[
-                styles.welcomeCard,
-                { maxWidth: isTablet ? 460 : 380 },
-              ]}
+          <KeyboardAvoidingView
+            behavior={Platform.OS === "ios" ? "padding" : "height"}
+            style={styles.emptyPaperStage}
+          >
+            <ScrollView
+              style={styles.emptyPaperScroll}
+              contentContainerStyle={styles.emptyPaperScrollContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
             >
-              <Text style={styles.welcomeBadge}>SPATIAL AI WHITEBOARD</Text>
-              <Text style={styles.welcomeTitle}>AI Smart Whiteboard Tutor</Text>
-              <Text style={styles.welcomeSub}>
-                Select a lecture PDF or open a cached lecture to explore
-                step-by-step explanations on an interactive pan & zoom paper
-                canvas.
-              </Text>
+              <View
+                style={[
+                  styles.welcomeCard,
+                  { maxWidth: isTablet ? 460 : 380 },
+                ]}
+              >
+                <Text style={styles.welcomeBadge}>SPATIAL AI WHITEBOARD</Text>
+                <Text style={styles.welcomeTitle}>AI Smart Whiteboard Tutor</Text>
+                <Text style={styles.welcomeSub}>
+                  Select a lecture PDF or open a cached lecture to explore
+                  step-by-step explanations on an interactive pan & zoom paper
+                  canvas.
+                </Text>
 
-              <View style={styles.welcomeActions}>
-                <Pressable
-                  style={styles.welcomePrimaryBtn}
-                  onPress={handlePickPdf}
-                >
-                  <Text style={styles.welcomePrimaryText}>
-                    {pdfFile ? "Change Lecture PDF" : "Select Lecture PDF"}
-                  </Text>
-                </Pressable>
+                <View style={styles.welcomeActions}>
+                  <Pressable
+                    style={styles.welcomePrimaryBtn}
+                    onPress={handlePickPdf}
+                  >
+                    <Text style={styles.welcomePrimaryText}>
+                      {pdfFile ? "Change Lecture PDF" : "Select Lecture PDF"}
+                    </Text>
+                  </Pressable>
 
-                <Pressable
-                  style={styles.welcomeSecondaryBtn}
-                  onPress={handleOpenRecentLectures}
-                >
-                  <Text style={styles.welcomeSecondaryText}>
-                    Recent Lectures
+                  <Pressable
+                    style={styles.welcomeSecondaryBtn}
+                    onPress={handleOpenRecentLectures}
+                  >
+                    <Text style={styles.welcomeSecondaryText}>
+                      Recent Lectures
+                    </Text>
+                  </Pressable>
+                </View>
+
+                {pdfFile && (
+                  <Text style={styles.welcomeSelectedNote} numberOfLines={1}>
+                    Ready: {pdfFile.name} • Page {pageInput || "1"}
                   </Text>
-                </Pressable>
+                )}
               </View>
 
-              {pdfFile && (
-                <Text style={styles.welcomeSelectedNote} numberOfLines={1}>
-                  Ready: {pdfFile.name} • Page {pageInput || "1"}
-                </Text>
-              )}
-            </View>
-          </View>
+              {/* Minimalist Free-Form AI Tutor Chat Bar (No PDF Required) */}
+              <View
+                style={[
+                  styles.homeAskPill,
+                  { maxWidth: isTablet ? 460 : 380 },
+                ]}
+              >
+                <Pressable
+                  style={[
+                    styles.webToggleBtn,
+                    freeSearchEnabled && styles.webToggleBtnActive,
+                  ]}
+                  onPress={() => setFreeSearchEnabled((v) => !v)}
+                  disabled={loading}
+                  accessibilityLabel="Toggle web search sources"
+                >
+                  <Text
+                    style={[
+                      styles.webToggleIcon,
+                      freeSearchEnabled && styles.webToggleIconActive,
+                    ]}
+                  >
+                    🌐
+                  </Text>
+                </Pressable>
+
+                <TextInput
+                  value={homeAskInput}
+                  onChangeText={setHomeAskInput}
+                  placeholder="اسأل أي سؤال"
+                  placeholderTextColor="#94A3B8"
+                  style={styles.homeAskInput}
+                  returnKeyType="send"
+                  editable={!loading}
+                  onSubmitEditing={() => void handleStartFreeAsk()}
+                />
+
+                <Pressable
+                  style={[
+                    styles.askSendBtn,
+                    (!homeAskInput.trim() || loading) && styles.dockDisabled,
+                  ]}
+                  onPress={() => void handleStartFreeAsk()}
+                  disabled={!homeAskInput.trim() || loading}
+                  accessibilityLabel="Send question"
+                >
+                  {loading ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.askSendBtnText}>↑</Text>
+                  )}
+                </Pressable>
+              </View>
+            </ScrollView>
+          </KeyboardAvoidingView>
         )}
       </View>
 
@@ -1056,22 +1217,28 @@ function TutorWorkspace() {
 
             <View style={styles.pillDivider} />
 
-            <View style={styles.pageMiniGroup}>
-              <Text style={styles.pageMiniPrefix}>P.</Text>
-              <TextInput
-                value={pageInput}
-                onChangeText={setPageInput}
-                keyboardType="number-pad"
-                maxLength={4}
-                style={styles.pageMiniInput}
-                placeholder="1"
-                placeholderTextColor="#94A3B8"
-                returnKeyType="go"
-                onSubmitEditing={() => {
-                  if (pdfFile && !loading) void handleExplain();
-                }}
-              />
-            </View>
+            {isFreeMode ? (
+              <View style={styles.freeModeBadge}>
+                <Text style={styles.freeModeBadgeText}>Free Q&A</Text>
+              </View>
+            ) : (
+              <View style={styles.pageMiniGroup}>
+                <Text style={styles.pageMiniPrefix}>P.</Text>
+                <TextInput
+                  value={pageInput}
+                  onChangeText={setPageInput}
+                  keyboardType="number-pad"
+                  maxLength={4}
+                  style={styles.pageMiniInput}
+                  placeholder="1"
+                  placeholderTextColor="#94A3B8"
+                  returnKeyType="go"
+                  onSubmitEditing={() => {
+                    if (pdfFile && !loading) void handleExplain();
+                  }}
+                />
+              </View>
+            )}
 
             <View style={styles.pillDivider} />
 
@@ -1088,18 +1255,25 @@ function TutorWorkspace() {
             <Pressable
               style={[
                 styles.circleIconBtn,
-                boardMode !== "auto" && styles.circleIconBtnBlue,
+                (isFreeMode || boardMode !== "auto") && styles.circleIconBtnBlue,
+                isFreeMode && styles.circleIconBtnLocked,
               ]}
               onPress={handleCycleBoardMode}
-              accessibilityLabel="Toggle board mode"
+              disabled={isFreeMode}
+              accessibilityLabel={
+                isFreeMode
+                  ? "Whiteboard mode locked in Free Q&A"
+                  : "Toggle board mode"
+              }
             >
               <Text
                 style={[
                   styles.circleIconLabel,
-                  boardMode !== "auto" && styles.circleIconLabelActive,
+                  (isFreeMode || boardMode !== "auto") &&
+                    styles.circleIconLabelActive,
                 ]}
               >
-                {BOARD_MODE_SHORT_LABELS[boardMode]}
+                {isFreeMode ? "WB" : BOARD_MODE_SHORT_LABELS[boardMode]}
               </Text>
             </Pressable>
 
@@ -1212,10 +1386,34 @@ function TutorWorkspace() {
           >
             {askExpanded ? (
               <View style={styles.askExpandedPill}>
+                {isFreeMode && (
+                  <Pressable
+                    style={[
+                      styles.webToggleBtn,
+                      freeSearchEnabled && styles.webToggleBtnActive,
+                    ]}
+                    onPress={() => setFreeSearchEnabled((v) => !v)}
+                    disabled={askLoading}
+                    accessibilityLabel="Toggle web search sources"
+                  >
+                    <Text
+                      style={[
+                        styles.webToggleIcon,
+                        freeSearchEnabled && styles.webToggleIconActive,
+                      ]}
+                    >
+                      🌐
+                    </Text>
+                  </Pressable>
+                )}
                 <TextInput
                   value={askInput}
                   onChangeText={setAskInput}
-                  placeholder="Ask anything about this slide..."
+                  placeholder={
+                    isFreeMode
+                      ? "اسأل سؤال متابعة..."
+                      : "Ask anything about this slide..."
+                  }
                   placeholderTextColor="#94A3B8"
                   style={styles.askTextInput}
                   returnKeyType="send"
@@ -1272,7 +1470,11 @@ function TutorWorkspace() {
             <View style={styles.dockLoadingRow}>
               <ActivityIndicator size="small" color="#F8FAFC" />
               <Text style={styles.dockLoadingText}>
-                Analyzing & voicing page {pageInput || "1"}...
+                {isFreeMode
+                  ? freeSearchEnabled
+                    ? "Researching & voicing explanation..."
+                    : "Thinking & voicing explanation..."
+                  : `Analyzing & voicing page ${pageInput || "1"}...`}
               </Text>
             </View>
           ) : result && currentStep ? (
@@ -1526,9 +1728,83 @@ const styles = StyleSheet.create({
   emptyPaperStage: {
     flex: 1,
     backgroundColor: "#FAF8F5",
+  },
+  emptyPaperScroll: {
+    flex: 1,
+  },
+  emptyPaperScrollContent: {
+    flexGrow: 1,
     alignItems: "center",
     justifyContent: "center",
     paddingHorizontal: 24,
+    paddingTop: 84,
+    paddingBottom: 112,
+    gap: 14,
+  },
+  homeAskPill: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.98)",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 999,
+    paddingLeft: 8,
+    paddingRight: 6,
+    paddingVertical: 5,
+    gap: 6,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  homeAskInput: {
+    flex: 1,
+    fontSize: 14,
+    color: "#0F172A",
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+    textAlign: "right",
+    includeFontPadding: false,
+  },
+  webToggleBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  webToggleBtnActive: {
+    backgroundColor: "#CCFBF1",
+    borderWidth: 1,
+    borderColor: "#5EEAD4",
+  },
+  webToggleIcon: {
+    fontSize: 14,
+    opacity: 0.45,
+    includeFontPadding: false,
+  },
+  webToggleIconActive: {
+    opacity: 1,
+  },
+  freeModeBadge: {
+    backgroundColor: "#F0FDFA",
+    borderWidth: 1,
+    borderColor: "#99F6E4",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  freeModeBadgeText: {
+    fontSize: 10.5,
+    fontWeight: "800",
+    color: "#0F766E",
+    includeFontPadding: false,
+  },
+  circleIconBtnLocked: {
+    opacity: 0.85,
   },
   welcomeCard: {
     width: "100%",

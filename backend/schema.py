@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 # خانات ثابتة للسبورة البيضاء حتى النموذج الرخيص ما يركب الكلام فوق بعضه
@@ -279,7 +279,29 @@ class LecturePlan(BaseModel):
     steps: List[TeachingStep] = Field(..., min_length=1)
     quiz_question_ar: str = Field(
         ...,
-        description="One practical application question in Iraqi Arabic at the end of the explanation."
+        description="One practical application question in White Saudi Educational Arabic at the end of the explanation."
+    )
+    sources: Optional[List[str]] = Field(
+        default=None,
+        description="Optional verified web source titles/domains used to ground a standalone free-form explanation."
+    )
+
+
+class FreeAskRequest(BaseModel):
+    """Request payload for standalone no-PDF free-form tutor & follow-up chat."""
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=1200,
+        description="Student's standalone or follow-up question.",
+    )
+    search_sources: bool = Field(
+        default=True,
+        description="Whether to run Stage 1 Google Search grounding before generating the whiteboard plan.",
+    )
+    history: Optional[List[dict[str, Any]]] = Field(
+        default=None,
+        description="Optional prior conversation turns [{question, summary}] for multi-turn continuity.",
     )
 
 
