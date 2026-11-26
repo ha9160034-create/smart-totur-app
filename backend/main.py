@@ -319,6 +319,7 @@ def _sanitize_plan(
         "wb_flow_card",
         "wb_table",
         "wb_note",
+        "wb_diagram",
     }
 
     for step in plan.steps:
@@ -346,6 +347,8 @@ def _sanitize_plan(
                     if resolved_code:
                         action.code = resolved_code
                         action.text = resolved_code
+                elif action.type == "wb_diagram" and action.slot is None:
+                    action.slot = "main_top"
 
     return plan
 

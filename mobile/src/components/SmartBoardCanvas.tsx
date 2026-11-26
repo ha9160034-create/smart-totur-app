@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Image,
   LayoutChangeEvent,
@@ -29,6 +29,9 @@ import Animated, {
 } from "react-native-reanimated";
 import type {
   BoundingBox,
+  DiagramEdge,
+  DiagramNode,
+  DiagramTint,
   SketchIcon,
   TeachingStep,
   VisualAction,
@@ -36,12 +39,17 @@ import type {
   WordTiming,
 } from "../types/schema";
 import {
+  computeSmartDiagramArrowGeometry,
+  createDiamondFillPath,
   createRoughArrowPath,
   createRoughCirclePath,
+  createRoughDashedRectPath,
+  createRoughDiamondPath,
   createRoughRectPath,
   createRoughTableGridPath,
   createRoughUnderlinePath,
   createSketchIconPath,
+  createSmartDiagramArrowPath,
   hashSeed,
   makeEmptySkiaPath,
 } from "../utils/roughSkia";
@@ -86,6 +94,8 @@ export interface SmartBoardCanvasProps {
   isPlaying?: boolean;
   /** Incremented on Replay Step to re-trigger progressive animation without remounting canvas */
   replayToken?: number;
+  /** True once bundled handwritten whiteboard TTF fonts have loaded via expo-font */
+  handwrittenFontsReady?: boolean;
   /** Safe top padding so whiteboard cards begin cleanly below the floating HUD pill */
   topInset?: number;
   /** Safe bottom padding so cards & Reset View button stay clear of the floating dark dock */
@@ -101,13 +111,30 @@ const MIN_SCALE = 0.6;
 const MAX_SCALE = 3.0;
 const MIN_TABLE_COL_WIDTH = 105;
 const TABLE_CANVAS_BLEED = 8; // >= 6px bleed on all sides so 3-4px corner overshoots & double-strokes never clip
-const WORD_SYNC_REVEAL_WINDOW_MS = 240;
-const WORD_SYNC_LEAD_MS = 150; // Leading edge so visuals arrive slightly ahead of speech
+const WORD_SYNC_LEAD_MS = 250; // +250ms leading edge so ink-sweeps finish on or ahead of speech
 const CARD_BORDER_DRAW_MS = 480;
 const TABLE_GRID_DRAW_MS = 580;
 const ARROW_DRAW_DELAY_MS = 320;
 const ARROW_DRAW_MS = 440;
 const PDF_STROKE_DRAW_MS = 460;
+const INK_SWEEP_HEADING_MS = 320;
+const INK_SWEEP_CARD_MS = 320;
+const INK_SWEEP_BULLET_MS = 280;
+const INK_SWEEP_TABLE_HEADER_MS = 260;
+const INK_SWEEP_TABLE_ROW_MS = 290;
+const INK_SWEEP_NOTE_MS = 340;
+const DIAGRAM_CANVAS_BLEED = 8; // >= 6px bleed on all sides for rough overshoots & curved loop arrows
+const DIAGRAM_TITLE_HEIGHT = 36;
+const DIAGRAM_NODE_DRAW_MS = 450;
+const DIAGRAM_EDGE_DRAW_MS = 400;
+const DIAGRAM_EDGE_DELAY_MS = 140;
+const DIAGRAM_MIN_NODE_W = 76; // Safeguard #1: minimum readable node width on narrow phones
+const DIAGRAM_MIN_NODE_H = 38; // Safeguard #1: minimum readable node height on narrow phones
+const HANDWRITTEN_WIDTH_FACTOR = 1.12; // PlaypenSansArabic / PatrickHand glyph advance factor
+
+const FONT_AR_REGULAR = "PlaypenSansArabic-Regular";
+const FONT_AR_SEMIBOLD = "PlaypenSansArabic-SemiBold";
+const FONT_EN_HAND = "PatrickHand-Regular";
 
 const CODE_FONT_FAMILY = Platform.select({
   ios: "Menlo",
@@ -120,6 +147,79 @@ const SERIF_FONT_FAMILY = Platform.select({
   android: "serif",
   default: "serif",
 });
+
+const ARABIC_SCRIPT_RE = /[\u0600-\u06FF]/;
+
+function hasArabicChars(text: string): boolean {
+  return ARABIC_SCRIPT_RE.test(text);
+}
+
+function isArabicDominant(text: string): boolean {
+  if (!text) return false;
+  const arCount = text.match(/[\u0600-\u06FF]/g)?.length ?? 0;
+  const enCount = text.match(/[A-Za-z]/g)?.length ?? 0;
+  return arCount > 0 && arCount >= enCount * 0.4;
+}
+
+type HandwrittenRole =
+  | "heading"
+  | "flowCard"
+  | "bullet"
+  | "note"
+  | "equation"
+  | "tableHeader"
+  | "tableFirstCol"
+  | "tableCell";
+
+/**
+ * Returns cross-platform handwritten font styling.
+ * IMPORTANT: When custom static .ttf fonts are active, fontWeight & fontStyle MUST be
+ * "normal" so Android never silently drops the custom TTF back to system Roboto.
+ */
+function getHandwrittenFontStyle(
+  text: string,
+  role: HandwrittenRole,
+  fontsReady: boolean
+) {
+  if (!fontsReady) {
+    return undefined;
+  }
+  const containsArabic = hasArabicChars(text);
+  const isBoldRole =
+    role === "heading" || role === "tableHeader" || role === "tableFirstCol";
+
+  if (containsArabic) {
+    return {
+      fontFamily: isBoldRole ? FONT_AR_SEMIBOLD : FONT_AR_REGULAR,
+      fontWeight: "normal" as const,
+      fontStyle: "normal" as const,
+    };
+  }
+
+  // English-dominant handwritten headings & labels use PatrickHand-Regular
+  // with slight optical font-size lift on bold/heading roles for crisp presence
+  const opticalBump =
+    role === "heading"
+      ? { fontSize: 20, lineHeight: 27 }
+      : role === "flowCard"
+      ? { fontSize: 16, lineHeight: 23 }
+      : role === "tableHeader"
+      ? { fontSize: 14.5, lineHeight: 20 }
+      : role === "tableFirstCol" || role === "tableCell"
+      ? { fontSize: 14, lineHeight: 20 }
+      : role === "note"
+      ? { fontSize: 15.5, lineHeight: 23 }
+      : role === "bullet"
+      ? { fontSize: 15.5, lineHeight: 22 }
+      : { fontSize: 18, lineHeight: 26 };
+
+  return {
+    fontFamily: FONT_EN_HAND,
+    fontWeight: "normal" as const,
+    fontStyle: "normal" as const,
+    ...opticalBump,
+  };
+}
 
 interface ColorToken {
   stroke: string;
@@ -175,6 +275,73 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
 
 function getColorToken(color?: VisualAction["color"]): ColorToken {
   return (color && COLOR_MAP[color]) || COLOR_MAP.blue;
+}
+
+interface DiagramTintToken {
+  fill: string;
+  containerFill: string;
+  stroke: string;
+  text: string;
+  pillBg: string;
+}
+
+const DIAGRAM_TINT_MAP: Record<DiagramTint, DiagramTintToken> = {
+  blue: {
+    fill: "#EFF6FF",
+    containerFill: "rgba(219, 234, 254, 0.36)",
+    stroke: "#2563EB",
+    text: "#1E3A8A",
+    pillBg: "#DBEAFE",
+  },
+  teal: {
+    fill: "#F0FDFA",
+    containerFill: "rgba(204, 251, 241, 0.38)",
+    stroke: "#0D9488",
+    text: "#115E59",
+    pillBg: "#CCFBF1",
+  },
+  amber: {
+    fill: "#FFFBEB",
+    containerFill: "rgba(254, 243, 199, 0.42)",
+    stroke: "#D97706",
+    text: "#92400E",
+    pillBg: "#FEF3C7",
+  },
+  rose: {
+    fill: "#FFF1F2",
+    containerFill: "rgba(255, 228, 230, 0.4)",
+    stroke: "#E11D48",
+    text: "#9F1239",
+    pillBg: "#FFE4E6",
+  },
+  slate: {
+    fill: "#F8FAFC",
+    containerFill: "rgba(226, 232, 240, 0.38)",
+    stroke: "#475569",
+    text: "#0F172A",
+    pillBg: "#E2E8F0",
+  },
+};
+
+function getDiagramTintToken(
+  tint?: DiagramTint | null,
+  fallbackColor?: VisualAction["color"]
+): DiagramTintToken {
+  if (tint && DIAGRAM_TINT_MAP[tint]) {
+    return DIAGRAM_TINT_MAP[tint];
+  }
+  switch (fallbackColor) {
+    case "green":
+      return DIAGRAM_TINT_MAP.teal;
+    case "red":
+      return DIAGRAM_TINT_MAP.rose;
+    case "yellow":
+      return DIAGRAM_TINT_MAP.amber;
+    case "black":
+      return DIAGRAM_TINT_MAP.slate;
+    default:
+      return DIAGRAM_TINT_MAP.blue;
+  }
 }
 
 function clamp01(value: number): number {
@@ -809,15 +976,15 @@ function resolveWhiteboardBlocks(
 
       const rawSlot: WhiteboardSlot | undefined =
         action.slot ??
-        (action.type === "wb_table"
+        (action.type === "wb_table" || action.type === "wb_diagram"
           ? "main_top"
           : action.type === "wb_note"
           ? "bottom_summary"
           : undefined);
       if (!rawSlot) continue;
 
-      // Always promote wb_heading and wb_table to full contentWidth so headings & tables
-      // never crush inside narrow left_col / right_col half-width columns
+      // Always promote wb_heading, wb_table, and wb_diagram to full contentWidth so
+      // headings, tables, and diagrams never crush inside narrow left_col / right_col columns
       let targetSlot: WhiteboardSlot = rawSlot;
       if (
         action.type === "wb_heading" &&
@@ -825,7 +992,7 @@ function resolveWhiteboardBlocks(
       ) {
         targetSlot = "header";
       } else if (
-        action.type === "wb_table" &&
+        (action.type === "wb_table" || action.type === "wb_diagram") &&
         (rawSlot === "left_col" || rawSlot === "right_col")
       ) {
         targetSlot = bandSlots.has("main_top") ? "full_canvas" : "main_top";
@@ -969,7 +1136,11 @@ function computeTableMetrics(
   const colWidth = tableWidth / colCount;
   const colWidths = Array.from({ length: colCount }, () => colWidth);
 
-  const headerCharsPerLine = Math.max(8, Math.floor((colWidth - 16) / 8.2));
+  // Account for ~1.12x wider handwritten glyph advances + +8px safe cross-platform bottom buffer
+  const headerCharsPerLine = Math.max(
+    7,
+    Math.floor((colWidth - 16) / (8.2 * HANDWRITTEN_WIDTH_FACTOR))
+  );
   let maxHeaderLines = 1;
   for (const h of headers) {
     maxHeaderLines = Math.max(
@@ -977,10 +1148,12 @@ function computeTableMetrics(
       estimateWrappedLines(h || " ", headerCharsPerLine)
     );
   }
-  // Includes +8px cross-platform safe bottom text buffer so Android/iOS cells never clip
-  const headerHeight = Math.max(46, 26 + maxHeaderLines * 20);
+  const headerHeight = Math.max(48, 26 + maxHeaderLines * 22);
 
-  const cellCharsPerLine = Math.max(8, Math.floor((colWidth - 16) / 7.8));
+  const cellCharsPerLine = Math.max(
+    7,
+    Math.floor((colWidth - 16) / (7.8 * HANDWRITTEN_WIDTH_FACTOR))
+  );
   const rowHeights: number[] = rows.map((row) => {
     let maxLines = 1;
     for (const cell of row) {
@@ -989,7 +1162,7 @@ function computeTableMetrics(
         estimateWrappedLines(cell || " ", cellCharsPerLine)
       );
     }
-    return Math.max(44, 26 + maxLines * 19);
+    return Math.max(46, 26 + maxLines * 21);
   });
 
   const gridHeight =
@@ -1012,6 +1185,279 @@ function computeTableMetrics(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive Diagram Metrics (Auto-Fit Enclosing Containers + Min Node Bounds)
+// ---------------------------------------------------------------------------
+interface ResolvedDiagramNode {
+  node: DiagramNode;
+  rect: RectFrame; // In Canvas pixel coordinates (already offset by DIAGRAM_CANVAS_BLEED)
+}
+
+interface ResolvedDiagramEdge {
+  edge: DiagramEdge;
+  fromRect: RectFrame;
+  toRect: RectFrame;
+  curveOffset: number;
+  labelX: number;
+  labelY: number;
+}
+
+interface DiagramLayoutMetrics {
+  title: string;
+  hasTitle: boolean;
+  diagramWidth: number;
+  diagramHeight: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  needsHorizontalScroll: boolean;
+  containers: ResolvedDiagramNode[];
+  innerNodes: ResolvedDiagramNode[];
+  orderedNodes: ResolvedDiagramNode[];
+  edges: ResolvedDiagramEdge[];
+  totalSlotHeight: number;
+}
+
+/**
+ * Deterministic Android + iOS responsive node label font size (10px-13px) based on
+ * resolved box dimensions and text length (does not rely on iOS-only adjustsFontSizeToFit).
+ */
+function computeDiagramNodeFontSize(
+  rect: RectFrame,
+  label: string,
+  isDecision: boolean
+): number {
+  const usableW = Math.max(42, isDecision ? rect.width * 0.62 : rect.width - 14);
+  const usableH = Math.max(22, isDecision ? rect.height * 0.56 : rect.height - 10);
+  const len = Math.max(1, label.length);
+
+  // Target <= 2 lines cleanly inside usableW * usableH
+  const charsPerLineTarget = Math.max(6, Math.ceil(len / 2));
+  const widthBased = usableW / (charsPerLineTarget * 0.66);
+  const heightBased = usableH / 2.8;
+  const raw = Math.min(widthBased, heightBased);
+  return Math.max(10, Math.min(13, Math.round(raw * 2) / 2));
+}
+
+function computeDiagramMetrics(
+  action: VisualAction,
+  availableWidth: number
+): DiagramLayoutMetrics {
+  const title = normalizeBlockText(action.diagram_title);
+  const hasTitle = title.length > 0;
+  const titleBlockH = hasTitle ? DIAGRAM_TITLE_HEIGHT : 0;
+
+  const rawNodes = Array.isArray(action.nodes) ? action.nodes : [];
+  const rawEdges = Array.isArray(action.edges) ? action.edges : [];
+
+  const innerAvailW = Math.max(260, availableWidth - DIAGRAM_CANVAS_BLEED * 2);
+  // Wide multi-column diagrams get a comfortable minimum canvas width with smooth horizontal scroll on tiny phones
+  const minReadableWidth = rawNodes.length >= 7 ? 380 : 300;
+  const needsHorizontalScroll = minReadableWidth > innerAvailW;
+  const diagramWidth = needsHorizontalScroll ? minReadableWidth : innerAvailW;
+
+  const aspect = Math.max(
+    0.65,
+    Math.min(1.5, Number.isFinite(action.diagram_aspect) ? Number(action.diagram_aspect) : 0.85)
+  );
+  let diagramHeight = Math.max(260, Math.round(diagramWidth * aspect));
+
+  const bleed = DIAGRAM_CANVAS_BLEED;
+
+  // 1. Map every 0..1000 node rect into pixel coordinates enforcing minW=76, minH=38 (Safeguard #1)
+  const rectById = new Map<string, RectFrame>();
+  const nodeById = new Map<string, DiagramNode>();
+
+  for (const node of rawNodes) {
+    if (!node || !node.id) continue;
+    const xPct = Math.max(0, Math.min(960, Number(node.x) || 0));
+    const yPct = Math.max(0, Math.min(960, Number(node.y) || 0));
+    const wPct = Math.max(40, Math.min(1000 - xPct, Number(node.w) || 120));
+    const hPct = Math.max(40, Math.min(1000 - yPct, Number(node.h) || 80));
+
+    let pxW = Math.max(DIAGRAM_MIN_NODE_W, (wPct / 1000) * diagramWidth);
+    let pxH = Math.max(DIAGRAM_MIN_NODE_H, (hPct / 1000) * diagramHeight);
+    pxW = Math.min(pxW, diagramWidth);
+    pxH = Math.min(pxH, diagramHeight);
+
+    let pxX = bleed + (xPct / 1000) * diagramWidth;
+    let pxY = bleed + (yPct / 1000) * diagramHeight;
+
+    // Clamp inside diagram canvas bounds so boxes never overflow right/bottom edges
+    pxX = Math.max(bleed, Math.min(bleed + diagramWidth - pxW, pxX));
+    pxY = Math.max(bleed, Math.min(bleed + diagramHeight - pxH, pxY));
+
+    rectById.set(node.id, { x: pxX, y: pxY, width: pxW, height: pxH });
+    nodeById.set(node.id, node);
+  }
+
+  // 2. Auto-Fit Enclosing Containers (Safeguard #1):
+  // Expand every "container" node to enclose the union bbox of all child nodes referencing
+  // its parent_id (+34px top header clearance, +14px side/bottom padding). Run 2 passes for nested containers.
+  const childrenByParent = new Map<string, string[]>();
+  for (const node of rawNodes) {
+    if (node?.parent_id && rectById.has(node.parent_id) && node.parent_id !== node.id) {
+      const list = childrenByParent.get(node.parent_id) ?? [];
+      list.push(node.id);
+      childrenByParent.set(node.parent_id, list);
+    }
+  }
+
+  for (let pass = 0; pass < 2; pass++) {
+    for (const node of rawNodes) {
+      if (!node || node.kind !== "container") continue;
+      const childIds = childrenByParent.get(node.id);
+      if (!childIds || childIds.length === 0) continue;
+
+      const cRect = rectById.get(node.id);
+      if (!cRect) continue;
+
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const cid of childIds) {
+        const cr = rectById.get(cid);
+        if (!cr) continue;
+        minX = Math.min(minX, cr.x);
+        minY = Math.min(minY, cr.y);
+        maxX = Math.max(maxX, cr.x + cr.width);
+        maxY = Math.max(maxY, cr.y + cr.height);
+      }
+
+      if (!Number.isFinite(minX)) continue;
+
+      const padSide = 14;
+      const padTop = 34; // Top header clearance for container title pill
+      const padBottom = 14;
+
+      const targetLeft = Math.max(bleed, Math.min(cRect.x, minX - padSide));
+      const targetTop = Math.max(bleed, Math.min(cRect.y, minY - padTop));
+      const targetRight = Math.min(
+        bleed + diagramWidth,
+        Math.max(cRect.x + cRect.width, maxX + padSide)
+      );
+      const targetBottom = Math.max(cRect.y + cRect.height, maxY + padBottom);
+
+      if (targetBottom > bleed + diagramHeight) {
+        diagramHeight = Math.ceil(targetBottom - bleed);
+      }
+
+      rectById.set(node.id, {
+        x: targetLeft,
+        y: targetTop,
+        width: Math.max(DIAGRAM_MIN_NODE_W, targetRight - targetLeft),
+        height: Math.max(DIAGRAM_MIN_NODE_H, targetBottom - targetTop),
+      });
+    }
+  }
+
+  // 3. Separate containers (Layer 1) vs inner boxes/pills/decisions (Layer 2)
+  const containers: ResolvedDiagramNode[] = [];
+  const innerNodes: ResolvedDiagramNode[] = [];
+  for (const node of rawNodes) {
+    const rect = rectById.get(node.id);
+    if (!rect) continue;
+    const resolved = { node, rect };
+    if (node.kind === "container") {
+      containers.push(resolved);
+    } else {
+      innerNodes.push(resolved);
+    }
+  }
+
+  // Reading / topological sort order for smooth progressive drawing fallback
+  const byPosition = (a: ResolvedDiagramNode, b: ResolvedDiagramNode) => {
+    if (Math.abs(a.rect.y - b.rect.y) > 22) return a.rect.y - b.rect.y;
+    return a.rect.x - b.rect.x;
+  };
+  containers.sort(byPosition);
+
+  // Kahn topological ordering on inner nodes, falling back to reading order
+  const inDegree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  const innerIdSet = new Set(innerNodes.map((n) => n.node.id));
+  for (const n of innerNodes) {
+    inDegree.set(n.node.id, 0);
+    adj.set(n.node.id, []);
+  }
+  for (const edge of rawEdges) {
+    if (innerIdSet.has(edge.from_id) && innerIdSet.has(edge.to_id) && edge.from_id !== edge.to_id) {
+      adj.get(edge.from_id)!.push(edge.to_id);
+      inDegree.set(edge.to_id, (inDegree.get(edge.to_id) ?? 0) + 1);
+    }
+  }
+  const innerById = new Map(innerNodes.map((n) => [n.node.id, n]));
+  const ready = innerNodes
+    .filter((n) => (inDegree.get(n.node.id) ?? 0) === 0)
+    .sort(byPosition);
+  const topoInner: ResolvedDiagramNode[] = [];
+  const visited = new Set<string>();
+  while (ready.length > 0) {
+    const curr = ready.shift()!;
+    if (visited.has(curr.node.id)) continue;
+    visited.add(curr.node.id);
+    topoInner.push(curr);
+    for (const nextId of adj.get(curr.node.id) ?? []) {
+      const nextDeg = (inDegree.get(nextId) ?? 1) - 1;
+      inDegree.set(nextId, nextDeg);
+      if (nextDeg <= 0 && !visited.has(nextId)) {
+        const nextNode = innerById.get(nextId);
+        if (nextNode) {
+          ready.push(nextNode);
+          ready.sort(byPosition);
+        }
+      }
+    }
+  }
+  // Append any cycle members in reading order
+  const remaining = innerNodes
+    .filter((n) => !visited.has(n.node.id))
+    .sort(byPosition);
+  const sortedInner = [...topoInner, ...remaining];
+  const orderedNodes = [...containers, ...sortedInner];
+
+  // 4. Resolve valid edges & compute automatic opposite curveOffsets for bidirectional pairs
+  const validEdges = rawEdges.filter(
+    (e) => e && rectById.has(e.from_id) && rectById.has(e.to_id) && e.from_id !== e.to_id
+  );
+  const pairSet = new Set(validEdges.map((e) => `${e.from_id}::${e.to_id}`));
+  const edges: ResolvedDiagramEdge[] = validEdges.map((edge) => {
+    const fromRect = rectById.get(edge.from_id)!;
+    const toRect = rectById.get(edge.to_id)!;
+    const hasReverse = pairSet.has(`${edge.to_id}::${edge.from_id}`);
+    const curveOffset = hasReverse ? (edge.from_id < edge.to_id ? 26 : -26) : 0;
+    const geom = computeSmartDiagramArrowGeometry(fromRect, toRect, curveOffset);
+    return {
+      edge,
+      fromRect,
+      toRect,
+      curveOffset,
+      labelX: geom.labelX,
+      labelY: geom.labelY,
+    };
+  });
+
+  const canvasWidth = diagramWidth + bleed * 2;
+  const canvasHeight = diagramHeight + bleed * 2;
+  const totalSlotHeight =
+    titleBlockH + canvasHeight + (needsHorizontalScroll ? 24 : 6);
+
+  return {
+    title,
+    hasTitle,
+    diagramWidth,
+    diagramHeight,
+    canvasWidth,
+    canvasHeight,
+    needsHorizontalScroll,
+    containers,
+    innerNodes: sortedInner,
+    orderedNodes,
+    edges,
+    totalSlotHeight,
+  };
+}
+
 function estimateSlotHeight(
   items: ResolvedAction[] | undefined,
   slotWidth: number,
@@ -1020,28 +1466,35 @@ function estimateSlotHeight(
   if (!items || items.length === 0 || slotWidth <= 0) return 0;
   const primary = items[0].action;
 
+  if (primary.type === "wb_diagram") {
+    return computeDiagramMetrics(primary, slotWidth).totalSlotHeight;
+  }
+
   if (primary.type === "wb_table") {
     return computeTableMetrics(primary, slotWidth).totalSlotHeight;
   }
 
   if (primary.type === "wb_note") {
     const clean = normalizeBlockText(primary.text);
-    const charsPerLine = Math.max(11, Math.floor((slotWidth - 48) / 8.2));
+    const charsPerLine = Math.max(
+      10,
+      Math.floor((slotWidth - 48) / (8.2 * HANDWRITTEN_WIDTH_FACTOR))
+    );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Accounts for NOTE badge row + top/bottom padding + +8px safe cross-platform text buffer
-    return Math.max(100, 70 + lines * 22);
+    // Accounts for NOTE badge row + handwritten glyph advance (1.12x) + +8px safe buffer
+    return Math.max(106, 74 + lines * 24);
   }
 
   if (primary.type === "wb_heading") {
     const clean = normalizeBlockText(primary.text);
     const iconReserve = primary.icon ? 44 : 0;
     const charsPerLine = Math.max(
-      12,
-      Math.floor((slotWidth - 32 - iconReserve) / 10.2)
+      10,
+      Math.floor((slotWidth - 32 - iconReserve) / (10.2 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
     // Generous vertical padding + +8px safe buffer above the rough Skia underline
-    return Math.max(74, 52 + lines * 26);
+    return Math.max(80, 56 + lines * 28);
   }
 
   if (primary.type === "wb_code") {
@@ -1052,37 +1505,43 @@ function estimateSlotHeight(
     const charWidth = isCompactColumn ? 6.8 : 7.4;
     const rowHeight = isCompactColumn ? 18.5 : 21.5;
     const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / charWidth);
-    // 32px header + 42px vertical padding + per-line height
+    // 32px header + 42px vertical padding + per-line height (monospace unchanged)
     return Math.max(132, 32 + 42 + wrappedLines * rowHeight);
   }
 
   if (primary.type === "wb_equation") {
     const clean = normalizeBlockText(primary.text);
-    const charsPerLine = Math.max(12, Math.floor((slotWidth - 28) / 9.5));
+    const charsPerLine = Math.max(
+      10,
+      Math.floor((slotWidth - 28) / (9.5 * HANDWRITTEN_WIDTH_FACTOR))
+    );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(92, 56 + lines * 26);
+    return Math.max(96, 60 + lines * 27);
   }
 
   if (primary.type === "wb_flow_card") {
     const clean = normalizeBlockText(primary.text);
     const iconReserve = primary.icon ? (isCompactColumn ? 30 : 38) : 0;
     const charsPerLine = Math.max(
-      10,
-      Math.floor((slotWidth - 28 - iconReserve) / 8.5)
+      9,
+      Math.floor((slotWidth - 28 - iconReserve) / (8.5 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(112, 64 + lines * 23);
+    return Math.max(118, 68 + lines * 25);
   }
 
-  // Stacked wb_bullet items with conservative word-wrap estimate & +8px safe bottom text buffer
-  const bulletCharsPerLine = Math.max(11, Math.floor((slotWidth - 46) / 8.5));
-  let totalH = 58;
+  // Stacked wb_bullet items calibrated for ~1.12x handwritten glyph widths + +8px safe bottom buffer
+  const bulletCharsPerLine = Math.max(
+    10,
+    Math.floor((slotWidth - 46) / (8.5 * HANDWRITTEN_WIDTH_FACTOR))
+  );
+  let totalH = 60;
   for (const item of items) {
     const clean = normalizeBlockText(item.action.text);
     const lines = estimateWrappedLines(clean, bulletCharsPerLine);
-    totalH += lines * 22 + 10;
+    totalH += lines * 24 + 12;
   }
-  return Math.max(112, totalH);
+  return Math.max(118, totalH);
 }
 
 function computeCumulativeWhiteboardLayout(
@@ -1646,27 +2105,856 @@ const AnimatedTableGrid: React.FC<{
 );
 
 // ---------------------------------------------------------------------------
-// Progressive RN Table View (Adaptive Scroll + Rough Skia Grid + WordBoundary Sync)
+// GPU-Composited Dual-TranslateX Directional Ink-Sweep Mask (iOS & Android 60fps)
+// ---------------------------------------------------------------------------
+// Uses two nested collapsable={false} Animated.Views driven by a single Reanimated
+// progress p (0 -> 1 over 260ms-350ms):
+//   Outer mask (overflow: "hidden"): translateX = isRtl ? (1-p)*W : -(1-p)*W
+//   Inner content (width: W):        translateX = isRtl ? -(1-p)*W : (1-p)*W
+// Glyphs stay 100% stationary (zero Arabic ligature breaking or line reflow) while
+// wiping cleanly right-to-left for Arabic and left-to-right for English on the GPU.
+const InkSweepReveal: React.FC<{
+  triggered: boolean;
+  instantComplete: boolean;
+  isRtl: boolean;
+  resetKey: string;
+  durationMs?: number;
+  delayMs?: number;
+  children: React.ReactNode;
+}> = React.memo(
+  ({
+    triggered,
+    instantComplete,
+    isRtl,
+    resetKey,
+    durationMs = INK_SWEEP_CARD_MS,
+    delayMs = 0,
+    children,
+  }) => {
+    const [measuredWidth, setMeasuredWidth] = useState(0);
+    const widthSV = useSharedValue(0);
+    const progressSV = useSharedValue(instantComplete ? 1 : 0);
+    const prevResetKeyRef = useRef(resetKey);
+
+    const handleMeasure = useCallback(
+      (e: LayoutChangeEvent) => {
+        const w = e.nativeEvent.layout.width;
+        if (w > 0 && Math.abs(w - widthSV.value) > 0.5) {
+          widthSV.value = w;
+          setMeasuredWidth(w);
+        }
+      },
+      [widthSV]
+    );
+
+    useEffect(() => {
+      const didReset = prevResetKeyRef.current !== resetKey;
+      prevResetKeyRef.current = resetKey;
+
+      if (instantComplete) {
+        progressSV.value = 1;
+        return;
+      }
+
+      if (didReset) {
+        progressSV.value = 0;
+      }
+
+      if (triggered && measuredWidth > 0) {
+        if (didReset || progressSV.value < 0.01) {
+          const sweep = withTiming(1, {
+            duration: durationMs,
+            easing: Easing.out(Easing.cubic),
+          });
+          progressSV.value = delayMs > 0 ? withDelay(delayMs, sweep) : sweep;
+        }
+      } else if (!triggered) {
+        progressSV.value = 0;
+      }
+    }, [
+      resetKey,
+      triggered,
+      instantComplete,
+      measuredWidth,
+      durationMs,
+      delayMs,
+      progressSV,
+    ]);
+
+    const maskAnimStyle = useAnimatedStyle(() => {
+      const p = progressSV.value;
+      const w = widthSV.value;
+      // Keep opacity 0 until onLayout resolves measuredWidth > 0 (zero 1-frame flash)
+      if (w <= 0) {
+        return {
+          opacity: 0,
+          transform: [{ translateX: 0 }],
+        };
+      }
+      const shift = (1 - p) * w;
+      const tx = isRtl ? shift : -shift;
+      return {
+        opacity: p <= 0.001 ? 0 : Math.min(1, p * 2.4),
+        transform: [{ translateX: tx }],
+      };
+    }, [isRtl]);
+
+    const innerAnimStyle = useAnimatedStyle(() => {
+      const p = progressSV.value;
+      const w = widthSV.value;
+      if (w <= 0) {
+        return {
+          transform: [{ translateX: 0 }],
+        };
+      }
+      const shift = (1 - p) * w;
+      const tx = isRtl ? -shift : shift;
+      return {
+        transform: [{ translateX: tx }],
+      };
+    }, [isRtl]);
+
+    if (instantComplete) {
+      return <View style={styles.inkSweepHost}>{children}</View>;
+    }
+
+    return (
+      <View style={styles.inkSweepHost} onLayout={handleMeasure}>
+        <Animated.View
+          collapsable={false}
+          style={[
+            styles.inkSweepMask,
+            measuredWidth > 0 ? { width: measuredWidth } : styles.inkSweepFull,
+            maskAnimStyle,
+          ]}
+        >
+          <Animated.View
+            collapsable={false}
+            style={[
+              measuredWidth > 0 ? { width: measuredWidth } : styles.inkSweepFull,
+              innerAnimStyle,
+            ]}
+          >
+            {children}
+          </Animated.View>
+        </Animated.View>
+      </View>
+    );
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Memoized Skia Diagram Primitives & Interactive Speech-Synced DiagramBlockView
+// ---------------------------------------------------------------------------
+const AnimatedDiagramNodeShape: React.FC<{
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  kind: "container" | "box" | "pill" | "decision";
+  seed: number;
+  fillColor: string;
+  strokeColor: string;
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+}> = React.memo(
+  ({
+    x,
+    y,
+    width,
+    height,
+    kind,
+    seed,
+    fillColor,
+    strokeColor,
+    triggered,
+    instantComplete,
+    resetKey,
+  }) => {
+    const strokePath = useMemo(() => {
+      const rect = { x, y, width, height };
+      if (kind === "container") {
+        return createRoughDashedRectPath(rect, 14, seed, 0.95);
+      }
+      if (kind === "decision") {
+        return createRoughDiamondPath(rect, seed, 0.95);
+      }
+      const radius = kind === "pill" ? Math.min(height / 2, 24) : 12;
+      return createRoughRectPath(rect, radius, seed, 0.92);
+    }, [x, y, width, height, kind, seed]);
+
+    const diamondFillPath = useMemo(
+      () =>
+        kind === "decision"
+          ? createDiamondFillPath({ x, y, width, height })
+          : makeEmptySkiaPath(),
+      [x, y, width, height, kind]
+    );
+
+    const strokeProgress = useSharedValue(instantComplete ? 1 : 0);
+    const prevResetKeyRef = useRef(resetKey);
+
+    useEffect(() => {
+      const didReset = prevResetKeyRef.current !== resetKey;
+      prevResetKeyRef.current = resetKey;
+      if (instantComplete) {
+        strokeProgress.value = 1;
+        return;
+      }
+      if (didReset) {
+        strokeProgress.value = 0;
+      }
+      if (triggered) {
+        if (didReset || strokeProgress.value < 0.01) {
+          strokeProgress.value = withTiming(1, {
+            duration: DIAGRAM_NODE_DRAW_MS,
+            easing: Easing.out(Easing.cubic),
+          });
+        }
+      } else {
+        strokeProgress.value = 0;
+      }
+    }, [resetKey, triggered, instantComplete, strokeProgress]);
+
+    const fillOpacity = useDerivedValue(() =>
+      instantComplete ? 1 : Math.min(1, strokeProgress.value * 1.25)
+    );
+
+    const radius =
+      kind === "container" ? 14 : kind === "pill" ? Math.min(height / 2, 24) : 12;
+
+    return (
+      <>
+        {kind === "decision" ? (
+          <Path
+            path={diamondFillPath}
+            style="fill"
+            color={fillColor}
+            opacity={fillOpacity}
+          />
+        ) : (
+          <>
+            {kind !== "container" && (
+              <RoundedRect
+                x={x}
+                y={y + 2.5}
+                width={width}
+                height={height}
+                r={radius}
+                color="rgba(15, 23, 42, 0.055)"
+                opacity={fillOpacity}
+              />
+            )}
+            <RoundedRect
+              x={x}
+              y={y}
+              width={width}
+              height={height}
+              r={radius}
+              color={fillColor}
+              opacity={fillOpacity}
+            />
+          </>
+        )}
+        <Path
+          path={strokePath}
+          style="stroke"
+          strokeWidth={kind === "container" ? 1.75 : 1.9}
+          strokeCap="round"
+          strokeJoin="round"
+          color={strokeColor}
+          start={0}
+          end={instantComplete ? 1 : strokeProgress}
+        />
+      </>
+    );
+  }
+);
+
+const AnimatedDiagramEdgeArrow: React.FC<{
+  fromX: number;
+  fromY: number;
+  fromW: number;
+  fromH: number;
+  toX: number;
+  toY: number;
+  toW: number;
+  toH: number;
+  curveOffset: number;
+  dashed: boolean;
+  seed: number;
+  strokeColor: string;
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+}> = React.memo(
+  ({
+    fromX,
+    fromY,
+    fromW,
+    fromH,
+    toX,
+    toY,
+    toW,
+    toH,
+    curveOffset,
+    dashed,
+    seed,
+    strokeColor,
+    triggered,
+    instantComplete,
+    resetKey,
+  }) => {
+    const arrowPath = useMemo(
+      () =>
+        createSmartDiagramArrowPath(
+          { x: fromX, y: fromY, width: fromW, height: fromH },
+          { x: toX, y: toY, width: toW, height: toH },
+          seed,
+          curveOffset,
+          dashed,
+          0.92
+        ),
+      [fromX, fromY, fromW, fromH, toX, toY, toW, toH, curveOffset, dashed, seed]
+    );
+
+    const arrowProgress = useSharedValue(instantComplete ? 1 : 0);
+    const prevResetKeyRef = useRef(resetKey);
+
+    useEffect(() => {
+      const didReset = prevResetKeyRef.current !== resetKey;
+      prevResetKeyRef.current = resetKey;
+      if (instantComplete) {
+        arrowProgress.value = 1;
+        return;
+      }
+      if (didReset) {
+        arrowProgress.value = 0;
+      }
+      if (triggered) {
+        if (didReset || arrowProgress.value < 0.01) {
+          arrowProgress.value = withDelay(
+            DIAGRAM_EDGE_DELAY_MS,
+            withTiming(1, {
+              duration: DIAGRAM_EDGE_DRAW_MS,
+              easing: Easing.out(Easing.cubic),
+            })
+          );
+        }
+      } else {
+        arrowProgress.value = 0;
+      }
+    }, [resetKey, triggered, instantComplete, arrowProgress]);
+
+    return (
+      <Path
+        path={arrowPath}
+        style="stroke"
+        strokeWidth={2.05}
+        strokeCap="round"
+        strokeJoin="round"
+        color={strokeColor}
+        start={0}
+        end={instantComplete ? 1 : arrowProgress}
+      />
+    );
+  }
+);
+
+const DiagramBlockView: React.FC<{
+  blockId: string;
+  action: VisualAction;
+  slotWidth: number;
+  isCurrentStep: boolean;
+  isStaticComplete: boolean;
+  stepResetKey: string;
+  stepProgress: number;
+  currentTimeMs?: number;
+  wordTimings?: WordTiming[];
+  handwrittenFontsReady: boolean;
+}> = ({
+  blockId,
+  action,
+  slotWidth,
+  isCurrentStep,
+  isStaticComplete,
+  stepResetKey,
+  stepProgress,
+  currentTimeMs,
+  wordTimings,
+  handwrittenFontsReady,
+}) => {
+  const token = getColorToken(action.color);
+  const metrics = useMemo(
+    () => computeDiagramMetrics(action, slotWidth),
+    [action, slotWidth]
+  );
+
+  // Match each diagram node's label (+ sublabel) against WordBoundary timings,
+  // ensuring parent containers always trigger on or before their first child node.
+  const nodeTriggerMsMap = useMemo(() => {
+    const map = new Map<string, number | null>();
+    if (metrics.orderedNodes.length === 0) return map;
+
+    const texts = metrics.orderedNodes.map(({ node }) =>
+      [node.label, node.sublabel ?? ""].join(" ").trim()
+    );
+    const triggers = computeItemTriggerMsList(texts, wordTimings);
+    metrics.orderedNodes.forEach(({ node }, idx) => {
+      map.set(node.id, triggers[idx] ?? null);
+    });
+
+    // Pull parent container trigger earlier if any child matches before its container
+    for (const { node } of metrics.orderedNodes) {
+      if (!node.parent_id) continue;
+      const childT = map.get(node.id);
+      const parentT = map.get(node.parent_id);
+      if (childT != null) {
+        if (parentT == null || childT < parentT) {
+          map.set(node.parent_id, Math.max(0, childT - 120));
+        }
+      }
+    }
+    return map;
+  }, [metrics.orderedNodes, wordTimings]);
+
+  const clampedStep = clamp01(stepProgress);
+  const diagramInstant = !isCurrentStep || isStaticComplete || clampedStep >= 0.995;
+  const canUseWordTiming =
+    isCurrentStep &&
+    typeof currentTimeMs === "number" &&
+    Number.isFinite(currentTimeMs) &&
+    Array.isArray(wordTimings) &&
+    wordTimings.length > 0 &&
+    (currentTimeMs > 0 || clampedStep <= 0.05);
+  const syncedTimeMs =
+    typeof currentTimeMs === "number" && Number.isFinite(currentTimeMs)
+      ? currentTimeMs + WORD_SYNC_LEAD_MS
+      : 0;
+
+  const totalNodes = Math.max(1, metrics.orderedNodes.length);
+  const nodeTriggeredMap = new Map<string, boolean>();
+  metrics.orderedNodes.forEach(({ node }, idx) => {
+    if (diagramInstant || clampedStep >= 0.92) {
+      nodeTriggeredMap.set(node.id, true);
+      return;
+    }
+    const triggerMs = nodeTriggerMsMap.get(node.id) ?? null;
+    if (canUseWordTiming && triggerMs !== null) {
+      nodeTriggeredMap.set(node.id, syncedTimeMs >= triggerMs);
+    } else {
+      const threshold = 0.04 + (idx / totalNodes) * 0.68;
+      nodeTriggeredMap.set(node.id, clampedStep >= threshold);
+    }
+  });
+
+  // Guarantee parent container is triggered whenever any child is triggered
+  for (const { node } of metrics.orderedNodes) {
+    if (node.parent_id && nodeTriggeredMap.get(node.id)) {
+      nodeTriggeredMap.set(node.parent_id, true);
+    }
+  }
+
+  const diagramCanvasInner = (
+    <View
+      style={{
+        width: metrics.canvasWidth,
+        height: metrics.canvasHeight,
+      }}
+    >
+      {/* Layer 1: 60fps Memoized Skia Vector Diagram (Containers -> Boxes/Diamonds -> Arrows) */}
+      <Canvas
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: metrics.canvasWidth,
+          height: metrics.canvasHeight,
+        }}
+        pointerEvents="none"
+      >
+        {/* Subtle warm diagram paper backing */}
+        <RoundedRect
+          x={DIAGRAM_CANVAS_BLEED - 2}
+          y={DIAGRAM_CANVAS_BLEED - 2}
+          width={metrics.diagramWidth + 4}
+          height={metrics.diagramHeight + 4}
+          r={16}
+          color="rgba(255, 255, 255, 0.78)"
+        />
+
+        {/* 1. Outer container nodes (dashed rough marker borders) */}
+        {metrics.containers.map(({ node, rect }) => {
+          const tint = getDiagramTintToken(node.tint, action.color);
+          const triggered = nodeTriggeredMap.get(node.id) ?? true;
+          return (
+            <AnimatedDiagramNodeShape
+              key={`dnode-c-${node.id}`}
+              x={rect.x}
+              y={rect.y}
+              width={rect.width}
+              height={rect.height}
+              kind="container"
+              seed={hashSeed(`diag-${blockId}-${node.id}`)}
+              fillColor={tint.containerFill}
+              strokeColor={tint.stroke}
+              triggered={triggered}
+              instantComplete={diagramInstant}
+              resetKey={`${stepResetKey}-dn-${blockId}-${node.id}`}
+            />
+          );
+        })}
+
+        {/* 2. Inner box / pill / decision nodes (double-stroke rough borders) */}
+        {metrics.innerNodes.map(({ node, rect }) => {
+          const tint = getDiagramTintToken(node.tint, action.color);
+          const triggered = nodeTriggeredMap.get(node.id) ?? true;
+          const kind =
+            node.kind === "pill" || node.kind === "decision" ? node.kind : "box";
+          return (
+            <AnimatedDiagramNodeShape
+              key={`dnode-i-${node.id}`}
+              x={rect.x}
+              y={rect.y}
+              width={rect.width}
+              height={rect.height}
+              kind={kind}
+              seed={hashSeed(`diag-${blockId}-${node.id}`)}
+              fillColor={tint.fill}
+              strokeColor={tint.stroke}
+              triggered={triggered}
+              instantComplete={diagramInstant}
+              resetKey={`${stepResetKey}-dn-${blockId}-${node.id}`}
+            />
+          );
+        })}
+
+        {/* 3. Directed rough connector arrows (triggered right after both endpoints appear) */}
+        {metrics.edges.map((item, eIdx) => {
+          const edgeTriggered =
+            diagramInstant ||
+            (Boolean(nodeTriggeredMap.get(item.edge.from_id)) &&
+              Boolean(nodeTriggeredMap.get(item.edge.to_id)));
+          return (
+            <AnimatedDiagramEdgeArrow
+              key={`dedge-${item.edge.from_id}-${item.edge.to_id}-${eIdx}`}
+              fromX={item.fromRect.x}
+              fromY={item.fromRect.y}
+              fromW={item.fromRect.width}
+              fromH={item.fromRect.height}
+              toX={item.toRect.x}
+              toY={item.toRect.y}
+              toW={item.toRect.width}
+              toH={item.toRect.height}
+              curveOffset={item.curveOffset}
+              dashed={Boolean(item.edge.dashed)}
+              seed={hashSeed(`dedge-${blockId}-${item.edge.from_id}-${item.edge.to_id}-${eIdx}`)}
+              strokeColor={token.stroke}
+              triggered={edgeTriggered}
+              instantComplete={diagramInstant}
+              resetKey={`${stepResetKey}-de-${blockId}-${eIdx}`}
+            />
+          );
+        })}
+      </Canvas>
+
+      {/* Layer 2: Handwritten Node & Edge Labels (GPU InkSweepReveal + Android-Safe Sizing) */}
+      <View
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: metrics.canvasWidth,
+          height: metrics.canvasHeight,
+        }}
+        pointerEvents="none"
+      >
+        {/* Container Title Pills (top-left LTR / top-right RTL so child boxes stay clear) */}
+        {metrics.containers.map(({ node, rect }) => {
+          const tint = getDiagramTintToken(node.tint, action.color);
+          const triggered = nodeTriggeredMap.get(node.id) ?? true;
+          const label = normalizeBlockText(node.label);
+          const rtl = isArabicDominant(label);
+          return (
+            <View
+              key={`dlbl-c-${node.id}`}
+              style={[
+                styles.diagramContainerHeaderWrap,
+                {
+                  left: rect.x + 8,
+                  top: rect.y + 6,
+                  width: Math.max(40, rect.width - 16),
+                  alignItems: rtl ? "flex-end" : "flex-start",
+                },
+              ]}
+            >
+              <InkSweepReveal
+                triggered={triggered}
+                instantComplete={diagramInstant}
+                isRtl={rtl}
+                resetKey={`${stepResetKey}-dlbl-${blockId}-${node.id}`}
+                durationMs={INK_SWEEP_BULLET_MS}
+              >
+                <View
+                  style={[
+                    styles.diagramContainerPill,
+                    {
+                      backgroundColor: tint.pillBg,
+                      alignSelf: rtl ? "flex-end" : "flex-start",
+                    },
+                  ]}
+                >
+                  <Text
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                    style={[
+                      styles.diagramContainerPillText,
+                      getHandwrittenFontStyle(
+                        label,
+                        "tableHeader",
+                        handwrittenFontsReady
+                      ),
+                      { color: tint.text, fontSize: 11.5, lineHeight: 16 },
+                    ]}
+                  >
+                    {label}
+                  </Text>
+                </View>
+              </InkSweepReveal>
+            </View>
+          );
+        })}
+
+        {/* Inner Box / Pill / Decision Centered Handwritten Labels */}
+        {metrics.innerNodes.map(({ node, rect }) => {
+          const tint = getDiagramTintToken(node.tint, action.color);
+          const triggered = nodeTriggeredMap.get(node.id) ?? true;
+          const label = normalizeBlockText(node.label);
+          const sublabel = normalizeBlockText(node.sublabel);
+          const rtl = isArabicDominant(label);
+          const isDecision = node.kind === "decision";
+          const fontSize = computeDiagramNodeFontSize(rect, label, isDecision);
+          const lineHeight = Math.round(fontSize * 1.32);
+          const showSublabel =
+            sublabel.length > 0 && rect.height >= (isDecision ? 58 : 48);
+          const horizPad = isDecision
+            ? Math.max(10, Math.round(rect.width * 0.16))
+            : 7;
+
+          return (
+            <View
+              key={`dlbl-i-${node.id}`}
+              style={[
+                styles.diagramNodeLabelBox,
+                {
+                  left: rect.x,
+                  top: rect.y,
+                  width: rect.width,
+                  height: rect.height,
+                  paddingHorizontal: horizPad,
+                  paddingVertical: 4,
+                },
+              ]}
+            >
+              <InkSweepReveal
+                triggered={triggered}
+                instantComplete={diagramInstant}
+                isRtl={rtl}
+                resetKey={`${stepResetKey}-dlbl-${blockId}-${node.id}`}
+                durationMs={INK_SWEEP_BULLET_MS}
+              >
+                <Text
+                  numberOfLines={2}
+                  ellipsizeMode="tail"
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.82}
+                  style={[
+                    styles.diagramNodeLabelText,
+                    getHandwrittenFontStyle(
+                      label,
+                      "flowCard",
+                      handwrittenFontsReady
+                    ),
+                    {
+                      color: tint.text,
+                      fontSize,
+                      lineHeight,
+                    },
+                  ]}
+                >
+                  {label}
+                </Text>
+                {showSublabel && (
+                  <Text
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                    style={[
+                      styles.diagramNodeSublabelText,
+                      getHandwrittenFontStyle(
+                        sublabel,
+                        "tableCell",
+                        handwrittenFontsReady
+                      ),
+                      {
+                        color: tint.stroke,
+                        fontSize: Math.max(9.5, fontSize - 1.5),
+                        lineHeight: Math.round(Math.max(9.5, fontSize - 1.5) * 1.28),
+                      },
+                    ]}
+                  >
+                    {sublabel}
+                  </Text>
+                )}
+              </InkSweepReveal>
+            </View>
+          );
+        })}
+
+        {/* Edge Labels centered along Bezier curve midpoint (labelX, labelY) */}
+        {metrics.edges.map((item, eIdx) => {
+          const edgeLabel = normalizeBlockText(item.edge.label);
+          if (!edgeLabel) return null;
+          const edgeTriggered =
+            diagramInstant ||
+            (Boolean(nodeTriggeredMap.get(item.edge.from_id)) &&
+              Boolean(nodeTriggeredMap.get(item.edge.to_id)));
+          const rtl = isArabicDominant(edgeLabel);
+          const pillW = Math.min(110, Math.max(46, edgeLabel.length * 7.5 + 16));
+          const left = Math.max(
+            4,
+            Math.min(metrics.canvasWidth - pillW - 4, item.labelX - pillW / 2)
+          );
+          const top = Math.max(
+            4,
+            Math.min(metrics.canvasHeight - 24, item.labelY - 11)
+          );
+
+          return (
+            <View
+              key={`delbl-${item.edge.from_id}-${item.edge.to_id}-${eIdx}`}
+              style={[
+                styles.diagramEdgeLabelWrap,
+                {
+                  left,
+                  top,
+                  width: pillW,
+                },
+              ]}
+            >
+              <InkSweepReveal
+                triggered={edgeTriggered}
+                instantComplete={diagramInstant}
+                isRtl={rtl}
+                resetKey={`${stepResetKey}-delbl-${blockId}-${eIdx}`}
+                durationMs={260}
+                delayMs={DIAGRAM_EDGE_DELAY_MS}
+              >
+                <View style={styles.diagramEdgeLabelPill}>
+                  <Text
+                    numberOfLines={1}
+                    ellipsizeMode="tail"
+                    style={[
+                      styles.diagramEdgeLabelText,
+                      getHandwrittenFontStyle(
+                        edgeLabel,
+                        "tableCell",
+                        handwrittenFontsReady
+                      ),
+                      { color: token.text, fontSize: 10.5, lineHeight: 14 },
+                    ]}
+                  >
+                    {edgeLabel}
+                  </Text>
+                </View>
+              </InkSweepReveal>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+
+  const titleRtl = isArabicDominant(metrics.title);
+
+  return (
+    <View style={styles.diagramBlockRoot}>
+      {metrics.hasTitle && (
+        <View style={styles.diagramTitleWrap}>
+          <InkSweepReveal
+            triggered={diagramInstant || clampedStep >= 0.01}
+            instantComplete={diagramInstant}
+            isRtl={titleRtl}
+            resetKey={`${stepResetKey}-dtitle-${blockId}`}
+            durationMs={INK_SWEEP_HEADING_MS}
+          >
+            <Text
+              numberOfLines={1}
+              ellipsizeMode="tail"
+              style={[
+                styles.diagramTitleText,
+                getHandwrittenFontStyle(
+                  metrics.title,
+                  "heading",
+                  handwrittenFontsReady
+                ),
+                { color: token.text },
+              ]}
+            >
+              {metrics.title}
+            </Text>
+          </InkSweepReveal>
+        </View>
+      )}
+
+      {metrics.needsHorizontalScroll ? (
+        <View style={styles.tableWrapper}>
+          <ScrollView
+            horizontal
+            nestedScrollEnabled
+            showsHorizontalScrollIndicator
+            directionalLockEnabled
+            contentContainerStyle={styles.tableScrollContent}
+          >
+            {diagramCanvasInner}
+          </ScrollView>
+          <Text style={styles.tableScrollHintText}>
+            ↔ Swipe diagram horizontally
+          </Text>
+        </View>
+      ) : (
+        <View style={styles.tableWrapperCentered}>{diagramCanvasInner}</View>
+      )}
+    </View>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Progressive RN Table View (Adaptive Scroll + Rough Skia Grid + Ink-Sweep Sync)
 // ---------------------------------------------------------------------------
 const TableBlockView: React.FC<{
   blockId: string;
   action: VisualAction;
   slotWidth: number;
   isCurrentStep: boolean;
+  isStaticComplete: boolean;
+  stepResetKey: string;
   stepProgress: number;
   currentTimeMs?: number;
   wordTimings?: WordTiming[];
-  isPlaying: boolean;
+  handwrittenFontsReady: boolean;
   tableGridProgress: SharedValue<number>;
 }> = ({
   blockId,
   action,
   slotWidth,
   isCurrentStep,
+  isStaticComplete,
+  stepResetKey,
   stepProgress,
   currentTimeMs,
   wordTimings,
-  isPlaying,
+  handwrittenFontsReady,
   tableGridProgress,
 }) => {
   const token = getColorToken(action.color);
@@ -1692,6 +2980,7 @@ const TableBlockView: React.FC<{
   }, [metrics.rows, wordTimings]);
 
   const clampedStep = clamp01(stepProgress);
+  const tableInstant = !isCurrentStep || isStaticComplete || clampedStep >= 0.995;
   const canUseWordTiming =
     isCurrentStep &&
     typeof currentTimeMs === "number" &&
@@ -1700,28 +2989,19 @@ const TableBlockView: React.FC<{
     wordTimings.length > 0 &&
     (currentTimeMs > 0 || clampedStep <= 0.05);
 
-  const headerOpacity = !isCurrentStep
-    ? 1
-    : clampedStep >= 0.995
-    ? 1
-    : clamp01((clampedStep - 0.02) / 0.14);
-
   const rowCount = Math.max(1, metrics.rows.length);
+  const headerIsRtl = isArabicDominant(metrics.headers.join(" "));
 
-  const getRowRevealRatio = (rowIdx: number): number => {
-    if (!isCurrentStep || clampedStep >= 0.995) return 1;
+  const isRowTriggered = (rowIdx: number): boolean => {
+    if (tableInstant || clampedStep >= 0.94) return true;
     const triggerMs = rowTriggerMs[rowIdx];
     if (canUseWordTiming && triggerMs !== null) {
-      // +150ms leading edge so table rows appear right on or slightly ahead of speech
+      // +250ms leading edge so table rows finish sweeping right as or before spoken
       const syncedTimeMs = (currentTimeMs as number) + WORD_SYNC_LEAD_MS;
-      if (clampedStep >= 0.94) return 1;
-      if (syncedTimeMs < triggerMs) return 0;
-      return clamp01((syncedTimeMs - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS);
+      return syncedTimeMs >= triggerMs;
     }
-    // Proportional stepProgress fallback (0.12 -> 0.86 across all rows)
-    const start = 0.12 + (rowIdx / rowCount) * 0.68;
-    const windowSpan = Math.max(0.1, 0.68 / rowCount);
-    return clamp01((clampedStep - start) / windowSpan);
+    const threshold = 0.08 + (rowIdx / rowCount) * 0.64;
+    return clampedStep >= threshold;
   };
 
   const tableInner = (
@@ -1743,7 +3023,7 @@ const TableBlockView: React.FC<{
         fillColor="#FFFFFF"
         headerBgColor={token.badgeBg}
         strokeColor={token.stroke}
-        animate={isCurrentStep}
+        animate={isCurrentStep && !isStaticComplete}
         progress={tableGridProgress}
       />
 
@@ -1757,61 +3037,75 @@ const TableBlockView: React.FC<{
           height: metrics.gridHeight,
         }}
       >
-        {/* Header Row */}
-        <View
-          style={[
-            styles.tableRow,
-            {
-              height: metrics.headerHeight,
-              opacity: headerOpacity,
-            },
-          ]}
+        {/* Header Row (fast directional ink-sweep on step entry) */}
+        <InkSweepReveal
+          triggered
+          instantComplete={tableInstant}
+          isRtl={headerIsRtl}
+          resetKey={`${stepResetKey}-th-${blockId}`}
+          durationMs={INK_SWEEP_TABLE_HEADER_MS}
         >
-          {metrics.headers.map((header, cIdx) => (
-            <View
-              key={`th-${cIdx}`}
-              style={[
-                styles.tableCell,
-                { width: metrics.colWidths[cIdx] },
-              ]}
-            >
-              <Text
-                style={[styles.tableHeaderText, { color: token.text }]}
+          <View
+            style={[
+              styles.tableRow,
+              {
+                height: metrics.headerHeight,
+              },
+            ]}
+          >
+            {metrics.headers.map((header, cIdx) => (
+              <View
+                key={`th-${cIdx}`}
+                style={[
+                  styles.tableCell,
+                  { width: metrics.colWidths[cIdx] },
+                ]}
               >
-                {header}
-              </Text>
-            </View>
-          ))}
-        </View>
+                <Text
+                  style={[
+                    styles.tableHeaderText,
+                    getHandwrittenFontStyle(
+                      header,
+                      "tableHeader",
+                      handwrittenFontsReady
+                    ),
+                    { color: token.text },
+                  ]}
+                >
+                  {header}
+                </Text>
+              </View>
+            ))}
+          </View>
+        </InkSweepReveal>
 
-        {/* Data Rows (Progressive Reveal via WordBoundary Sync or Step Progress) */}
+        {/* Data Rows (GPU Ink-Sweep Reveal via WordBoundary +250ms Lead — Zero Character Slicing) */}
         {metrics.rows.map((row, rIdx) => {
-          const ratio = getRowRevealRatio(rIdx);
-          const rowOpacity = ratio <= 0 ? 0 : Math.min(1, ratio * 1.45);
-          const isRowTyping = isCurrentStep && isPlaying && ratio > 0 && ratio < 0.995;
+          const rowRtl = isArabicDominant(row.join(" "));
+          const triggered = isRowTriggered(rIdx);
 
           return (
-            <View
+            <InkSweepReveal
               key={`tr-${rIdx}`}
-              style={[
-                styles.tableRow,
-                {
-                  height: metrics.rowHeights[rIdx],
-                  opacity: rowOpacity,
-                  backgroundColor:
-                    rIdx % 2 === 1 ? "rgba(15, 23, 42, 0.024)" : "transparent",
-                },
-              ]}
+              triggered={triggered}
+              instantComplete={tableInstant}
+              isRtl={rowRtl}
+              resetKey={`${stepResetKey}-tr-${blockId}-${rIdx}`}
+              durationMs={INK_SWEEP_TABLE_ROW_MS}
             >
-              {row.map((cell, cIdx) => {
-                const visibleCell =
-                  ratio >= 0.995
-                    ? cell
-                    : cell.slice(0, Math.max(0, Math.round(cell.length * ratio)));
-                const showCellCursor =
-                  isRowTyping && cIdx === row.length - 1 && visibleCell.length > 0;
-
-                return (
+              <View
+                style={[
+                  styles.tableRow,
+                  {
+                    height: metrics.rowHeights[rIdx],
+                    backgroundColor:
+                      rIdx % 2 === 1
+                        ? "rgba(15, 23, 42, 0.024)"
+                        : "transparent",
+                  },
+                ]}
+              >
+                {row.map((cell, cIdx) => (
                   <View
                     key={`td-${rIdx}-${cIdx}`}
                     style={[
@@ -1823,18 +3117,20 @@ const TableBlockView: React.FC<{
                       style={[
                         styles.tableCellText,
                         cIdx === 0 && styles.tableFirstColText,
+                        getHandwrittenFontStyle(
+                          cell,
+                          cIdx === 0 ? "tableFirstCol" : "tableCell",
+                          handwrittenFontsReady
+                        ),
                         { color: cIdx === 0 ? token.text : "#1E293B" },
                       ]}
                     >
-                      {visibleCell}
-                      {showCellCursor && (
-                        <Text style={{ color: token.stroke }}>▍</Text>
-                      )}
+                      {cell}
                     </Text>
                   </View>
-                );
-              })}
-            </View>
+                ))}
+              </View>
+            </InkSweepReveal>
           );
         })}
       </View>
@@ -1995,29 +3291,35 @@ const CodeBlockView: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
-// Slot Content View (Heading, Flow Card, Equation, Note, Code, Table, Bullets)
+// Slot Content View (Handwritten Ink-Sweep Heading, Card, Note, Table, Bullets & Monospace Code)
 // ---------------------------------------------------------------------------
 const SlotContentView: React.FC<{
   blockId: string;
   items: ResolvedAction[];
   slotWidth: number;
+  stepResetKey: string;
+  isStaticComplete: boolean;
   stepProgress: number;
   textProgress: number;
   currentTimeMs?: number;
   wordTimings?: WordTiming[];
   isPlaying: boolean;
   isCompact: boolean;
+  handwrittenFontsReady: boolean;
   tableGridProgress: SharedValue<number>;
 }> = ({
   blockId,
   items,
   slotWidth,
+  stepResetKey,
+  isStaticComplete,
   stepProgress,
   textProgress,
   currentTimeMs,
   wordTimings,
   isPlaying,
   isCompact,
+  handwrittenFontsReady,
   tableGridProgress,
 }) => {
   // Memoize WordBoundary trigger times for stacked current-step bullets
@@ -2037,15 +3339,75 @@ const SlotContentView: React.FC<{
     return map;
   }, [currentStepBullets, wordTimings]);
 
+  const primaryAction = items[0]?.action;
+  const primaryFullText = useMemo(
+    () => (primaryAction ? normalizeBlockText(primaryAction.text) : ""),
+    [primaryAction]
+  );
+
+  // Spoken trigger timestamp for single-text whiteboard primitives (heading, flow_card, note, equation)
+  const primaryWordTriggerMs = useMemo(() => {
+    if (
+      !primaryAction ||
+      primaryAction.type === "wb_code" ||
+      primaryAction.type === "wb_table" ||
+      primaryAction.type === "wb_diagram" ||
+      primaryAction.type === "wb_bullet" ||
+      !primaryFullText
+    ) {
+      return null;
+    }
+    const [matched] = computeItemTriggerMsList([primaryFullText], wordTimings);
+    if (matched === null) return null;
+    // Cap heading/primary card triggers so the board never sits blank during an opening clause
+    const capMs = primaryAction.type === "wb_heading" ? 350 : 900;
+    return Math.min(matched, capMs);
+  }, [primaryAction, primaryFullText, wordTimings]);
+
   if (!items || items.length === 0) return null;
   const primaryItem = items[0];
   const primary = primaryItem.action;
-  const primaryRatio = primaryItem.isCurrentStep ? textProgress : 1;
-  const primaryShowCursor =
-    primaryItem.isCurrentStep &&
-    isPlaying &&
-    textProgress > 0 &&
-    textProgress < 0.995;
+  const clampedStep = clamp01(stepProgress);
+  const canUseWordTiming =
+    typeof currentTimeMs === "number" &&
+    Number.isFinite(currentTimeMs) &&
+    Array.isArray(wordTimings) &&
+    wordTimings.length > 0 &&
+    (currentTimeMs > 0 || clampedStep <= 0.05);
+  const syncedTimeMs =
+    typeof currentTimeMs === "number" && Number.isFinite(currentTimeMs)
+      ? currentTimeMs + WORD_SYNC_LEAD_MS
+      : 0;
+
+  const primaryInstant =
+    !primaryItem.isCurrentStep || isStaticComplete || clampedStep >= 0.995;
+  const primaryTriggered =
+    primaryInstant ||
+    clampedStep >= 0.94 ||
+    (primary.type === "wb_heading"
+      ? !canUseWordTiming ||
+        primaryWordTriggerMs === null ||
+        syncedTimeMs >= primaryWordTriggerMs
+      : canUseWordTiming && primaryWordTriggerMs !== null
+      ? syncedTimeMs >= primaryWordTriggerMs
+      : clampedStep >= 0.02);
+
+  if (primary.type === "wb_diagram") {
+    return (
+      <DiagramBlockView
+        blockId={blockId}
+        action={primary}
+        slotWidth={slotWidth}
+        isCurrentStep={primaryItem.isCurrentStep}
+        isStaticComplete={isStaticComplete}
+        stepResetKey={stepResetKey}
+        stepProgress={stepProgress}
+        currentTimeMs={currentTimeMs}
+        wordTimings={wordTimings}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
+    );
+  }
 
   if (primary.type === "wb_table") {
     return (
@@ -2054,16 +3416,24 @@ const SlotContentView: React.FC<{
         action={primary}
         slotWidth={slotWidth}
         isCurrentStep={primaryItem.isCurrentStep}
+        isStaticComplete={isStaticComplete}
+        stepResetKey={stepResetKey}
         stepProgress={stepProgress}
         currentTimeMs={currentTimeMs}
         wordTimings={wordTimings}
-        isPlaying={isPlaying}
+        handwrittenFontsReady={handwrittenFontsReady}
         tableGridProgress={tableGridProgress}
       />
     );
   }
 
   if (primary.type === "wb_code") {
+    const primaryRatio = primaryItem.isCurrentStep ? textProgress : 1;
+    const primaryShowCursor =
+      primaryItem.isCurrentStep &&
+      isPlaying &&
+      textProgress > 0 &&
+      textProgress < 0.995;
     return (
       <CodeBlockView
         action={primary}
@@ -2076,11 +3446,7 @@ const SlotContentView: React.FC<{
 
   if (primary.type === "wb_note") {
     const token = getColorToken(primary.color);
-    const full = normalizeBlockText(primary.text);
-    const visible =
-      primaryRatio >= 0.995
-        ? full
-        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const lines = primaryFullText ? primaryFullText.split("\n") : [""];
     return (
       <View style={styles.noteBox}>
         <View style={styles.noteHeaderRow}>
@@ -2090,23 +3456,38 @@ const SlotContentView: React.FC<{
             </Text>
           </View>
         </View>
-        <Text style={[styles.noteText, { color: token.text }]}>
-          {visible}
-          {primaryShowCursor && (
-            <Text style={{ color: token.stroke }}>▍</Text>
-          )}
-        </Text>
+        {lines.map((line, lIdx) => {
+          const rtl = isArabicDominant(line);
+          return (
+            <InkSweepReveal
+              key={`note-${lIdx}`}
+              triggered={primaryTriggered}
+              instantComplete={primaryInstant}
+              isRtl={rtl}
+              resetKey={`${stepResetKey}-${primaryItem.key}-l${lIdx}`}
+              durationMs={INK_SWEEP_NOTE_MS}
+              delayMs={lIdx * 95}
+            >
+              <Text
+                style={[
+                  styles.noteText,
+                  getHandwrittenFontStyle(line, "note", handwrittenFontsReady),
+                  rtl && styles.rtlTextAlign,
+                  { color: token.text },
+                ]}
+              >
+                {line}
+              </Text>
+            </InkSweepReveal>
+          );
+        })}
       </View>
     );
   }
 
   if (primary.type === "wb_heading") {
     const token = getColorToken(primary.color);
-    const full = normalizeBlockText(primary.text);
-    const visible =
-      primaryRatio >= 0.995
-        ? full
-        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const rtl = isArabicDominant(primaryFullText);
     const hasIcon = Boolean(primary.icon);
     return (
       <View
@@ -2115,42 +3496,71 @@ const SlotContentView: React.FC<{
           hasIcon && styles.headingBoxWithIcon,
         ]}
       >
-        <Text style={[styles.headingText, { color: token.text }]}>
-          {visible}
-          {primaryShowCursor && (
-            <Text style={{ color: token.stroke }}>▍</Text>
-          )}
-        </Text>
+        <InkSweepReveal
+          triggered={primaryTriggered}
+          instantComplete={primaryInstant}
+          isRtl={rtl}
+          resetKey={`${stepResetKey}-${primaryItem.key}`}
+          durationMs={INK_SWEEP_HEADING_MS}
+        >
+          <Text
+            style={[
+              styles.headingText,
+              getHandwrittenFontStyle(
+                primaryFullText,
+                "heading",
+                handwrittenFontsReady
+              ),
+              { color: token.text },
+            ]}
+          >
+            {primaryFullText}
+          </Text>
+        </InkSweepReveal>
       </View>
     );
   }
 
   if (primary.type === "wb_equation") {
     const token = getColorToken(primary.color);
-    const full = normalizeBlockText(primary.text);
-    const visible =
-      primaryRatio >= 0.995
-        ? full
-        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const lines = primaryFullText ? primaryFullText.split("\n") : [""];
     return (
       <View style={styles.equationBox}>
-        <Text style={[styles.equationText, { color: token.text }]}>
-          {visible}
-          {primaryShowCursor && (
-            <Text style={{ color: token.stroke }}>▍</Text>
-          )}
-        </Text>
+        {lines.map((line, lIdx) => {
+          const rtl = isArabicDominant(line);
+          return (
+            <InkSweepReveal
+              key={`eq-${lIdx}`}
+              triggered={primaryTriggered}
+              instantComplete={primaryInstant}
+              isRtl={rtl}
+              resetKey={`${stepResetKey}-${primaryItem.key}-l${lIdx}`}
+              durationMs={INK_SWEEP_CARD_MS}
+              delayMs={lIdx * 90}
+            >
+              <Text
+                style={[
+                  styles.equationText,
+                  getHandwrittenFontStyle(
+                    line,
+                    "equation",
+                    handwrittenFontsReady
+                  ),
+                  { color: token.text },
+                ]}
+              >
+                {line}
+              </Text>
+            </InkSweepReveal>
+          );
+        })}
       </View>
     );
   }
 
   if (primary.type === "wb_flow_card") {
     const token = getColorToken(primary.color);
-    const full = normalizeBlockText(primary.text);
-    const visible =
-      primaryRatio >= 0.995
-        ? full
-        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const lines = primaryFullText ? primaryFullText.split("\n") : [""];
     const hasIcon = Boolean(primary.icon);
     return (
       <View
@@ -2162,161 +3572,96 @@ const SlotContentView: React.FC<{
               : styles.flowCardBoxWithIcon),
         ]}
       >
-        <Text style={[styles.flowCardText, { color: token.text }]}>
-          {visible}
-          {primaryShowCursor && (
-            <Text style={{ color: token.stroke }}>▍</Text>
-          )}
-        </Text>
-      </View>
-    );
-  }
-
-  // Stacked wb_bullet items:
-  // - Completed prior bullets render at 100%
-  // - Current-step bullets use exact WordBoundary sync when matched (280ms reveal window),
-  //   gracefully falling back to proportional sequential textProgress when unmatched/empty.
-  const clampedStep = clamp01(stepProgress);
-  const canUseWordTiming =
-    typeof currentTimeMs === "number" &&
-    Number.isFinite(currentTimeMs) &&
-    Array.isArray(wordTimings) &&
-    wordTimings.length > 0 &&
-    (currentTimeMs > 0 || clampedStep <= 0.05);
-
-  const hasAnyBulletWordMatch =
-    canUseWordTiming &&
-    currentStepBullets.some((it) => bulletTriggerMap.get(it.key) != null);
-
-  if (hasAnyBulletWordMatch) {
-    const totalCurrent = Math.max(1, currentStepBullets.length);
-    return (
-      <View style={styles.bulletList}>
-        {items.map((item) => {
-          const token = getColorToken(item.action.color);
-          const full = normalizeBlockText(item.action.text);
-
-          if (!item.isCurrentStep || clampedStep >= 0.995) {
-            return (
-              <View key={item.key} style={styles.bulletRow}>
-                <View
-                  style={[styles.bulletDot, { backgroundColor: token.stroke }]}
-                />
-                <Text style={[styles.bulletText, { color: token.text }]}>
-                  {full}
-                </Text>
-              </View>
-            );
-          }
-
-          const triggerMs = bulletTriggerMap.get(item.key) ?? null;
-          let ratio: number;
-          if (triggerMs !== null) {
-            // +150ms leading edge so bullets arrive crisp and never lag behind speech
-            const syncedTimeMs = (currentTimeMs as number) + WORD_SYNC_LEAD_MS;
-            if (clampedStep >= 0.94) {
-              ratio = 1;
-            } else if (syncedTimeMs < triggerMs) {
-              ratio = 0;
-            } else {
-              ratio = clamp01(
-                (syncedTimeMs - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS
-              );
-            }
-          } else {
-            const cIdx = Math.max(
-              0,
-              currentStepBullets.findIndex((b) => b.key === item.key)
-            );
-            const start = 0.08 + (cIdx / totalCurrent) * 0.7;
-            const span = Math.max(0.12, 0.7 / totalCurrent);
-            ratio = clamp01((clampedStep - start) / span);
-          }
-
-          if (ratio <= 0) {
-            return null;
-          }
-
-          const visible =
-            ratio >= 0.995
-              ? full
-              : full.slice(0, Math.max(1, Math.round(full.length * ratio)));
-          const isTypingThisBullet = isPlaying && ratio > 0 && ratio < 0.995;
-
+        {lines.map((line, lIdx) => {
+          const rtl = isArabicDominant(line);
           return (
-            <View
-              key={item.key}
-              style={[
-                styles.bulletRow,
-                { opacity: Math.min(1, ratio * 1.4) },
-              ]}
+            <InkSweepReveal
+              key={`fc-${lIdx}`}
+              triggered={primaryTriggered}
+              instantComplete={primaryInstant}
+              isRtl={rtl}
+              resetKey={`${stepResetKey}-${primaryItem.key}-l${lIdx}`}
+              durationMs={INK_SWEEP_CARD_MS}
+              delayMs={lIdx * 95}
             >
-              <View
-                style={[styles.bulletDot, { backgroundColor: token.stroke }]}
-              />
-              <Text style={[styles.bulletText, { color: token.text }]}>
-                {visible}
-                {isTypingThisBullet && (
-                  <Text style={{ color: token.stroke }}>▍</Text>
-                )}
+              <Text
+                style={[
+                  styles.flowCardText,
+                  getHandwrittenFontStyle(
+                    line,
+                    "flowCard",
+                    handwrittenFontsReady
+                  ),
+                  { color: token.text },
+                ]}
+              >
+                {line}
               </Text>
-            </View>
+            </InkSweepReveal>
           );
         })}
       </View>
     );
   }
 
-  // Default sequential typewriter budget fallback for stacked wb_bullet items
-  const currentTotalChars = currentStepBullets.reduce(
-    (sum, it) => sum + Math.max(1, normalizeBlockText(it.action.text).length),
-    0
-  );
-  let bulletBudget =
-    textProgress >= 0.995
-      ? currentTotalChars
-      : Math.floor(currentTotalChars * clamp01(textProgress));
+  // Stacked wb_bullet items:
+  // Every bullet sweeps cleanly RTL (Arabic) or LTR (English) in 280ms triggered by
+  // exact WordBoundary timestamps (+250ms lead) or early proportional stagger — ZERO character slicing.
+  const totalCurrent = Math.max(1, currentStepBullets.length);
 
   return (
     <View style={styles.bulletList}>
       {items.map((item) => {
         const token = getColorToken(item.action.color);
         const full = normalizeBlockText(item.action.text);
+        const rtl = isArabicDominant(full);
+        const itemInstant =
+          !item.isCurrentStep || isStaticComplete || clampedStep >= 0.995;
 
-        if (!item.isCurrentStep || textProgress >= 0.995) {
-          return (
-            <View key={item.key} style={styles.bulletRow}>
+        let triggered = itemInstant || clampedStep >= 0.94;
+        if (!triggered) {
+          const triggerMs = bulletTriggerMap.get(item.key) ?? null;
+          if (canUseWordTiming && triggerMs !== null) {
+            triggered = syncedTimeMs >= triggerMs;
+          } else {
+            const cIdx = Math.max(
+              0,
+              currentStepBullets.findIndex((b) => b.key === item.key)
+            );
+            const threshold = 0.06 + (cIdx / totalCurrent) * 0.65;
+            triggered = clampedStep >= threshold;
+          }
+        }
+
+        return (
+          <InkSweepReveal
+            key={item.key}
+            triggered={triggered}
+            instantComplete={itemInstant}
+            isRtl={rtl}
+            resetKey={`${stepResetKey}-${item.key}`}
+            durationMs={INK_SWEEP_BULLET_MS}
+          >
+            <View style={[styles.bulletRow, rtl && styles.bulletRowRtl]}>
               <View
                 style={[styles.bulletDot, { backgroundColor: token.stroke }]}
               />
-              <Text style={[styles.bulletText, { color: token.text }]}>
+              <Text
+                style={[
+                  styles.bulletText,
+                  getHandwrittenFontStyle(
+                    full,
+                    "bullet",
+                    handwrittenFontsReady
+                  ),
+                  rtl && styles.rtlTextAlign,
+                  { color: token.text },
+                ]}
+              >
                 {full}
               </Text>
             </View>
-          );
-        }
-
-        if (bulletBudget <= 0) {
-          return null;
-        }
-
-        const take = Math.min(full.length, bulletBudget);
-        bulletBudget -= Math.max(1, take);
-        const isTypingThisBullet =
-          isPlaying && bulletBudget <= 0 && textProgress < 0.995;
-
-        return (
-          <View key={item.key} style={styles.bulletRow}>
-            <View
-              style={[styles.bulletDot, { backgroundColor: token.stroke }]}
-            />
-            <Text style={[styles.bulletText, { color: token.text }]}>
-              {full.slice(0, take)}
-              {isTypingThisBullet && (
-                <Text style={{ color: token.stroke }}>▍</Text>
-              )}
-            </Text>
-          </View>
+          </InkSweepReveal>
         );
       })}
     </View>
@@ -2337,6 +3682,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   wordTimings,
   isPlaying = false,
   replayToken = 0,
+  handwrittenFontsReady = false,
   topInset = 76,
   bottomInset = 112,
 }) => {
@@ -2896,9 +4242,9 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   const primary = block.items[0]?.action;
                   if (!primary) return null;
 
-                  // wb_table renders its own memoized rough Skia grid inside TableBlockView
-                  // so horizontal scrolling on narrow phones keeps grid lines locked 1:1 with cells
-                  if (primary.type === "wb_table") {
+                  // wb_table and wb_diagram render their own memoized rough Skia canvases
+                  // so horizontal scrolling keeps vector strokes locked 1:1 with RN overlays
+                  if (primary.type === "wb_table" || primary.type === "wb_diagram") {
                     return null;
                   }
 
@@ -3000,6 +4346,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                 const primaryType = block.items[0]?.action.type;
                 const isCode = primaryType === "wb_code";
                 const isTable = primaryType === "wb_table";
+                const isDiagram = primaryType === "wb_diagram";
                 const isCompact =
                   block.slot === "left_col" || block.slot === "right_col";
 
@@ -3009,7 +4356,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                     style={[
                       styles.slotContainer,
                       isCode && styles.codeSlotContainer,
-                      isTable && styles.tableSlotContainer,
+                      (isTable || isDiagram) && styles.tableSlotContainer,
                       {
                         left: rect.x,
                         top: rect.y,
@@ -3022,12 +4369,15 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                       blockId={block.blockId}
                       items={block.items}
                       slotWidth={rect.width}
+                      stepResetKey={stepResetKey}
+                      isStaticComplete={isStaticComplete}
                       stepProgress={clampedProgress}
                       textProgress={textProgress}
                       currentTimeMs={currentTimeMs}
                       wordTimings={wordTimings}
                       isPlaying={isPlaying}
                       isCompact={isCompact}
+                      handwrittenFontsReady={handwrittenFontsReady}
                       tableGridProgress={tableGridProgressSV}
                     />
                   </View>
@@ -3243,6 +4593,88 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "flex-start",
     gap: 9,
+  },
+  bulletRowRtl: {
+    flexDirection: "row-reverse",
+  },
+  rtlTextAlign: {
+    textAlign: "right",
+    writingDirection: "rtl",
+  },
+  inkSweepHost: {
+    width: "100%",
+    overflow: "hidden",
+  },
+  inkSweepMask: {
+    overflow: "hidden",
+  },
+  inkSweepFull: {
+    width: "100%",
+  },
+  diagramBlockRoot: {
+    width: "100%",
+  },
+  diagramTitleWrap: {
+    height: DIAGRAM_TITLE_HEIGHT,
+    justifyContent: "center",
+    paddingHorizontal: 8,
+    paddingBottom: 2,
+  },
+  diagramTitleText: {
+    fontSize: 16,
+    fontWeight: "700",
+    lineHeight: 22,
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  diagramContainerHeaderWrap: {
+    position: "absolute",
+    justifyContent: "center",
+  },
+  diagramContainerPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 8,
+    maxWidth: "100%",
+  },
+  diagramContainerPillText: {
+    fontSize: 11.5,
+    fontWeight: "700",
+    includeFontPadding: false,
+  },
+  diagramNodeLabelBox: {
+    position: "absolute",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  diagramNodeLabelText: {
+    fontWeight: "600",
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  diagramNodeSublabelText: {
+    marginTop: 1,
+    textAlign: "center",
+    includeFontPadding: false,
+    opacity: 0.9,
+  },
+  diagramEdgeLabelWrap: {
+    position: "absolute",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  diagramEdgeLabelPill: {
+    backgroundColor: "rgba(250, 248, 245, 0.92)",
+    paddingHorizontal: 6,
+    paddingVertical: 1.5,
+    borderRadius: 6,
+    borderWidth: 0.75,
+    borderColor: "rgba(148, 163, 184, 0.35)",
+  },
+  diagramEdgeLabelText: {
+    fontWeight: "600",
+    textAlign: "center",
+    includeFontPadding: false,
   },
   bulletDot: {
     width: 7,

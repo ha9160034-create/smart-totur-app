@@ -14,6 +14,30 @@ export type SketchIcon =
   | "code"
   | "compare";
 
+export type DiagramNodeKind = "container" | "box" | "pill" | "decision";
+
+export type DiagramTint = "blue" | "teal" | "amber" | "rose" | "slate";
+
+export interface DiagramNode {
+  id: string;
+  label: string;
+  sublabel?: string | null;
+  kind?: DiagramNodeKind;
+  parent_id?: string | null;
+  x: number; // 0-1000
+  y: number; // 0-1000
+  w: number; // 40-1000
+  h: number; // 40-1000
+  tint?: DiagramTint | null;
+}
+
+export interface DiagramEdge {
+  from_id: string;
+  to_id: string;
+  label?: string | null;
+  dashed?: boolean;
+}
+
 export interface WordTiming {
   word: string;
   start_ms: number;
@@ -38,7 +62,8 @@ export interface VisualAction {
     | "wb_code"
     | "wb_flow_card"
     | "wb_table"
-    | "wb_note";
+    | "wb_note"
+    | "wb_diagram";
   color: "blue" | "red" | "green" | "yellow" | "black";
   bbox?: BoundingBox;
   slot?: WhiteboardSlot;
@@ -50,6 +75,10 @@ export interface VisualAction {
   highlight_lines?: number[];
   headers?: string[];
   rows?: string[][];
+  diagram_title?: string | null;
+  diagram_aspect?: number | null;
+  nodes?: DiagramNode[] | null;
+  edges?: DiagramEdge[] | null;
 }
 
 export interface TeachingStep {

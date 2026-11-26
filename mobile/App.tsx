@@ -21,6 +21,7 @@ import {
 } from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import { useFonts } from "expo-font";
 import {
   setAudioModeAsync,
   useAudioPlayer,
@@ -246,6 +247,14 @@ function TutorWorkspace() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 600;
   const hudMaxWidth = isTablet ? 640 : undefined;
+
+  // Non-blocking bundled handwritten whiteboard fonts (falls back gracefully to system fonts)
+  const [fontsLoaded, fontError] = useFonts({
+    "PlaypenSansArabic-Regular": require("./assets/fonts/PlaypenSansArabic-Regular.ttf"),
+    "PlaypenSansArabic-SemiBold": require("./assets/fonts/PlaypenSansArabic-SemiBold.ttf"),
+    "PatrickHand-Regular": require("./assets/fonts/PatrickHand-Regular.ttf"),
+  });
+  const handwrittenFontsReady = Boolean(fontsLoaded && !fontError);
 
   const [pdfFile, setPdfFile] = useState<PickedPdf | null>(null);
   const [pageInput, setPageInput] = useState<string>("1");
@@ -961,6 +970,7 @@ function TutorWorkspace() {
             wordTimings={currentStepWordTimings}
             isPlaying={isPlaying || status.playing}
             replayToken={replayToken}
+            handwrittenFontsReady={handwrittenFontsReady}
             topInset={topHudInset}
             bottomInset={bottomHudInset}
           />

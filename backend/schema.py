@@ -12,6 +12,47 @@ WhiteboardSlot = Literal[
 ]
 
 SketchIcon = Literal["lightbulb", "brain", "check", "warning", "code", "compare"]
+DiagramNodeKind = Literal["container", "box", "pill", "decision"]
+DiagramTint = Literal["blue", "teal", "amber", "rose", "slate"]
+
+
+class DiagramNode(BaseModel):
+    id: str = Field(..., description="Unique short node identifier (e.g., 'n1', 'outer_box').")
+    label: str = Field(..., description="Concise node label (2-5 words).")
+    sublabel: Optional[str] = Field(
+        default=None,
+        description="Optional short subtitle, metric, or detail (2-4 words).",
+    )
+    kind: DiagramNodeKind = Field(
+        default="box",
+        description="container=outer dashed grouping box, box=standard node, pill=start/end/tag, decision=branching diamond",
+    )
+    parent_id: Optional[str] = Field(
+        default=None,
+        description="Optional id of an enclosing container node when this node sits inside another box.",
+    )
+    x: int = Field(..., description="Left X coordinate in 0..1000 diagram space.")
+    y: int = Field(..., description="Top Y coordinate in 0..1000 diagram space.")
+    w: int = Field(..., description="Width in 40..1000 diagram space.")
+    h: int = Field(..., description="Height in 40..1000 diagram space.")
+    tint: Optional[DiagramTint] = Field(
+        default=None,
+        description="Optional whiteboard marker tint: blue, teal, amber, rose, or slate.",
+    )
+
+
+class DiagramEdge(BaseModel):
+    from_id: str = Field(..., description="Source node id.")
+    to_id: str = Field(..., description="Target node id.")
+    label: Optional[str] = Field(
+        default=None,
+        description="Optional concise edge label (e.g., 'Yes', 'No', 'Signal').",
+    )
+    dashed: bool = Field(
+        default=False,
+        description="True for feedback loops, weak links, or secondary data paths.",
+    )
+
 
 class BoundingBox(BaseModel):
     ymin: int = Field(..., ge=0, le=1000, description="Top Y (0-1000)")
@@ -30,7 +71,8 @@ class VisualAction(BaseModel):
         "wb_code",         # عرض بلوك كود برمجي ملون
         "wb_flow_card",    # رسم بطاقة مخطط انسيابي (طبي أو خوارزمي)
         "wb_table",        # رسم جدول مقارنة منظم على السبورة (2-4 أعمدة)
-        "wb_note"          # ملاحظة هامشية سريعة بخط يدوي (قاعدة، تنبيه، نصيحة)
+        "wb_note",         # ملاحظة هامشية سريعة بخط يدوي (قاعدة، تنبيه، نصيحة)
+        "wb_diagram"       # إعادة رسم مخطط تفاعلي كامل (صناديق متداخلة، قرارات، أسهم)
     ]
 
     color: Literal["blue", "red", "green", "yellow", "black"] = Field(
@@ -87,6 +129,26 @@ class VisualAction(BaseModel):
         description="REQUIRED for wb_table actions: 2 to 5 concise data rows (2-5 words per cell) aligned with headers."
     )
 
+    diagram_title: Optional[str] = Field(
+        default=None,
+        description="Optional handwritten header title rendered above a wb_diagram."
+    )
+
+    diagram_aspect: Optional[float] = Field(
+        default=None,
+        description="Optional height/width aspect ratio for wb_diagram (clamped 0.65..1.5, default 0.85)."
+    )
+
+    nodes: Optional[List[DiagramNode]] = Field(
+        default=None,
+        description="REQUIRED for wb_diagram actions: 2 to 14 DiagramNode objects positioned in 0..1000 space."
+    )
+
+    edges: Optional[List[DiagramEdge]] = Field(
+        default=None,
+        description="Optional directed DiagramEdge connectors (0 to 18) referencing valid node ids."
+    )
+
     @model_validator(mode="after")
     def validate_action_payload(self) -> "VisualAction":
         if self.type == "wb_code":
@@ -127,6 +189,71 @@ class VisualAction(BaseModel):
                 normalized_rows.append(cells)
             self.headers = cleaned_headers
             self.rows = normalized_rows
+        elif self.type == "wb_diagram":
+            raw_nodes = self.nodes or []
+            cleaned_nodes: List[DiagramNode] = []
+            seen_ids: set[str] = set()
+            for node in raw_nodes:
+                nid = str(node.id or "").strip()
+                label = str(node.label or "").strip()
+                if not nid or not label or nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+                cx = max(0, min(960, int(node.x)))
+                cy = max(0, min(960, int(node.y)))
+                cw = max(40, min(1000 - cx, int(node.w)))
+                ch = max(40, min(1000 - cy, int(node.h)))
+                sub = str(node.sublabel).strip() if node.sublabel is not None else None
+                cleaned_nodes.append(
+                    DiagramNode(
+                        id=nid,
+                        label=label,
+                        sublabel=sub or None,
+                        kind=node.kind,
+                        parent_id=str(node.parent_id).strip() if node.parent_id else None,
+                        x=cx,
+                        y=cy,
+                        w=cw,
+                        h=ch,
+                        tint=node.tint,
+                    )
+                )
+                if len(cleaned_nodes) >= 14:
+                    break
+
+            if len(cleaned_nodes) < 2:
+                raise ValueError(
+                    "wb_diagram action must provide at least 2 valid nodes with non-empty id and label."
+                )
+
+            valid_ids = {n.id for n in cleaned_nodes}
+            for node in cleaned_nodes:
+                if node.parent_id and (node.parent_id not in valid_ids or node.parent_id == node.id):
+                    node.parent_id = None
+
+            cleaned_edges: List[DiagramEdge] = []
+            for edge in (self.edges or []):
+                src = str(edge.from_id or "").strip()
+                dst = str(edge.to_id or "").strip()
+                if src in valid_ids and dst in valid_ids and src != dst:
+                    elabel = str(edge.label).strip() if edge.label is not None else None
+                    cleaned_edges.append(
+                        DiagramEdge(
+                            from_id=src,
+                            to_id=dst,
+                            label=elabel or None,
+                            dashed=bool(edge.dashed),
+                        )
+                    )
+                    if len(cleaned_edges) >= 18:
+                        break
+
+            aspect = 0.85 if self.diagram_aspect is None else float(self.diagram_aspect)
+            self.diagram_aspect = max(0.65, min(1.5, aspect))
+            if self.diagram_title is not None:
+                self.diagram_title = str(self.diagram_title).strip() or None
+            self.nodes = cleaned_nodes
+            self.edges = cleaned_edges
         return self
 
 class TeachingStep(BaseModel):

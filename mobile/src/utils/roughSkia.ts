@@ -868,3 +868,359 @@ export function createSketchIconPath(
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// 7. Hand-Drawn Nested Diagram Primitives (Containers, Diamonds, Smart Arrows)
+// ---------------------------------------------------------------------------
+
+/**
+ * Draws a sequence of organic hand-drawn marker dashes along a straight segment.
+ */
+function addRoughDashedSegment(
+  b: PathDrawOps,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  rng: () => number,
+  roughness: number,
+  dashLen = 10,
+  gapLen = 6.5
+): void {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return;
+
+  const ux = dx / len;
+  const uy = dy / len;
+  const nx = -uy;
+  const ny = ux;
+  const r = clampRoughness(roughness);
+
+  let pos = 0;
+  while (pos < len) {
+    const segEnd = Math.min(len, pos + dashLen * (0.9 + rng() * 0.22));
+    const sx = x1 + ux * pos + nx * jitter(rng, 0.65 * r);
+    const sy = y1 + uy * pos + ny * jitter(rng, 0.65 * r);
+    const ex = x1 + ux * segEnd + nx * jitter(rng, 0.65 * r);
+    const ey = y1 + uy * segEnd + ny * jitter(rng, 0.65 * r);
+    addBowedSegment(b, sx, sy, ex, ey, rng, r * 0.55, true);
+    pos = segEnd + gapLen * (0.88 + rng() * 0.24);
+  }
+}
+
+/**
+ * Creates a deterministic hand-drawn dashed rounded rectangle for enclosing
+ * `container` nodes in wb_diagram.
+ */
+export function createRoughDashedRectPath(
+  rect: RoughRectFrame,
+  radius: number,
+  seed: number,
+  roughness = 0.95
+): SkPath {
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return makeEmptySkiaPath();
+  }
+
+  const { x, y, width: w, height: h } = rect;
+  const rad = Math.max(0, Math.min(radius, w / 4, h / 4));
+  const rng = mulberry32(seed);
+  const safeRough = Math.min(
+    clampRoughness(roughness),
+    Math.min(w, h) / 18
+  );
+
+  return makePathFromBuilder((b) => {
+    // Four dashed edges
+    addRoughDashedSegment(b, x + rad, y, x + w - rad, y, rng, safeRough);
+    addRoughDashedSegment(b, x + w, y + rad, x + w, y + h - rad, rng, safeRough);
+    addRoughDashedSegment(b, x + w - rad, y + h, x + rad, y + h, rng, safeRough);
+    addRoughDashedSegment(b, x, y + h - rad, x, y + rad, rng, safeRough);
+
+    // Subtle organic rounded corner arcs so container corners feel hand-sketched
+    if (rad > 1) {
+      const jit = 0.6 * safeRough;
+      // Top-right corner
+      b.moveTo(x + w - rad, y + jitter(rng, jit));
+      b.quadTo(x + w + jitter(rng, jit), y + jitter(rng, jit), x + w + jitter(rng, jit), y + rad);
+      // Bottom-right corner
+      b.moveTo(x + w + jitter(rng, jit), y + h - rad);
+      b.quadTo(x + w + jitter(rng, jit), y + h + jitter(rng, jit), x + w - rad, y + h + jitter(rng, jit));
+      // Bottom-left corner
+      b.moveTo(x + rad, y + h + jitter(rng, jit));
+      b.quadTo(x + jitter(rng, jit), y + h + jitter(rng, jit), x + jitter(rng, jit), y + h - rad);
+      // Top-left corner
+      b.moveTo(x + jitter(rng, jit), y + rad);
+      b.quadTo(x + jitter(rng, jit), y + jitter(rng, jit), x + rad, y + jitter(rng, jit));
+    }
+  });
+}
+
+/**
+ * Clean closed diamond polygon path for tinted fill inside `decision` nodes.
+ */
+export function createDiamondFillPath(rect: RoughRectFrame): SkPath {
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return makeEmptySkiaPath();
+  }
+  const { x, y, width: w, height: h } = rect;
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  return makePathFromBuilder((b) => {
+    b.moveTo(cx, y);
+    b.lineTo(x + w, cy);
+    b.lineTo(cx, y + h);
+    b.lineTo(x, cy);
+    b.lineTo(cx, y);
+  });
+}
+
+/**
+ * Creates a deterministic double-stroke hand-drawn diamond path for `decision` nodes
+ * with guaranteed minimum curve bow and 2.2px-3.0px secondary pass separation.
+ */
+export function createRoughDiamondPath(
+  rect: RoughRectFrame,
+  seed: number,
+  roughness = 1
+): SkPath {
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return makeEmptySkiaPath();
+  }
+
+  const { x, y, width: w, height: h } = rect;
+  const cx = x + w / 2;
+  const cy = y + h / 2;
+  const rng = mulberry32(seed);
+  const safeRough = Math.min(
+    clampRoughness(roughness),
+    Math.min(w, h) / 14
+  );
+
+  return makePathFromBuilder((b) => {
+    for (let pass = 0; pass < 2; pass++) {
+      const sep = pass === 0 ? 0 : Math.min(Math.min(w, h) * 0.055, (2.2 + rng() * 0.8) * safeRough);
+      const ox = pass === 0 ? 0 : (rng() > 0.5 ? 1 : -1) * sep * 0.78;
+      const oy = pass === 0 ? 0 : (rng() > 0.5 ? 1 : -1) * sep * 0.78;
+      const jit = Math.min(Math.min(w, h) * 0.035, 1.4 * safeRough);
+      const bowBias = pass === 0 ? 1 : -1;
+
+      const top = { x: cx + ox + jitter(rng, jit), y: y + oy + jitter(rng, jit) };
+      const right = { x: x + w + ox + jitter(rng, jit), y: cy + oy + jitter(rng, jit) };
+      const bottom = { x: cx + ox + jitter(rng, jit), y: y + h + oy + jitter(rng, jit) };
+      const left = { x: x + ox + jitter(rng, jit), y: cy + oy + jitter(rng, jit) };
+
+      b.moveTo(top.x, top.y);
+      addBowedSegment(b, top.x, top.y, right.x, right.y, rng, safeRough, false, bowBias);
+      addBowedSegment(b, right.x, right.y, bottom.x, bottom.y, rng, safeRough, false, -bowBias);
+      addBowedSegment(b, bottom.x, bottom.y, left.x, left.y, rng, safeRough, false, bowBias);
+      addBowedSegment(b, left.x, left.y, top.x, top.y, rng, safeRough, false, -bowBias);
+    }
+  });
+}
+
+export interface SmartArrowGeometry {
+  startX: number;
+  startY: number;
+  ctrlX: number;
+  ctrlY: number;
+  endX: number;
+  endY: number;
+  labelX: number;
+  labelY: number;
+}
+
+/**
+ * Computes optimal box-edge face anchors, Bezier control point (automatically
+ * curving upward feedback loops or bidirectional edges), and exact curve midpoint
+ * for placing edge labels cleanly without overlap.
+ */
+export function computeSmartDiagramArrowGeometry(
+  from: RoughRectFrame,
+  to: RoughRectFrame,
+  curveOffset = 0
+): SmartArrowGeometry {
+  const fromCx = from.x + from.width / 2;
+  const fromCy = from.y + from.height / 2;
+  const toCx = to.x + to.width / 2;
+  const toCy = to.y + to.height / 2;
+
+  const dx = toCx - fromCx;
+  const dy = toCy - fromCy;
+
+  // Normalized directional dominance accounts for wide landscape boxes stacked vertically
+  const normDx = Math.abs(dx) / Math.max(1, (from.width + to.width) * 0.5);
+  const normDy = Math.abs(dy) / Math.max(1, (from.height + to.height) * 0.5);
+
+  const margin = 4;
+  let startX = fromCx;
+  let startY = fromCy;
+  let endX = toCx;
+  let endY = toCy;
+
+  if (normDx >= normDy) {
+    if (dx >= 0) {
+      startX = from.x + from.width + margin;
+      endX = to.x - margin;
+    } else {
+      startX = from.x - margin;
+      endX = to.x + to.width + margin;
+    }
+  } else {
+    if (dy >= 0) {
+      startY = from.y + from.height + margin;
+      endY = to.y - margin;
+    } else {
+      startY = from.y - margin;
+      endY = to.y + to.height + margin;
+    }
+  }
+
+  const spanX = endX - startX;
+  const spanY = endY - startY;
+  const dist = Math.hypot(spanX, spanY);
+  const midX = (startX + endX) * 0.5;
+  const midY = (startY + endY) * 0.5;
+
+  let effectiveCurve = curveOffset;
+  // Automatically curve upward feedback / loop edges so they arc cleanly around interior boxes
+  if (effectiveCurve === 0 && fromCy > toCy + 16) {
+    effectiveCurve = Math.min(44, Math.max(24, dist * 0.22));
+  } else if (effectiveCurve === 0 && Math.abs(spanX) > 20 && Math.abs(spanY) > 20) {
+    effectiveCurve = Math.min(18, dist * 0.08) * (dx >= 0 ? -1 : 1);
+  }
+
+  const nx = dist > 0.5 ? -spanY / dist : 0;
+  const ny = dist > 0.5 ? spanX / dist : -1;
+  const ctrlX = midX + nx * effectiveCurve;
+  const ctrlY = midY + ny * effectiveCurve;
+
+  // Exact quadratic Bezier midpoint at t = 0.5
+  const labelX = 0.25 * startX + 0.5 * ctrlX + 0.25 * endX;
+  const labelY = 0.25 * startY + 0.5 * ctrlY + 0.25 * endY;
+
+  return { startX, startY, ctrlX, ctrlY, endX, endY, labelX, labelY };
+}
+
+/**
+ * Creates a hand-drawn smart diagram connector arrow (solid or dashed curved shaft
+ * + double-stroke sketchy arrowhead) connecting the closest faces of `from` -> `to`.
+ */
+export function createSmartDiagramArrowPath(
+  from: RoughRectFrame,
+  to: RoughRectFrame,
+  seed: number,
+  curveOffset = 0,
+  dashed = false,
+  roughness = 0.95
+): SkPath {
+  if (
+    !from ||
+    !to ||
+    from.width <= 0 ||
+    from.height <= 0 ||
+    to.width <= 0 ||
+    to.height <= 0
+  ) {
+    return makeEmptySkiaPath();
+  }
+
+  const geom = computeSmartDiagramArrowGeometry(from, to, curveOffset);
+  const dist = Math.hypot(geom.endX - geom.startX, geom.endY - geom.startY);
+  if (dist < 4) return makeEmptySkiaPath();
+
+  const rng = mulberry32(seed);
+  const r = clampRoughness(roughness);
+
+  const nx = -(geom.endY - geom.startY) / dist;
+  const ny = (geom.endX - geom.startX) / dist;
+  const sep = Math.min(dist * 0.06, (2.0 + rng() * 0.7) * r) * (rng() > 0.5 ? 1 : -1);
+
+  // Tangent at end of quadratic Bezier is (end - ctrl)
+  const angle = Math.atan2(geom.endY - geom.ctrlY, geom.endX - geom.ctrlX);
+  const headLen = Math.min(11, Math.max(7, dist * 0.24));
+  const spread = Math.PI / 6;
+
+  return makePathFromBuilder((b) => {
+    if (dashed) {
+      // Sample quadratic Bezier into clean hand-drawn dashes
+      const steps = Math.max(10, Math.round(dist / 7.5));
+      const pts: Array<{ x: number; y: number }> = [];
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const omt = 1 - t;
+        pts.push({
+          x:
+            omt * omt * geom.startX +
+            2 * omt * t * geom.ctrlX +
+            t * t * geom.endX +
+            jitter(rng, 0.55 * r),
+          y:
+            omt * omt * geom.startY +
+            2 * omt * t * geom.ctrlY +
+            t * t * geom.endY +
+            jitter(rng, 0.55 * r),
+        });
+      }
+      for (let i = 0; i < pts.length - 1; i += 2) {
+        const p0 = pts[i];
+        const p1 = pts[Math.min(pts.length - 1, i + 1)];
+        b.moveTo(p0.x, p0.y);
+        b.lineTo(p1.x, p1.y);
+      }
+    } else {
+      // Primary curved marker shaft
+      b.moveTo(geom.startX + jitter(rng, 0.65 * r), geom.startY + jitter(rng, 0.65 * r));
+      b.quadTo(
+        geom.ctrlX + jitter(rng, 1.2 * r),
+        geom.ctrlY + jitter(rng, 1.2 * r),
+        geom.endX,
+        geom.endY
+      );
+      // Companion double-stroke shaft for Retina hand-drawn feel
+      b.moveTo(
+        geom.startX + nx * sep * 0.7 + jitter(rng, 0.7 * r),
+        geom.startY + ny * sep * 0.7 + jitter(rng, 0.7 * r)
+      );
+      b.quadTo(
+        geom.ctrlX + nx * sep + jitter(rng, 1.4 * r),
+        geom.ctrlY + ny * sep + jitter(rng, 1.4 * r),
+        geom.endX + nx * sep * 0.4 + jitter(rng, 0.7 * r),
+        geom.endY + ny * sep * 0.4 + jitter(rng, 0.7 * r)
+      );
+    }
+
+    // Double-stroke sketchy arrowhead wings
+    for (let pass = 0; pass < 2; pass++) {
+      const tipX = geom.endX + jitter(rng, (0.5 + pass * 0.45) * r);
+      const tipY = geom.endY + jitter(rng, (0.5 + pass * 0.45) * r);
+      const lenL = headLen * (0.94 + rng() * 0.14);
+      const lenR = headLen * (0.94 + rng() * 0.14);
+      const spreadL = spread + jitter(rng, 0.08 * r);
+      const spreadR = spread + jitter(rng, 0.08 * r);
+
+      addBowedSegment(
+        b,
+        tipX,
+        tipY,
+        tipX - lenL * Math.cos(angle - spreadL),
+        tipY - lenL * Math.sin(angle - spreadL),
+        rng,
+        r * 0.6,
+        true
+      );
+      addBowedSegment(
+        b,
+        tipX,
+        tipY,
+        tipX - lenR * Math.cos(angle + spreadR),
+        tipY - lenR * Math.sin(angle + spreadR),
+        rng,
+        r * 0.6,
+        true
+      );
+    }
+  });
+}
