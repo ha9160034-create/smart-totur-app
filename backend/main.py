@@ -691,11 +691,58 @@ async def _synthesize_edge_segment_bytes(lang: Literal["ar", "en"], segment_text
     return _strip_id3v2(b"".join(chunks)) if chunks else b""
 
 
+_CBR_MP3_FRAME_BYTES: int = 144  # 24kHz / 48kbps mono MPEG-2 Layer III = 144 bytes per 24ms frame
+_SPLICE_TRIM_FRAMES: int = 7      # ~168ms (1008 bytes) trimmed at internal splice boundaries
+_MIN_RETAINED_FRAMES: int = 6     # Always retain at least ~144ms so short words never vanish
+
+
+def _trim_cbr_mp3_splice(
+    mp3_bytes: bytes,
+    trim_lead: bool,
+    trim_tail: bool,
+    frames: int = _SPLICE_TRIM_FRAMES,
+) -> bytes:
+    """
+    Trim leading/trailing silence padding on 144-byte CBR MPEG-2 Layer III frame boundaries
+    at internal splice points when concatenating multiple edge-tts segments.
+    """
+    if not mp3_bytes or (not trim_lead and not trim_tail):
+        return mp3_bytes
+    # Verify MPEG-2 Layer III header sync (0xFF 0xF2 / 0xFF 0xF3) before frame-aligned slicing
+    if len(mp3_bytes) < _CBR_MP3_FRAME_BYTES * (_MIN_RETAINED_FRAMES + 2):
+        return mp3_bytes
+    if mp3_bytes[0] != 0xFF or (mp3_bytes[1] & 0xFE) != 0xF2:
+        return mp3_bytes
+
+    total_frames = len(mp3_bytes) // _CBR_MP3_FRAME_BYTES
+    max_trimmable = max(0, total_frames - _MIN_RETAINED_FRAMES)
+    if max_trimmable == 0:
+        return mp3_bytes
+
+    lead_frames = 0
+    tail_frames = 0
+    if trim_lead and trim_tail:
+        per_side = min(frames, max_trimmable // 2)
+        lead_frames = per_side
+        tail_frames = per_side
+    elif trim_lead:
+        lead_frames = min(frames, max_trimmable)
+    elif trim_tail:
+        tail_frames = min(frames, max_trimmable)
+
+    start_byte = lead_frames * _CBR_MP3_FRAME_BYTES
+    end_byte = len(mp3_bytes) - (tail_frames * _CBR_MP3_FRAME_BYTES)
+    if start_byte >= end_byte:
+        return mp3_bytes
+    return mp3_bytes[start_byte:end_byte]
+
+
 async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
     """
     Free bilingual MP3 synthesis via edge-tts:
     Synthesizes Arabic runs (ar-AE-HamdanNeural, +8%) and English runs (en-US-AndrewNeural, +5%)
-    concurrently and concatenates raw 24kHz/48kbps mono CBR MP3 frames with zero external deps.
+    concurrently, trims ~7 leading/trailing silence frames (1008 bytes) at internal splice
+    boundaries, and concatenates raw 24kHz/48kbps mono CBR MP3 frames with zero external deps.
     """
     segments = _split_bilingual_segments(text)
     if not segments:
@@ -708,10 +755,10 @@ async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        stitched_parts: list[bytes] = []
+        raw_parts: list[bytes] = []
         for (lang, seg_text), res in zip(segments, results):
             if isinstance(res, bytes) and res:
-                stitched_parts.append(res)
+                raw_parts.append(res)
             elif isinstance(res, Exception):
                 logger.warning(
                     "Bilingual edge-tts segment failed (lang=%s, text=%r): %s",
@@ -720,7 +767,19 @@ async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
                     res,
                 )
 
-        if stitched_parts:
+        if raw_parts:
+            if len(raw_parts) > 1:
+                last_idx = len(raw_parts) - 1
+                stitched_parts = [
+                    _trim_cbr_mp3_splice(
+                        part,
+                        trim_lead=(idx > 0),
+                        trim_tail=(idx < last_idx),
+                    )
+                    for idx, part in enumerate(raw_parts)
+                ]
+            else:
+                stitched_parts = raw_parts
             return base64.b64encode(b"".join(stitched_parts)).decode("ascii")
 
         # Fallback to single-voice synthesis if segmented stitching produced no audio

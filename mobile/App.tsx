@@ -84,6 +84,18 @@ const BOARD_MODE_SHORT_LABELS: Record<BoardMode, string> = {
 
 const PLAYBACK_SPEEDS: PlaybackSpeed[] = [1.0, 1.25, 1.5];
 
+/**
+ * Wrap embedded English phrases with Unicode Left-to-Right Isolate markers (\u2066...\u2069)
+ * so multi-word English technical terms read cleanly left-to-right inside RTL Arabic captions.
+ */
+function formatBidiArabicCaption(text: string): string {
+  if (!text) return "";
+  return text.replace(
+    /[A-Za-z][A-Za-z0-9_/\-+.]*(?:\s+[A-Za-z0-9][A-Za-z0-9_/\-+.]*)*/g,
+    (match) => `\u2066${match}\u2069`
+  );
+}
+
 function requestJson<T>(url: string, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -151,7 +163,7 @@ function TutorWorkspace() {
   const [pageInput, setPageInput] = useState<string>("1");
   const [boardMode, setBoardMode] = useState<BoardMode>("auto");
   const [useDeepModel, setUseDeepModel] = useState<boolean>(false);
-  const [showCaptions, setShowCaptions] = useState<boolean>(true);
+  const [showCaptions, setShowCaptions] = useState<boolean>(false);
 
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -844,12 +856,14 @@ function TutorWorkspace() {
             style={styles.captionScroll}
             showsVerticalScrollIndicator={false}
           >
-            <Text style={styles.captionSpeechAr}>{currentStep.speech_ar}</Text>
+            <Text style={styles.captionSpeechAr}>
+              {formatBidiArabicCaption(currentStep.speech_ar)}
+            </Text>
 
             {isLastStep && !!result.plan.quiz_question_ar && (
               <View style={styles.captionQuizRow}>
                 <Text style={styles.captionQuizText}>
-                  سؤال تطبيقي: {result.plan.quiz_question_ar}
+                  سؤال تطبيقي: {formatBidiArabicCaption(result.plan.quiz_question_ar)}
                 </Text>
               </View>
             )}

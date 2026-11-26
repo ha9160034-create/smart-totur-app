@@ -362,8 +362,8 @@ function buildRoundedRectStrokePath(rect: RectFrame, radius: number) {
 function buildHeadingUnderlinePath(rect: RectFrame) {
   const { x, y, width: w, height: h } = rect;
   if (w <= 0 || h <= 0) return makeEmptyPath();
-  const inset = Math.min(28, w * 0.14);
-  const lineY = y + h - 5;
+  const inset = Math.min(28, w * 0.1);
+  const lineY = y + h - 4;
   return makePathFromBuilder((b) => {
     b.moveTo(x + inset, lineY);
     b.lineTo(x + w - inset, lineY);
@@ -484,14 +484,21 @@ function resolveWhiteboardBlocks(
       }
       if (!action.slot) continue;
 
+      // Always place wb_heading in a full-width slot so headings never wrap inside narrow half-width columns
+      const targetSlot: WhiteboardSlot =
+        action.type === "wb_heading" &&
+        (action.slot === "left_col" || action.slot === "right_col")
+          ? "header"
+          : action.slot;
+
       const resolvedItem: ResolvedAction = {
-        key: `s${step.step_id}-i${i}-a${j}-${action.type}-${action.slot}`,
+        key: `s${step.step_id}-i${i}-a${j}-${action.type}-${targetSlot}`,
         action,
         stepIdx: i,
         isCurrentStep: isCurrent,
       };
 
-      const existingInBand = bandSlots.get(action.slot);
+      const existingInBand = bandSlots.get(targetSlot);
 
       // Stack bullets cleanly inside the same slot if the current band's slot already holds bullets
       if (
@@ -516,9 +523,9 @@ function resolveWhiteboardBlocks(
         : undefined;
 
       const newBlock: WhiteboardBlock = {
-        blockId: `b${currentBand}-${action.slot}-s${step.step_id}-a${j}`,
+        blockId: `b${currentBand}-${targetSlot}-s${step.step_id}-a${j}`,
         bandIndex: currentBand,
-        slot: action.slot,
+        slot: targetSlot,
         createdAtStepIdx: i,
         lastUpdatedStepIdx: i,
         items: [resolvedItem],
@@ -526,8 +533,11 @@ function resolveWhiteboardBlocks(
       };
 
       blocks.push(newBlock);
-      bandSlots.set(action.slot, newBlock);
-      latestBySlot.set(action.slot, newBlock);
+      bandSlots.set(targetSlot, newBlock);
+      latestBySlot.set(targetSlot, newBlock);
+      if (targetSlot !== action.slot) {
+        latestBySlot.set(action.slot, newBlock);
+      }
     }
   }
 
@@ -535,58 +545,97 @@ function resolveWhiteboardBlocks(
 }
 
 function estimateWrappedLines(text: string, charsPerLine: number): number {
-  const safeChars = Math.max(12, Math.floor(charsPerLine));
-  const rawLines = text.split("\n");
+  const safeChars = Math.max(10, Math.floor(charsPerLine));
+  const paragraphs = text.split("\n");
   let total = 0;
-  for (const line of rawLines) {
-    total += Math.max(1, Math.ceil(line.length / safeChars));
+
+  for (const para of paragraphs) {
+    const trimmed = para.trim();
+    if (!trimmed) {
+      total += 1;
+      continue;
+    }
+    // Simulate word-boundary wrapping so long words moving to a new line never under-estimate height
+    const words = trimmed.split(/\s+/);
+    let linesInPara = 1;
+    let currentLen = 0;
+
+    for (const word of words) {
+      if (word.length > safeChars) {
+        if (currentLen > 0) {
+          linesInPara += 1;
+          currentLen = 0;
+        }
+        const extra = Math.ceil(word.length / safeChars);
+        linesInPara += extra - 1;
+        currentLen = word.length % safeChars || safeChars;
+      } else if (currentLen === 0) {
+        currentLen = word.length;
+      } else if (currentLen + 1 + word.length <= safeChars) {
+        currentLen += 1 + word.length;
+      } else {
+        linesInPara += 1;
+        currentLen = word.length;
+      }
+    }
+    total += linesInPara;
   }
+
   return Math.max(1, total);
 }
 
 function estimateSlotHeight(
   items: ResolvedAction[] | undefined,
-  slotWidth: number
+  slotWidth: number,
+  isCompactColumn = false
 ): number {
   if (!items || items.length === 0 || slotWidth <= 0) return 0;
   const primary = items[0].action;
-  const innerW = Math.max(100, slotWidth - 24);
 
   if (primary.type === "wb_heading") {
     const clean = normalizeBlockText(primary.text);
-    const lines = estimateWrappedLines(clean, innerW / 10.5);
-    return Math.max(56, 28 + lines * 24);
+    const charsPerLine = Math.max(14, Math.floor((slotWidth - 32) / 10.2));
+    const lines = estimateWrappedLines(clean, charsPerLine);
+    // Generous vertical padding + bottom clearance above the Skia underline at y + height - 4
+    return Math.max(64, 42 + lines * 26);
   }
 
   if (primary.type === "wb_code") {
     const rawCode = primary.code || primary.text || "";
     const clean = normalizeBlockText(rawCode);
-    const codeInnerW = Math.max(120, slotWidth - 52);
-    const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / 7.4);
-    // 32px macOS-style header + 24px vertical padding + 21px per wrapped code line
-    return Math.max(118, 32 + 24 + wrappedLines * 21);
+    const gutterAndPad = isCompactColumn ? 34 : 50;
+    const codeInnerW = Math.max(108, slotWidth - gutterAndPad);
+    const charWidth = isCompactColumn ? 6.8 : 7.4;
+    const rowHeight = isCompactColumn ? 18.5 : 21.5;
+    const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / charWidth);
+    // 32px header + 36px vertical padding (includes +12px bottom breathing room) + per-line height
+    return Math.max(126, 32 + 36 + wrappedLines * rowHeight);
   }
 
   if (primary.type === "wb_equation") {
     const clean = normalizeBlockText(primary.text);
-    const lines = estimateWrappedLines(clean, innerW / 9.5);
-    return Math.max(76, 30 + lines * 26);
+    const charsPerLine = Math.max(12, Math.floor((slotWidth - 28) / 9.5));
+    const lines = estimateWrappedLines(clean, charsPerLine);
+    return Math.max(84, 48 + lines * 26);
   }
 
   if (primary.type === "wb_flow_card") {
     const clean = normalizeBlockText(primary.text);
-    const lines = estimateWrappedLines(clean, innerW / 8.2);
-    return Math.max(92, 32 + lines * 22);
+    // Conservative chars-per-line estimate + generous +24px padding so half-width cards never clip
+    const charsPerLine = Math.max(11, Math.floor((slotWidth - 28) / 8.5));
+    const lines = estimateWrappedLines(clean, charsPerLine);
+    return Math.max(104, 56 + lines * 23);
   }
 
-  // Stacked wb_bullet items
-  let totalH = 26;
+  // Stacked wb_bullet items with conservative word-wrap estimate & generous vertical padding
+  const bulletCharsPerLine = Math.max(11, Math.floor((slotWidth - 46) / 8.5));
+  let totalH = 50;
   for (const item of items) {
     const clean = normalizeBlockText(item.action.text);
-    const lines = estimateWrappedLines(clean, (innerW - 18) / 8.0);
-    totalH += lines * 21 + 8;
+    const lines = estimateWrappedLines(clean, bulletCharsPerLine);
+    totalH += lines * 22 + 10;
   }
-  return Math.max(90, totalH);
+  return Math.max(104, totalH);
 }
 
 function computeCumulativeWhiteboardLayout(
@@ -651,9 +700,11 @@ function computeCumulativeWhiteboardLayout(
     }
 
     if (leftBlock || rightBlock) {
-      const leftH = leftBlock ? estimateSlotHeight(leftBlock.items, halfW) : 0;
+      const leftH = leftBlock
+        ? estimateSlotHeight(leftBlock.items, halfW, true)
+        : 0;
       const rightH = rightBlock
-        ? estimateSlotHeight(rightBlock.items, halfW)
+        ? estimateSlotHeight(rightBlock.items, halfW, true)
         : 0;
       const colsH = Math.max(leftH, rightH);
 
@@ -938,7 +989,8 @@ const CodeBlockView: React.FC<{
   action: VisualAction;
   revealRatio: number;
   showCursor: boolean;
-}> = ({ action, revealRatio, showCursor }) => {
+  isCompact: boolean;
+}> = ({ action, revealRatio, showCursor, isCompact }) => {
   const rawCode = action.code || action.text || "";
   const normalized = normalizeBlockText(rawCode);
   const fullLines = normalized ? normalized.split("\n") : ["# (no code provided)"];
@@ -1007,7 +1059,7 @@ const CodeBlockView: React.FC<{
         </Text>
       </View>
 
-      <View style={styles.codeBody}>
+      <View style={[styles.codeBody, isCompact && styles.codeBodyCompact]}>
         {visibleRows.map((row) => {
           const isHighlighted = highlighted.has(row.lineNum);
           const spans = tokenizeCodeLine(row.text);
@@ -1016,6 +1068,7 @@ const CodeBlockView: React.FC<{
               key={row.lineNum}
               style={[
                 styles.codeLineRow,
+                isCompact && styles.codeLineRowCompact,
                 isHighlighted && {
                   backgroundColor: "rgba(59, 130, 246, 0.24)",
                   borderLeftWidth: 3,
@@ -1023,8 +1076,20 @@ const CodeBlockView: React.FC<{
                 },
               ]}
             >
-              <Text style={styles.codeLineNumber}>{row.lineNum}</Text>
-              <Text style={styles.codeLineText}>
+              <Text
+                style={[
+                  styles.codeLineNumber,
+                  isCompact && styles.codeLineNumberCompact,
+                ]}
+              >
+                {row.lineNum}
+              </Text>
+              <Text
+                style={[
+                  styles.codeLineText,
+                  isCompact && styles.codeLineTextCompact,
+                ]}
+              >
                 {spans.map((span, sIdx) => (
                   <Text
                     key={sIdx}
@@ -1052,7 +1117,8 @@ const SlotContentView: React.FC<{
   items: ResolvedAction[];
   textProgress: number;
   isPlaying: boolean;
-}> = ({ items, textProgress, isPlaying }) => {
+  isCompact: boolean;
+}> = ({ items, textProgress, isPlaying, isCompact }) => {
   if (!items || items.length === 0) return null;
   const primaryItem = items[0];
   const primary = primaryItem.action;
@@ -1069,6 +1135,7 @@ const SlotContentView: React.FC<{
         action={primary}
         revealRatio={primaryRatio}
         showCursor={primaryShowCursor}
+        isCompact={isCompact}
       />
     );
   }
@@ -1751,6 +1818,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                 const rect = blockRects.get(block.blockId);
                 if (!rect || rect.width <= 0 || rect.height <= 0) return null;
                 const isCode = block.items[0]?.action.type === "wb_code";
+                const isCompact =
+                  block.slot === "left_col" || block.slot === "right_col";
 
                 return (
                   <View
@@ -1770,6 +1839,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                       items={block.items}
                       textProgress={textProgress}
                       isPlaying={isPlaying}
+                      isCompact={isCompact}
                     />
                   </View>
                 );
@@ -1852,6 +1922,7 @@ const styles = StyleSheet.create({
   headingBox: {
     justifyContent: "center",
     alignItems: "center",
+    paddingBottom: 8,
   },
   headingText: {
     fontSize: 17.5,
@@ -1939,14 +2010,24 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   codeBody: {
-    paddingVertical: 10,
+    paddingTop: 10,
+    paddingBottom: 18,
     gap: 2,
+  },
+  codeBodyCompact: {
+    paddingTop: 8,
+    paddingBottom: 18,
+    gap: 1.5,
   },
   codeLineRow: {
     flexDirection: "row",
     paddingHorizontal: 10,
     paddingVertical: 2,
     alignItems: "flex-start",
+  },
+  codeLineRowCompact: {
+    paddingHorizontal: 6,
+    paddingVertical: 1,
   },
   codeLineNumber: {
     width: 24,
@@ -1955,6 +2036,11 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
+  codeLineNumberCompact: {
+    width: 18,
+    fontSize: 10.5,
+    lineHeight: 16,
+  },
   codeLineText: {
     flex: 1,
     flexShrink: 1,
@@ -1962,6 +2048,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 19,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  codeLineTextCompact: {
+    fontSize: 11.5,
+    lineHeight: 16,
   },
   codePenCursor: {
     color: "#38BDF8",
