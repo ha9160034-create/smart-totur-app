@@ -35,12 +35,18 @@ import type {
 } from "./src/types/schema";
 
 // ---------------------------------------------------------------------------
-// Configuration: Env-driven for Cloud Deployment (Render/Railway), with LAN fallback
+// Configuration: Env-driven with live Railway production fallback (never LAN IP)
 // ---------------------------------------------------------------------------
+const PRODUCTION_API_URL = "https://smart-totur-app-production.up.railway.app";
 const API_BASE_URL = (
-  process.env.EXPO_PUBLIC_API_URL || "http://192.168.0.138:8000"
-).replace(/\/+$/, "");
-const APP_API_KEY = (process.env.EXPO_PUBLIC_APP_API_KEY || "").trim();
+  process.env.EXPO_PUBLIC_API_URL || PRODUCTION_API_URL
+)
+  .trim()
+  .replace(/^["']|["']$/g, "")
+  .replace(/\/+$/, "");
+const APP_API_KEY = (process.env.EXPO_PUBLIC_APP_API_KEY || "")
+  .trim()
+  .replace(/^["']|["']$/g, "");
 const REQUEST_TIMEOUT_MS = 90_000;
 
 type BoardMode = "auto" | "whiteboard" | "pdf_overlay";
