@@ -317,6 +317,8 @@ def _sanitize_plan(
         "wb_equation",
         "wb_code",
         "wb_flow_card",
+        "wb_table",
+        "wb_note",
     }
 
     for step in plan.steps:
@@ -351,11 +353,21 @@ def _sanitize_plan(
 # ---------------------------------------------------------------------------
 # Extended Response Envelope & Concurrent In-Memory Neural TTS (edge-tts)
 # ---------------------------------------------------------------------------
+class WordTiming(BaseModel):
+    word: str
+    start_ms: int = Field(..., ge=0)
+    duration_ms: int = Field(..., ge=0)
+
+
 class StepAudioPayload(BaseModel):
     step_id: int
     audio_base64: Optional[str] = Field(
         default=None,
         description="Base64-encoded MP3 audio synthesized for this step's speech_ar.",
+    )
+    word_timings: list[WordTiming] = Field(
+        default_factory=list,
+        description="Monotonically increasing word-level timing boundaries synced to the stitched MP3 audio.",
     )
 
 
@@ -738,19 +750,40 @@ def _strip_id3v2(mp3_bytes: bytes) -> bytes:
     return mp3_bytes
 
 
-async def _synthesize_edge_segment_bytes(lang: Literal["ar", "en"], segment_text: str) -> bytes:
-    """Synthesize a single Arabic or English segment into raw headerless CBR MP3 bytes."""
+async def _synthesize_edge_segment(
+    lang: Literal["ar", "en"],
+    segment_text: str,
+) -> tuple[bytes, list[tuple[str, int, int]]]:
+    """
+    Synthesize a single Arabic or English segment into raw headerless CBR MP3 bytes
+    alongside raw WordBoundary events as (word_text, offset_100ns, duration_100ns).
+    """
     voice = EDGE_TTS_EN_VOICE if lang == "en" else EDGE_TTS_VOICE
     rate = EDGE_TTS_EN_RATE if lang == "en" else EDGE_TTS_RATE
-    communicate = edge_tts.Communicate(segment_text, voice, rate=rate)
+    communicate = edge_tts.Communicate(
+        segment_text,
+        voice,
+        rate=rate,
+        boundary="WordBoundary",
+    )
     chunks: list[bytes] = []
+    boundaries: list[tuple[str, int, int]] = []
     async for chunk in communicate.stream():
-        if chunk.get("type") == "audio" and chunk.get("data"):
+        chunk_type = chunk.get("type")
+        if chunk_type == "audio" and chunk.get("data"):
             chunks.append(chunk["data"])
-    return _strip_id3v2(b"".join(chunks)) if chunks else b""
+        elif chunk_type == "WordBoundary":
+            word_text = str(chunk.get("text") or "").strip()
+            if word_text:
+                offset_ticks = int(chunk.get("offset") or 0)
+                duration_ticks = int(chunk.get("duration") or 0)
+                boundaries.append((word_text, offset_ticks, duration_ticks))
+    audio_bytes = _strip_id3v2(b"".join(chunks)) if chunks else b""
+    return audio_bytes, boundaries
 
 
-_CBR_MP3_FRAME_BYTES: int = 144  # 24kHz / 48kbps mono MPEG-2 Layer III = 144 bytes per 24ms frame
+_CBR_MP3_FRAME_BYTES: int = 144   # 24kHz / 48kbps mono MPEG-2 Layer III = 144 bytes per 24ms frame
+_CBR_MP3_FRAME_MS: float = 24.0   # 576 samples / 24,000 Hz = exactly 24.0ms per frame
 _SPLICE_TRIM_FRAMES: int = 7      # ~168ms (1008 bytes) trimmed at internal splice boundaries
 _MIN_RETAINED_FRAMES: int = 6     # Always retain at least ~144ms so short words never vanish
 
@@ -760,23 +793,24 @@ def _trim_cbr_mp3_splice(
     trim_lead: bool,
     trim_tail: bool,
     frames: int = _SPLICE_TRIM_FRAMES,
-) -> bytes:
+) -> tuple[bytes, int]:
     """
     Trim leading/trailing silence padding on 144-byte CBR MPEG-2 Layer III frame boundaries
     at internal splice points when concatenating multiple edge-tts segments.
+    Returns (trimmed_bytes, lead_frames_trimmed).
     """
     if not mp3_bytes or (not trim_lead and not trim_tail):
-        return mp3_bytes
+        return mp3_bytes, 0
     # Verify MPEG-2 Layer III header sync (0xFF 0xF2 / 0xFF 0xF3) before frame-aligned slicing
     if len(mp3_bytes) < _CBR_MP3_FRAME_BYTES * (_MIN_RETAINED_FRAMES + 2):
-        return mp3_bytes
+        return mp3_bytes, 0
     if mp3_bytes[0] != 0xFF or (mp3_bytes[1] & 0xFE) != 0xF2:
-        return mp3_bytes
+        return mp3_bytes, 0
 
     total_frames = len(mp3_bytes) // _CBR_MP3_FRAME_BYTES
     max_trimmable = max(0, total_frames - _MIN_RETAINED_FRAMES)
     if max_trimmable == 0:
-        return mp3_bytes
+        return mp3_bytes, 0
 
     lead_frames = 0
     tail_frames = 0
@@ -792,32 +826,33 @@ def _trim_cbr_mp3_splice(
     start_byte = lead_frames * _CBR_MP3_FRAME_BYTES
     end_byte = len(mp3_bytes) - (tail_frames * _CBR_MP3_FRAME_BYTES)
     if start_byte >= end_byte:
-        return mp3_bytes
-    return mp3_bytes[start_byte:end_byte]
+        return mp3_bytes, 0
+    return mp3_bytes[start_byte:end_byte], lead_frames
 
 
-async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
+async def _synthesize_edge_tts_b64(text: str) -> tuple[Optional[str], list[WordTiming]]:
     """
     Free bilingual MP3 synthesis via edge-tts:
     Synthesizes Arabic runs (ar-AE-HamdanNeural, +8%) and English runs (en-US-AndrewNeural, +5%)
     concurrently, trims ~7 leading/trailing silence frames (1008 bytes) at internal splice
-    boundaries, and concatenates raw 24kHz/48kbps mono CBR MP3 frames with zero external deps.
+    boundaries, concatenates raw 24kHz/48kbps mono CBR MP3 frames with zero external deps,
+    and returns (audio_base64, splice_adjusted_word_timings).
     """
     segments = _split_bilingual_segments(text)
     if not segments:
-        return None
+        return None, []
 
     try:
         tasks = [
-            _synthesize_edge_segment_bytes(lang, seg_text)
+            _synthesize_edge_segment(lang, seg_text)
             for lang, seg_text in segments
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        raw_parts: list[bytes] = []
+        raw_parts: list[tuple[bytes, list[tuple[str, int, int]]]] = []
         for (lang, seg_text), res in zip(segments, results):
-            if isinstance(res, bytes) and res:
-                raw_parts.append(res)
+            if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], bytes) and res[0]:
+                raw_parts.append((res[0], res[1]))
             elif isinstance(res, Exception):
                 logger.warning(
                     "Bilingual edge-tts segment failed (lang=%s, text=%r): %s",
@@ -827,38 +862,72 @@ async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
                 )
 
         if raw_parts:
-            if len(raw_parts) > 1:
-                last_idx = len(raw_parts) - 1
-                stitched_parts = [
-                    _trim_cbr_mp3_splice(
-                        part,
+            stitched_parts: list[bytes] = []
+            word_timings: list[WordTiming] = []
+            cumulative_ms = 0.0
+            multi_segment = len(raw_parts) > 1
+            last_idx = len(raw_parts) - 1
+
+            for idx, (part_bytes, boundaries) in enumerate(raw_parts):
+                if multi_segment:
+                    trimmed_part, lead_frames = _trim_cbr_mp3_splice(
+                        part_bytes,
                         trim_lead=(idx > 0),
                         trim_tail=(idx < last_idx),
                     )
-                    for idx, part in enumerate(raw_parts)
-                ]
-            else:
-                stitched_parts = raw_parts
-            return base64.b64encode(b"".join(stitched_parts)).decode("ascii")
+                else:
+                    trimmed_part, lead_frames = part_bytes, 0
+
+                lead_trim_ms = lead_frames * _CBR_MP3_FRAME_MS
+                for word_text, offset_ticks, duration_ticks in boundaries:
+                    abs_start_ms = max(
+                        0,
+                        round(cumulative_ms + max(0.0, (offset_ticks / 10_000.0) - lead_trim_ms)),
+                    )
+                    dur_ms = max(0, round(duration_ticks / 10_000.0))
+                    word_timings.append(
+                        WordTiming(
+                            word=word_text,
+                            start_ms=abs_start_ms,
+                            duration_ms=dur_ms,
+                        )
+                    )
+
+                stitched_parts.append(trimmed_part)
+                cumulative_ms += (len(trimmed_part) / _CBR_MP3_FRAME_BYTES) * _CBR_MP3_FRAME_MS
+
+            word_timings.sort(key=lambda item: item.start_ms)
+            return base64.b64encode(b"".join(stitched_parts)).decode("ascii"), word_timings
 
         # Fallback to single-voice synthesis if segmented stitching produced no audio
-        single_bytes = await _synthesize_edge_segment_bytes("ar", text)
-        return base64.b64encode(single_bytes).decode("ascii") if single_bytes else None
+        single_bytes, single_boundaries = await _synthesize_edge_segment("ar", text)
+        if single_bytes:
+            fallback_timings = [
+                WordTiming(
+                    word=word_text,
+                    start_ms=max(0, round(offset_ticks / 10_000.0)),
+                    duration_ms=max(0, round(duration_ticks / 10_000.0)),
+                )
+                for word_text, offset_ticks, duration_ticks in single_boundaries
+            ]
+            fallback_timings.sort(key=lambda item: item.start_ms)
+            return base64.b64encode(single_bytes).decode("ascii"), fallback_timings
+        return None, []
     except Exception as exc:
         logger.warning("edge-tts synthesis failed (ar=%s, en=%s): %s", EDGE_TTS_VOICE, EDGE_TTS_EN_VOICE, exc)
-        return None
+        return None, []
 
 
-async def _synthesize_step_audio_b64(text: str) -> Optional[str]:
-    """Generate MP3 speech: optional Google Cloud TTS Chirp 3 HD if explicitly configured, else bilingual edge-tts."""
+async def _synthesize_step_audio_b64(text: str) -> tuple[Optional[str], list[WordTiming]]:
+    """Generate MP3 speech + WordBoundary timings: optional Google Cloud TTS Chirp 3 HD if explicitly configured, else bilingual edge-tts."""
     cleaned = _clean_speech_for_tts(text)
     if not cleaned:
-        return None
+        return None, []
 
     if GOOGLE_TTS_ENABLED and GOOGLE_TTS_API_KEY:
         chirp_b64 = await _synthesize_google_chirp_b64(cleaned)
         if chirp_b64:
-            return chirp_b64
+            return chirp_b64, []
 
     return await _synthesize_edge_tts_b64(cleaned)
 
@@ -876,13 +945,21 @@ async def _synthesize_plan_audio(plan: LecturePlan) -> list[StepAudioPayload]:
 
     payloads: list[StepAudioPayload] = []
     for step, result in zip(plan.steps, results):
-        if isinstance(result, str) and result:
-            audio_b64: Optional[str] = result
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0]:
+            audio_b64: Optional[str] = result[0]
+            word_timings: list[WordTiming] = list(result[1] or [])
         else:
             if isinstance(result, Exception):
                 logger.warning("TTS failed/timed out for step %d: %s", step.step_id, result)
             audio_b64 = None
-        payloads.append(StepAudioPayload(step_id=step.step_id, audio_base64=audio_b64))
+            word_timings = []
+        payloads.append(
+            StepAudioPayload(
+                step_id=step.step_id,
+                audio_base64=audio_b64,
+                word_timings=word_timings,
+            )
+        )
     return payloads
 
 

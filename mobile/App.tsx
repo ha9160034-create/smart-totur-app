@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -26,7 +27,11 @@ import {
   useAudioPlayerStatus,
 } from "expo-audio";
 import { SmartBoardCanvas } from "./src/components/SmartBoardCanvas";
-import type { ExplainSlideResponse, TeachingStep } from "./src/types/schema";
+import type {
+  ExplainSlideResponse,
+  TeachingStep,
+  WordTiming,
+} from "./src/types/schema";
 
 // ---------------------------------------------------------------------------
 // Configuration: Env-driven for Cloud Deployment (Render/Railway), with LAN fallback
@@ -49,6 +54,7 @@ interface PickedPdf {
 interface StepAudioPayload {
   step_id: number;
   audio_base64: string | null;
+  word_timings?: WordTiming[];
 }
 
 interface ExplainSlideWithAudioResponse extends ExplainSlideResponse {
@@ -237,6 +243,9 @@ function postJson<T>(
 
 function TutorWorkspace() {
   const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const isTablet = width >= 600;
+  const hudMaxWidth = isTablet ? 640 : undefined;
 
   const [pdfFile, setPdfFile] = useState<PickedPdf | null>(null);
   const [pageInput, setPageInput] = useState<string>("1");
@@ -281,6 +290,25 @@ function TutorWorkspace() {
   const currentStep = steps[stepIndex] ?? null;
   const currentStepAudioUri = stepAudioUris[stepIndex] ?? null;
 
+  const currentStepWordTimings = useMemo<WordTiming[]>(() => {
+    if (!result?.step_audio || !currentStep) return [];
+    const byIndex = result.step_audio[stepIndex];
+    if (
+      byIndex &&
+      byIndex.step_id === currentStep.step_id &&
+      Array.isArray(byIndex.word_timings)
+    ) {
+      return byIndex.word_timings;
+    }
+    const byStepId = result.step_audio.find(
+      (item) => item.step_id === currentStep.step_id
+    );
+    if (byStepId && Array.isArray(byStepId.word_timings)) {
+      return byStepId.word_timings;
+    }
+    return Array.isArray(byIndex?.word_timings) ? byIndex.word_timings : [];
+  }, [result, currentStep, stepIndex]);
+
   const slideAspectRatio = useMemo(() => {
     if (!result || result.slide_height <= 0) return 16 / 9;
     return result.slide_width / result.slide_height;
@@ -320,6 +348,12 @@ function TutorWorkspace() {
     status.playing,
     status.didJustFinish,
   ]);
+
+  // Unified continuous lecture progress across all steps (0.0 -> 1.0)
+  const overallProgress =
+    steps.length > 0
+      ? Math.max(0, Math.min(1, (stepIndex + stepProgress) / steps.length))
+      : 0;
 
   // Configure expo-audio session on mount so iOS plays audio even with mute switch on
   useEffect(() => {
@@ -631,10 +665,21 @@ function TutorWorkspace() {
         })
       );
       const alignedAudioPayloads: StepAudioPayload[] = renumberedSteps.map(
-        (step, idx) => ({
-          step_id: step.step_id,
-          audio_base64: qaData.step_audio?.[idx]?.audio_base64 ?? null,
-        })
+        (step, idx) => {
+          const originalStep = qaData.plan.steps[idx];
+          const matchedAudio =
+            qaData.step_audio?.[idx] ??
+            qaData.step_audio?.find(
+              (item) => item.step_id === originalStep?.step_id
+            );
+          return {
+            step_id: step.step_id,
+            audio_base64: matchedAudio?.audio_base64 ?? null,
+            word_timings: Array.isArray(matchedAudio?.word_timings)
+              ? matchedAudio.word_timings
+              : [],
+          };
+        }
       );
 
       const newCachedUris = await preCacheStepAudios(
@@ -886,6 +931,8 @@ function TutorWorkspace() {
             slideImageUri={result.slide_image_data_uri}
             slideAspectRatio={slideAspectRatio}
             stepProgress={stepProgress}
+            currentTimeMs={status.currentTime * 1000}
+            wordTimings={currentStepWordTimings}
             isPlaying={isPlaying || status.playing}
             replayToken={replayToken}
             topInset={topHudInset}
@@ -893,7 +940,12 @@ function TutorWorkspace() {
           />
         ) : (
           <View style={styles.emptyPaperStage}>
-            <View style={styles.welcomeCard}>
+            <View
+              style={[
+                styles.welcomeCard,
+                { maxWidth: isTablet ? 460 : 380 },
+              ]}
+            >
               <Text style={styles.welcomeBadge}>SPATIAL AI WHITEBOARD</Text>
               <Text style={styles.welcomeTitle}>AI Smart Whiteboard Tutor</Text>
               <Text style={styles.welcomeSub}>
@@ -937,120 +989,133 @@ function TutorWorkspace() {
       {/* ================================================================= */}
       <View
         pointerEvents="box-none"
-        style={[styles.topHudRow, { top: insets.top + 8 }]}
+        style={[styles.topHudOuter, { top: insets.top + 8 }]}
       >
-        {/* Top-Left Subtle Pill: PDF Title + Page Selector + Recent */}
-        <View style={styles.topLeftPill}>
-          <Pressable style={styles.docChip} onPress={handlePickPdf}>
-            <Text style={styles.docChipText} numberOfLines={1}>
-              {activeDocLabel}
-            </Text>
-          </Pressable>
+        <View
+          pointerEvents="box-none"
+          style={[
+            styles.topHudRow,
+            { maxWidth: hudMaxWidth },
+          ]}
+        >
+          {/* Top-Left Subtle Pill: PDF Title + Page Selector + Recent */}
+          <View style={styles.topLeftPill}>
+            <Pressable style={styles.docChip} onPress={handlePickPdf}>
+              <Text style={styles.docChipText} numberOfLines={1}>
+                {activeDocLabel}
+              </Text>
+            </Pressable>
 
-          {result?.cached && (
-            <View style={styles.cachedPill}>
-              <Text style={styles.cachedPillText}>Cached ⚡</Text>
+            {result?.cached && (
+              <View style={styles.cachedPill}>
+                <Text style={styles.cachedPillText}>Cached ⚡</Text>
+              </View>
+            )}
+
+            <View style={styles.pillDivider} />
+
+            <View style={styles.pageMiniGroup}>
+              <Text style={styles.pageMiniPrefix}>P.</Text>
+              <TextInput
+                value={pageInput}
+                onChangeText={setPageInput}
+                keyboardType="number-pad"
+                maxLength={4}
+                style={styles.pageMiniInput}
+                placeholder="1"
+                placeholderTextColor="#94A3B8"
+                returnKeyType="go"
+                onSubmitEditing={() => {
+                  if (pdfFile && !loading) void handleExplain();
+                }}
+              />
             </View>
-          )}
 
-          <View style={styles.pillDivider} />
+            <View style={styles.pillDivider} />
 
-          <View style={styles.pageMiniGroup}>
-            <Text style={styles.pageMiniPrefix}>P.</Text>
-            <TextInput
-              value={pageInput}
-              onChangeText={setPageInput}
-              keyboardType="number-pad"
-              maxLength={4}
-              style={styles.pageMiniInput}
-              placeholder="1"
-              placeholderTextColor="#94A3B8"
-              returnKeyType="go"
-              onSubmitEditing={() => {
-                if (pdfFile && !loading) void handleExplain();
-              }}
-            />
+            <Pressable
+              style={styles.recentMiniBtn}
+              onPress={handleOpenRecentLectures}
+            >
+              <Text style={styles.recentMiniText}>Recent</Text>
+            </Pressable>
           </View>
 
-          <View style={styles.pillDivider} />
-
-          <Pressable
-            style={styles.recentMiniBtn}
-            onPress={handleOpenRecentLectures}
-          >
-            <Text style={styles.recentMiniText}>Recent</Text>
-          </Pressable>
-        </View>
-
-        {/* Top-Right Compact Circular Icons: Mode, Deep, Captions */}
-        <View style={styles.topRightIcons}>
-          <Pressable
-            style={[
-              styles.circleIconBtn,
-              boardMode !== "auto" && styles.circleIconBtnBlue,
-            ]}
-            onPress={handleCycleBoardMode}
-            accessibilityLabel="Toggle board mode"
-          >
-            <Text
+          {/* Top-Right Compact Circular Icons: Mode, Deep, Captions */}
+          <View style={styles.topRightIcons}>
+            <Pressable
               style={[
-                styles.circleIconLabel,
-                boardMode !== "auto" && styles.circleIconLabelActive,
+                styles.circleIconBtn,
+                boardMode !== "auto" && styles.circleIconBtnBlue,
               ]}
+              onPress={handleCycleBoardMode}
+              accessibilityLabel="Toggle board mode"
             >
-              {BOARD_MODE_SHORT_LABELS[boardMode]}
-            </Text>
-          </Pressable>
+              <Text
+                style={[
+                  styles.circleIconLabel,
+                  boardMode !== "auto" && styles.circleIconLabelActive,
+                ]}
+              >
+                {BOARD_MODE_SHORT_LABELS[boardMode]}
+              </Text>
+            </Pressable>
 
-          <Pressable
-            style={[
-              styles.circleIconBtn,
-              useDeepModel && styles.circleIconBtnDeep,
-            ]}
-            onPress={() => setUseDeepModel((v) => !v)}
-            accessibilityLabel="Toggle deep reasoning mode"
-          >
-            <Text
+            <Pressable
               style={[
-                styles.circleIconSymbol,
-                useDeepModel && styles.circleIconLabelActive,
+                styles.circleIconBtn,
+                useDeepModel && styles.circleIconBtnDeep,
               ]}
+              onPress={() => setUseDeepModel((v) => !v)}
+              accessibilityLabel="Toggle deep reasoning mode"
             >
-              ✦
-            </Text>
-          </Pressable>
+              <Text
+                style={[
+                  styles.circleIconSymbol,
+                  useDeepModel && styles.circleIconLabelActive,
+                ]}
+              >
+                ✦
+              </Text>
+            </Pressable>
 
-          <Pressable
-            style={[
-              styles.circleIconBtn,
-              showCaptions && styles.circleIconBtnDark,
-            ]}
-            onPress={() => setShowCaptions((v) => !v)}
-            accessibilityLabel="Toggle captions"
-          >
-            <Text
+            <Pressable
               style={[
-                styles.circleIconLabel,
-                showCaptions && styles.circleIconLabelActive,
+                styles.circleIconBtn,
+                showCaptions && styles.circleIconBtnDark,
               ]}
+              onPress={() => setShowCaptions((v) => !v)}
+              accessibilityLabel="Toggle captions"
             >
-              CC
-            </Text>
-          </Pressable>
+              <Text
+                style={[
+                  styles.circleIconLabel,
+                  showCaptions && styles.circleIconLabelActive,
+                ]}
+              >
+                CC
+              </Text>
+            </Pressable>
+          </View>
         </View>
       </View>
 
       {/* Dismissible Floating Error Toast */}
       {error && (
-        <Pressable
-          style={[styles.floatingErrorToast, { top: insets.top + 56 }]}
-          onPress={() => setError(null)}
+        <View
+          pointerEvents="box-none"
+          style={[styles.floatingErrorWrap, { top: insets.top + 56 }]}
         >
-          <Text style={styles.floatingErrorText} numberOfLines={3}>
-            {error}
-          </Text>
-          <Text style={styles.floatingErrorDismiss}>✕</Text>
-        </Pressable>
+          <Pressable
+            style={[styles.floatingErrorToast, { maxWidth: hudMaxWidth }]}
+            onPress={() => setError(null)}
+          >
+            <Text style={styles.floatingErrorText} numberOfLines={3}>
+              {error}
+            </Text>
+            <Text style={styles.floatingErrorDismiss}>✕</Text>
+          </Pressable>
+        </View>
       )}
 
       {/* ================================================================= */}
@@ -1058,27 +1123,35 @@ function TutorWorkspace() {
       {/* ================================================================= */}
       {result && currentStep && showCaptions && (
         <View
+          pointerEvents="box-none"
           style={[
-            styles.captionStripCard,
+            styles.captionStripWrap,
             { bottom: insets.bottom + (askExpanded ? 132 : 114) },
           ]}
         >
-          <ScrollView
-            style={styles.captionScroll}
-            showsVerticalScrollIndicator={false}
+          <View
+            style={[
+              styles.captionStripCard,
+              { maxWidth: hudMaxWidth },
+            ]}
           >
-            <Text style={styles.captionSpeechAr}>
-              {formatBidiArabicCaption(currentStep.speech_ar)}
-            </Text>
+            <ScrollView
+              style={styles.captionScroll}
+              showsVerticalScrollIndicator={false}
+            >
+              <Text style={styles.captionSpeechAr}>
+                {formatBidiArabicCaption(currentStep.speech_ar)}
+              </Text>
 
-            {isLastStep && !!result.plan.quiz_question_ar && (
-              <View style={styles.captionQuizRow}>
-                <Text style={styles.captionQuizText}>
-                  سؤال تطبيقي: {formatBidiArabicCaption(result.plan.quiz_question_ar)}
-                </Text>
-              </View>
-            )}
-          </ScrollView>
+              {isLastStep && !!result.plan.quiz_question_ar && (
+                <View style={styles.captionQuizRow}>
+                  <Text style={styles.captionQuizText}>
+                    سؤال تطبيقي: {formatBidiArabicCaption(result.plan.quiz_question_ar)}
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
         </View>
       )}
 
@@ -1091,52 +1164,57 @@ function TutorWorkspace() {
           pointerEvents="box-none"
           style={[styles.askOverlayWrap, { bottom: insets.bottom + 72 }]}
         >
-          {askExpanded ? (
-            <View style={styles.askExpandedPill}>
-              <TextInput
-                value={askInput}
-                onChangeText={setAskInput}
-                placeholder="Ask anything about this slide..."
-                placeholderTextColor="#94A3B8"
-                style={styles.askTextInput}
-                returnKeyType="send"
-                editable={!askLoading}
-                autoFocus
-                onSubmitEditing={() => void handleAskQuestion()}
-              />
+          <View
+            pointerEvents="box-none"
+            style={[styles.askOverlayInner, { maxWidth: hudMaxWidth }]}
+          >
+            {askExpanded ? (
+              <View style={styles.askExpandedPill}>
+                <TextInput
+                  value={askInput}
+                  onChangeText={setAskInput}
+                  placeholder="Ask anything about this slide..."
+                  placeholderTextColor="#94A3B8"
+                  style={styles.askTextInput}
+                  returnKeyType="send"
+                  editable={!askLoading}
+                  autoFocus
+                  onSubmitEditing={() => void handleAskQuestion()}
+                />
+                <Pressable
+                  style={[
+                    styles.askSendBtn,
+                    (!askInput.trim() || askLoading) && styles.dockDisabled,
+                  ]}
+                  onPress={() => void handleAskQuestion()}
+                  disabled={!askInput.trim() || askLoading}
+                >
+                  {askLoading ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.askSendBtnText}>↑</Text>
+                  )}
+                </Pressable>
+                <Pressable
+                  style={styles.askCloseBtn}
+                  onPress={() => {
+                    Keyboard.dismiss();
+                    setAskExpanded(false);
+                  }}
+                  disabled={askLoading}
+                >
+                  <Text style={styles.askCloseBtnText}>✕</Text>
+                </Pressable>
+              </View>
+            ) : (
               <Pressable
-                style={[
-                  styles.askSendBtn,
-                  (!askInput.trim() || askLoading) && styles.dockDisabled,
-                ]}
-                onPress={() => void handleAskQuestion()}
-                disabled={!askInput.trim() || askLoading}
+                style={styles.askCollapsedPill}
+                onPress={() => setAskExpanded(true)}
               >
-                {askLoading ? (
-                  <ActivityIndicator size="small" color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.askSendBtnText}>↑</Text>
-                )}
+                <Text style={styles.askCollapsedText}>✦ Ask anything...</Text>
               </Pressable>
-              <Pressable
-                style={styles.askCloseBtn}
-                onPress={() => {
-                  Keyboard.dismiss();
-                  setAskExpanded(false);
-                }}
-                disabled={askLoading}
-              >
-                <Text style={styles.askCloseBtnText}>✕</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <Pressable
-              style={styles.askCollapsedPill}
-              onPress={() => setAskExpanded(true)}
-            >
-              <Text style={styles.askCollapsedText}>✦ Ask anything...</Text>
-            </Pressable>
-          )}
+            )}
+          </View>
         </KeyboardAvoidingView>
       )}
 
@@ -1147,7 +1225,7 @@ function TutorWorkspace() {
         pointerEvents="box-none"
         style={[styles.bottomDockWrap, { bottom: insets.bottom + 10 }]}
       >
-        <View style={styles.bottomDarkPill}>
+        <View style={[styles.bottomDarkPill, { maxWidth: hudMaxWidth }]}>
           {loading ? (
             <View style={styles.dockLoadingRow}>
               <ActivityIndicator size="small" color="#F8FAFC" />
@@ -1158,11 +1236,12 @@ function TutorWorkspace() {
           ) : result && currentStep ? (
             <>
               <Pressable
-                style={[styles.dockIconBtn, !canGoPrev && styles.dockDisabled]}
+                style={[styles.dockJumpBtn, !canGoPrev && styles.dockDisabled]}
                 onPress={() => canGoPrev && handleSelectStep(stepIndex - 1)}
                 disabled={!canGoPrev}
+                accessibilityLabel="Previous step"
               >
-                <Text style={styles.dockIconText}>‹</Text>
+                <Text style={styles.dockJumpText}>‹</Text>
               </Pressable>
 
               <Pressable
@@ -1172,26 +1251,63 @@ function TutorWorkspace() {
                 ]}
                 onPress={handleTogglePlayPause}
                 disabled={!currentStepAudioUri}
+                accessibilityLabel={
+                  isPlaying || status.playing ? "Pause lecture" : "Play lecture"
+                }
               >
                 <Text style={styles.dockPlayText}>
                   {isPlaying || status.playing ? "⏸" : "▶"}
                 </Text>
               </Pressable>
 
-              <Pressable style={styles.dockIconBtn} onPress={handleReplayStep}>
+              <Pressable
+                style={styles.dockIconBtn}
+                onPress={handleReplayStep}
+                accessibilityLabel="Replay current step"
+              >
                 <Text style={styles.dockReplayText}>↺</Text>
               </Pressable>
 
-              <Text style={styles.dockStepText}>
-                {stepIndex + 1}/{steps.length}
-              </Text>
+              {/* Unified Continuous Lecture Progress Bar */}
+              <View style={styles.dockProgressWrap}>
+                <View style={styles.dockProgressTrack}>
+                  <View
+                    style={[
+                      styles.dockProgressFill,
+                      { width: `${(overallProgress * 100).toFixed(2)}%` },
+                    ]}
+                  />
+                  {steps.length > 1 &&
+                    steps.slice(1).map((step, boundaryIdx) => {
+                      const ratio = (boundaryIdx + 1) / steps.length;
+                      const isPassed = overallProgress >= ratio;
+                      return (
+                        <View
+                          key={`tick-${step.step_id}-${boundaryIdx}`}
+                          pointerEvents="none"
+                          style={[
+                            styles.dockProgressTick,
+                            isPassed && styles.dockProgressTickPassed,
+                            { left: `${(ratio * 100).toFixed(2)}%` },
+                          ]}
+                        />
+                      );
+                    })}
+                </View>
+                <Text style={styles.dockProgressMicroLabel} numberOfLines={1}>
+                  {isTablet
+                    ? `${Math.round(overallProgress * 100)}% • ${stepIndex + 1}/${steps.length}`
+                    : `${stepIndex + 1}/${steps.length}`}
+                </Text>
+              </View>
 
               <Pressable
-                style={[styles.dockIconBtn, !canGoNext && styles.dockDisabled]}
+                style={[styles.dockJumpBtn, !canGoNext && styles.dockDisabled]}
                 onPress={() => canGoNext && handleSelectStep(stepIndex + 1)}
                 disabled={!canGoNext}
+                accessibilityLabel="Next step"
               >
-                <Text style={styles.dockIconText}>›</Text>
+                <Text style={styles.dockJumpText}>›</Text>
               </Pressable>
 
               <Pressable
@@ -1452,11 +1568,16 @@ const styles = StyleSheet.create({
   },
 
   // Top Floating HUD
-  topHudRow: {
+  topHudOuter: {
     position: "absolute",
     left: 12,
     right: 12,
     zIndex: 30,
+    alignItems: "center",
+  },
+  topHudRow: {
+    width: "100%",
+    alignSelf: "center",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -1488,6 +1609,7 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
     fontWeight: "700",
     color: "#0F172A",
+    includeFontPadding: false,
   },
   cachedPill: {
     backgroundColor: "#FEF3C7",
@@ -1501,6 +1623,7 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "800",
     color: "#B45309",
+    includeFontPadding: false,
   },
   pillDivider: {
     width: 1,
@@ -1515,6 +1638,7 @@ const styles = StyleSheet.create({
     fontSize: 11.5,
     fontWeight: "700",
     color: "#64748B",
+    includeFontPadding: false,
   },
   pageMiniInput: {
     minWidth: 26,
@@ -1525,6 +1649,7 @@ const styles = StyleSheet.create({
     color: "#0F172A",
     paddingVertical: 2,
     paddingHorizontal: 2,
+    includeFontPadding: false,
   },
   recentMiniBtn: {
     backgroundColor: "#F0FDF4",
@@ -1538,6 +1663,7 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: "700",
     color: "#15803D",
+    includeFontPadding: false,
   },
   topRightIcons: {
     flexDirection: "row",
@@ -1575,22 +1701,29 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "800",
     color: "#334155",
+    includeFontPadding: false,
   },
   circleIconSymbol: {
     fontSize: 14,
     fontWeight: "700",
     color: "#334155",
+    includeFontPadding: false,
   },
   circleIconLabelActive: {
     color: "#FFFFFF",
   },
 
   // Floating Error Toast
-  floatingErrorToast: {
+  floatingErrorWrap: {
     position: "absolute",
     left: 16,
     right: 16,
     zIndex: 35,
+    alignItems: "center",
+  },
+  floatingErrorToast: {
+    width: "100%",
+    alignSelf: "center",
     backgroundColor: "#FEF2F2",
     borderWidth: 1,
     borderColor: "#FCA5A5",
@@ -1612,20 +1745,27 @@ const styles = StyleSheet.create({
     color: "#B91C1C",
     fontSize: 12,
     fontWeight: "600",
+    includeFontPadding: false,
   },
   floatingErrorDismiss: {
     color: "#991B1B",
     fontSize: 13,
     fontWeight: "800",
     paddingHorizontal: 4,
+    includeFontPadding: false,
   },
 
   // Collapsible Compact Captions Strip
-  captionStripCard: {
+  captionStripWrap: {
     position: "absolute",
     left: 14,
     right: 14,
     zIndex: 25,
+    alignItems: "center",
+  },
+  captionStripCard: {
+    width: "100%",
+    alignSelf: "center",
     backgroundColor: "rgba(255, 255, 255, 0.94)",
     borderWidth: 1,
     borderColor: "#E7E2D9",
@@ -1649,6 +1789,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     textAlign: "right",
     writingDirection: "rtl",
+    includeFontPadding: false,
   },
   captionQuizRow: {
     marginTop: 5,
@@ -1662,6 +1803,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "right",
     writingDirection: "rtl",
+    includeFontPadding: false,
   },
 
   // Collapsible "Ask Anything..." Spatial Pill
@@ -1670,6 +1812,11 @@ const styles = StyleSheet.create({
     left: 14,
     right: 14,
     zIndex: 28,
+    alignItems: "center",
+  },
+  askOverlayInner: {
+    width: "100%",
+    alignSelf: "center",
     alignItems: "flex-start",
   },
   askCollapsedPill: {
@@ -1689,6 +1836,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
     color: "#1E293B",
+    includeFontPadding: false,
   },
   askExpandedPill: {
     width: "100%",
@@ -1713,6 +1861,7 @@ const styles = StyleSheet.create({
     fontSize: 13.5,
     color: "#0F172A",
     paddingVertical: 6,
+    includeFontPadding: false,
   },
   askSendBtn: {
     width: 34,
@@ -1726,6 +1875,7 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 16,
     fontWeight: "800",
+    includeFontPadding: false,
   },
   askCloseBtn: {
     width: 30,
@@ -1739,6 +1889,7 @@ const styles = StyleSheet.create({
     color: "#475569",
     fontSize: 12,
     fontWeight: "800",
+    includeFontPadding: false,
   },
 
   // Bottom Floating Dark Pill Bar
@@ -1751,7 +1902,7 @@ const styles = StyleSheet.create({
   },
   bottomDarkPill: {
     width: "100%",
-    maxWidth: 460,
+    alignSelf: "center",
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -1780,45 +1931,91 @@ const styles = StyleSheet.create({
     color: "#F8FAFC",
     fontSize: 13,
     fontWeight: "600",
+    includeFontPadding: false,
   },
-  dockIconBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+  dockJumpBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "rgba(255, 255, 255, 0.08)",
   },
-  dockIconText: {
-    color: "#F8FAFC",
-    fontSize: 18,
+  dockJumpText: {
+    color: "#E2E8F0",
+    fontSize: 16,
     fontWeight: "700",
-    marginTop: -2,
+    marginTop: -1,
+    includeFontPadding: false,
+  },
+  dockIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
   },
   dockReplayText: {
     color: "#E2E8F0",
-    fontSize: 15,
+    fontSize: 14.5,
     fontWeight: "700",
+    includeFontPadding: false,
   },
   dockPlayBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: "#0F766E",
     alignItems: "center",
     justifyContent: "center",
   },
   dockPlayText: {
     color: "#FFFFFF",
-    fontSize: 14,
+    fontSize: 13.5,
     fontWeight: "700",
+    includeFontPadding: false,
   },
-  dockStepText: {
-    color: "#E2E8F0",
-    fontSize: 12,
+  dockProgressWrap: {
+    flex: 1,
+    minWidth: 56,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 4,
+    gap: 3,
+  },
+  dockProgressTrack: {
+    width: "100%",
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 255, 255, 0.14)",
+    overflow: "hidden",
+    justifyContent: "center",
+    position: "relative",
+  },
+  dockProgressFill: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: "#14B8A6",
+  },
+  dockProgressTick: {
+    position: "absolute",
+    top: 1.75,
+    width: 2.5,
+    height: 2.5,
+    borderRadius: 1.25,
+    marginLeft: -1.25,
+    backgroundColor: "rgba(255, 255, 255, 0.30)",
+  },
+  dockProgressTickPassed: {
+    backgroundColor: "rgba(255, 255, 255, 0.78)",
+  },
+  dockProgressMicroLabel: {
+    color: "rgba(226, 232, 240, 0.72)",
+    fontSize: 9.5,
     fontWeight: "700",
-    minWidth: 32,
-    textAlign: "center",
+    letterSpacing: 0.2,
+    includeFontPadding: false,
   },
   dockSpeedBtn: {
     paddingHorizontal: 9,
@@ -1830,6 +2027,7 @@ const styles = StyleSheet.create({
     color: "#93C5FD",
     fontSize: 11.5,
     fontWeight: "800",
+    includeFontPadding: false,
   },
   dockAskTrigger: {
     flex: 1,
@@ -1840,6 +2038,7 @@ const styles = StyleSheet.create({
     color: "#CBD5E1",
     fontSize: 13,
     fontWeight: "500",
+    includeFontPadding: false,
   },
   dockPrimaryTrigger: {
     backgroundColor: "#2563EB",
@@ -1851,6 +2050,7 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 12,
     fontWeight: "800",
+    includeFontPadding: false,
   },
   dockDisabled: {
     opacity: 0.35,

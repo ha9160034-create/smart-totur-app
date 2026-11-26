@@ -11,6 +11,8 @@ WhiteboardSlot = Literal[
     "full_canvas"      # الشاشة كاملة (للكود الطويل أو المخططات الكبيرة)
 ]
 
+SketchIcon = Literal["lightbulb", "brain", "check", "warning", "code", "compare"]
+
 class BoundingBox(BaseModel):
     ymin: int = Field(..., ge=0, le=1000, description="Top Y (0-1000)")
     xmin: int = Field(..., ge=0, le=1000, description="Left X (0-1000)")
@@ -26,7 +28,9 @@ class VisualAction(BaseModel):
         "wb_bullet",       # كتابة نقطة شرح على السبورة
         "wb_equation",     # كتابة معادلة بصيغة LaTeX
         "wb_code",         # عرض بلوك كود برمجي ملون
-        "wb_flow_card"     # رسم بطاقة مخطط انسيابي (طبي أو خوارزمي)
+        "wb_flow_card",    # رسم بطاقة مخطط انسيابي (طبي أو خوارزمي)
+        "wb_table",        # رسم جدول مقارنة منظم على السبورة (2-4 أعمدة)
+        "wb_note"          # ملاحظة هامشية سريعة بخط يدوي (قاعدة، تنبيه، نصيحة)
     ]
 
     color: Literal["blue", "red", "green", "yellow", "black"] = Field(
@@ -52,6 +56,11 @@ class VisualAction(BaseModel):
         description="Optional for wb_flow_card: draws an animated arrow from a previous slot to this slot."
     )
 
+    icon: Optional[SketchIcon] = Field(
+        default=None,
+        description="Optional small hand-drawn icon badge for wb_heading or wb_flow_card."
+    )
+
     code_lang: Optional[Literal["python", "cpp", "java", "r", "sql", "pseudocode"]] = None
     highlight_lines: Optional[List[int]] = Field(
         default=None,
@@ -60,7 +69,7 @@ class VisualAction(BaseModel):
 
     text: Optional[str] = Field(
         default=None,
-        description="Text, LaTeX equation, or card body (for wb_heading, wb_bullet, wb_equation, wb_flow_card)."
+        description="Text, LaTeX equation, card body, or short margin callout (for wb_heading, wb_bullet, wb_equation, wb_flow_card, wb_note)."
     )
 
     code: Optional[str] = Field(
@@ -68,8 +77,18 @@ class VisualAction(BaseModel):
         description="REQUIRED for wb_code actions: 3 to 8 lines of real, runnable source code separated by newlines (never empty or placeholder)."
     )
 
+    headers: Optional[List[str]] = Field(
+        default=None,
+        description="REQUIRED for wb_table actions: 2 to 4 concise column header titles."
+    )
+
+    rows: Optional[List[List[str]]] = Field(
+        default=None,
+        description="REQUIRED for wb_table actions: 2 to 5 concise data rows (2-5 words per cell) aligned with headers."
+    )
+
     @model_validator(mode="after")
-    def validate_wb_code_non_empty(self) -> "VisualAction":
+    def validate_action_payload(self) -> "VisualAction":
         if self.type == "wb_code":
             resolved = (self.code or self.text or "").strip()
             if not resolved:
@@ -79,6 +98,35 @@ class VisualAction(BaseModel):
             self.code = resolved
             if not (self.text or "").strip():
                 self.text = resolved
+        elif self.type == "wb_table":
+            if not self.headers:
+                raise ValueError(
+                    "wb_table action must provide 2 to 4 non-empty column headers."
+                )
+            cleaned_headers = [str(h).strip() for h in self.headers]
+            if not (2 <= len(cleaned_headers) <= 4) or any(not h for h in cleaned_headers):
+                raise ValueError(
+                    "wb_table action must provide between 2 and 4 non-empty headers."
+                )
+            if not self.rows:
+                raise ValueError(
+                    "wb_table action must provide at least one non-empty data row."
+                )
+            col_count = len(cleaned_headers)
+            normalized_rows: List[List[str]] = []
+            for row in self.rows:
+                cells = [("" if cell is None else str(cell).strip()) for cell in row]
+                if len(cells) < col_count:
+                    cells.extend([""] * (col_count - len(cells)))
+                elif len(cells) > col_count:
+                    cells = cells[:col_count]
+                if not any(cells):
+                    raise ValueError(
+                        "wb_table rows cannot be completely blank."
+                    )
+                normalized_rows.append(cells)
+            self.headers = cleaned_headers
+            self.rows = normalized_rows
         return self
 
 class TeachingStep(BaseModel):

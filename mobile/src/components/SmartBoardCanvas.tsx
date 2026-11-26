@@ -4,8 +4,10 @@ import {
   LayoutChangeEvent,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 import {
@@ -26,10 +28,22 @@ import Animated, {
 } from "react-native-reanimated";
 import type {
   BoundingBox,
+  SketchIcon,
   TeachingStep,
   VisualAction,
   WhiteboardSlot,
+  WordTiming,
 } from "../types/schema";
+import {
+  createRoughArrowPath,
+  createRoughCirclePath,
+  createRoughRectPath,
+  createRoughTableGridPath,
+  createRoughUnderlinePath,
+  createSketchIconPath,
+  hashSeed,
+  makeEmptySkiaPath,
+} from "../utils/roughSkia";
 
 // ---------------------------------------------------------------------------
 // Public Types
@@ -63,6 +77,10 @@ export interface SmartBoardCanvasProps {
   renderPdfLayer?: (contentRect: RectFrame) => React.ReactNode;
   /** Normalized 0.0 -> 1.0 audio playback progress driving progressive strokes & typewriter reveal */
   stepProgress?: number;
+  /** Current step audio playback time in milliseconds for exact WordBoundary sync */
+  currentTimeMs?: number;
+  /** Word-level timestamps emitted by backend edge-tts for the active step */
+  wordTimings?: WordTiming[];
   /** True while step audio is actively playing (displays live pen/cursor at typing tip) */
   isPlaying?: boolean;
   /** Incremented on Replay Step to re-trigger progressive animation without remounting canvas */
@@ -74,16 +92,31 @@ export interface SmartBoardCanvasProps {
 }
 
 // ---------------------------------------------------------------------------
-// Warm Paper Palette & Color Tokens
+// Warm Paper Palette, Cross-Platform Fonts & Constants
 // ---------------------------------------------------------------------------
 const PAPER_BG = "#FAF8F5";
 const PAPER_GRID_COLOR = "rgba(148, 138, 122, 0.17)";
 const MIN_SCALE = 0.6;
 const MAX_SCALE = 3.0;
+const MIN_TABLE_COL_WIDTH = 105;
+const WORD_SYNC_REVEAL_WINDOW_MS = 280;
+
+const CODE_FONT_FAMILY = Platform.select({
+  ios: "Menlo",
+  android: "monospace",
+  default: "monospace",
+});
+
+const SERIF_FONT_FAMILY = Platform.select({
+  ios: "Georgia",
+  android: "serif",
+  default: "serif",
+});
 
 interface ColorToken {
   stroke: string;
   fill: string;
+  noteFill: string;
   highlight: string;
   text: string;
   badgeBg: string;
@@ -93,6 +126,7 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   blue: {
     stroke: "#2563EB",
     fill: "#F0F6FF",
+    noteFill: "#EFF6FF",
     highlight: "rgba(37, 99, 235, 0.24)",
     text: "#1E3A8A",
     badgeBg: "#DBEAFE",
@@ -100,6 +134,7 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   red: {
     stroke: "#DC2626",
     fill: "#FEF2F2",
+    noteFill: "#FFF5F5",
     highlight: "rgba(220, 38, 38, 0.24)",
     text: "#991B1B",
     badgeBg: "#FEE2E2",
@@ -107,6 +142,7 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   green: {
     stroke: "#16A34A",
     fill: "#F0FDF4",
+    noteFill: "#F0FDF4",
     highlight: "rgba(22, 163, 74, 0.24)",
     text: "#166534",
     badgeBg: "#DCFCE7",
@@ -114,6 +150,7 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   yellow: {
     stroke: "#CA8A04",
     fill: "#FEFCE8",
+    noteFill: "#FEFCE8",
     highlight: "rgba(250, 204, 21, 0.42)",
     text: "#854D0E",
     badgeBg: "#FEF9C3",
@@ -121,6 +158,7 @@ const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   black: {
     stroke: "#1E293B",
     fill: "#FFFFFF",
+    noteFill: "#F8FAFC",
     highlight: "rgba(15, 23, 42, 0.16)",
     text: "#0F172A",
     badgeBg: "#E2E8F0",
@@ -137,7 +175,7 @@ function clamp01(value: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Text Normalization & Lightweight Multi-Language Syntax Highlighter
+// Text Normalization & WordBoundary Token Matching (Arabic + English)
 // ---------------------------------------------------------------------------
 function normalizeBlockText(raw?: string | null): string {
   if (!raw) return "";
@@ -149,6 +187,189 @@ function normalizeBlockText(raw?: string | null): string {
     .replace(/\n+\s*$/, "");
 }
 
+const SYNC_STOPWORDS = new Set([
+  "the",
+  "an",
+  "of",
+  "to",
+  "and",
+  "or",
+  "is",
+  "are",
+  "be",
+  "on",
+  "at",
+  "by",
+  "as",
+  "في",
+  "من",
+  "علي",
+  "الي",
+  "عن",
+  "مع",
+  "هذا",
+  "هذه",
+  "التي",
+  "الذي",
+  "بين",
+  "كل",
+  "كان",
+  "او",
+  "ان",
+  "ما",
+  "لا",
+  "هو",
+  "هي",
+]);
+
+function normalizeSyncToken(raw: string): string {
+  return raw
+    .toLowerCase()
+    // Strip Arabic diacritics (tashkeel) and tatweel
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    // Normalize common Arabic orthographic variants
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ة/g, "ه")
+    .replace(/ى/g, "ي")
+    .replace(/ؤ/g, "و")
+    .replace(/ئ/g, "ي")
+    // Strip punctuation / symbols
+    .replace(/[^\u0600-\u06FFa-z0-9_]+/g, "")
+    .trim();
+}
+
+function stripArabicArticle(norm: string): string {
+  if (norm.length >= 4 && norm.startsWith("ال")) {
+    return norm.slice(2);
+  }
+  return norm;
+}
+
+function extractSyncTokens(text: string): string[] {
+  const parts = normalizeBlockText(text).split(/[\s,.;:!?()[\]{}<>/"'`|\\\-+*=]+/);
+  const filtered: string[] = [];
+  const fallback: string[] = [];
+  for (const part of parts) {
+    const norm = normalizeSyncToken(part);
+    if (norm.length < 2) continue;
+    fallback.push(norm);
+    if (!SYNC_STOPWORDS.has(norm)) {
+      filtered.push(norm);
+    }
+  }
+  return filtered.length > 0 ? filtered : fallback;
+}
+
+interface NormalizedTimingEntry {
+  norm: string;
+  bare: string;
+  startMs: number;
+}
+
+function tokensMatch(a: string, bNorm: string, bBare: string): boolean {
+  if (!a || !bNorm) return false;
+  const aBare = stripArabicArticle(a);
+  if (a === bNorm || aBare === bBare || a === bBare || aBare === bNorm) {
+    return true;
+  }
+  if (aBare.length >= 4 && bBare.length >= 4) {
+    if (bBare.startsWith(aBare) || aBare.startsWith(bBare)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Matches an ordered list of item texts (wb_table rows or stacked wb_bullet items)
+ * against normalized WordTiming entries, returning each item's spoken trigger start_ms
+ * (or null when no keyword match exists so callers fall back to proportional stepProgress).
+ */
+function computeItemTriggerMsList(
+  itemTexts: string[],
+  wordTimings?: WordTiming[]
+): Array<number | null> {
+  if (!Array.isArray(wordTimings) || wordTimings.length === 0) {
+    return itemTexts.map(() => null);
+  }
+
+  const normalizedTimings: NormalizedTimingEntry[] = [];
+  for (const wt of wordTimings) {
+    if (!wt || typeof wt.word !== "string" || !Number.isFinite(wt.start_ms)) {
+      continue;
+    }
+    const subParts = wt.word.split(/\s+/);
+    for (const part of subParts) {
+      const norm = normalizeSyncToken(part);
+      if (norm.length < 2) continue;
+      normalizedTimings.push({
+        norm,
+        bare: stripArabicArticle(norm),
+        startMs: Math.max(0, wt.start_ms),
+      });
+    }
+  }
+
+  if (normalizedTimings.length === 0) {
+    return itemTexts.map(() => null);
+  }
+  normalizedTimings.sort((a, b) => a.startMs - b.startMs);
+
+  const results: Array<number | null> = [];
+  let cursor = 0;
+
+  for (const text of itemTexts) {
+    const tokens = extractSyncTokens(text);
+    if (tokens.length === 0) {
+      results.push(null);
+      continue;
+    }
+
+    // Prioritize English technical identifiers & first meaningful token
+    const prioritized = [...tokens].sort((a, b) => {
+      const aLatin = /^[a-z0-9_]+$/.test(a) ? 0 : 1;
+      const bLatin = /^[a-z0-9_]+$/.test(b) ? 0 : 1;
+      return aLatin - bLatin;
+    });
+
+    let matchedIdx = -1;
+
+    // Pass 1: search forward from current monotonic cursor
+    for (let tIdx = cursor; tIdx < normalizedTimings.length; tIdx++) {
+      const entry = normalizedTimings[tIdx];
+      if (prioritized.some((tok) => tokensMatch(tok, entry.norm, entry.bare))) {
+        matchedIdx = tIdx;
+        break;
+      }
+    }
+
+    // Pass 2: if not found ahead (e.g. tutor introduced row earlier), search from start
+    if (matchedIdx === -1 && cursor > 0) {
+      for (let tIdx = 0; tIdx < cursor; tIdx++) {
+        const entry = normalizedTimings[tIdx];
+        if (prioritized.some((tok) => tokensMatch(tok, entry.norm, entry.bare))) {
+          matchedIdx = tIdx;
+          break;
+        }
+      }
+    }
+
+    if (matchedIdx !== -1) {
+      results.push(normalizedTimings[matchedIdx].startMs);
+      if (matchedIdx >= cursor) {
+        cursor = Math.min(normalizedTimings.length, matchedIdx + 1);
+      }
+    } else {
+      results.push(null);
+    }
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight Multi-Language Syntax Highlighter
+// ---------------------------------------------------------------------------
 const CODE_KEYWORDS = new Set([
   "def",
   "class",
@@ -298,21 +519,13 @@ function tokenizeCodeLine(line: string): CodeToken[] {
 }
 
 // ---------------------------------------------------------------------------
-// Modern Skia Path Helpers (Compatible with Immutable SkPath / PathBuilder)
+// Crisp Skia Path Helpers (Used ONLY for Paper Grid & Clean Dark Code Cards)
 // ---------------------------------------------------------------------------
-function makeEmptyPath() {
-  if (typeof Skia?.PathBuilder?.Make === "function") {
-    return Skia.PathBuilder.Make().build();
-  }
-  return Skia.Path.Make();
-}
-
 function makePathFromBuilder(
   draw: (builder: {
     moveTo: (x: number, y: number) => unknown;
     lineTo: (x: number, y: number) => unknown;
     quadTo: (x1: number, y1: number, x2: number, y2: number) => unknown;
-    addOval: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
   }) => void
 ) {
   if (typeof Skia?.PathBuilder?.Make === "function") {
@@ -325,7 +538,6 @@ function makePathFromBuilder(
     moveTo?: (x: number, y: number) => unknown;
     lineTo?: (x: number, y: number) => unknown;
     quadTo?: (x1: number, y1: number, x2: number, y2: number) => unknown;
-    addOval?: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
   };
   if (typeof legacyPath?.moveTo === "function") {
     draw(
@@ -333,17 +545,16 @@ function makePathFromBuilder(
         moveTo: (x: number, y: number) => unknown;
         lineTo: (x: number, y: number) => unknown;
         quadTo: (x1: number, y1: number, x2: number, y2: number) => unknown;
-        addOval: (rect: ReturnType<typeof Skia.XYWHRect>) => unknown;
       }
     );
   }
   return legacyPath as ReturnType<typeof Skia.Path.Make>;
 }
 
-/** Build a continuous clockwise rounded-rectangle stroke path for progressive border drawing */
+/** Crisp clockwise rounded-rectangle stroke path kept exclusively for dark wb_code cards */
 function buildRoundedRectStrokePath(rect: RectFrame, radius: number) {
   const { x, y, width: w, height: h } = rect;
-  if (w <= 0 || h <= 0) return makeEmptyPath();
+  if (w <= 0 || h <= 0) return makeEmptySkiaPath();
   const r = Math.min(radius, w / 2, h / 2);
 
   return makePathFromBuilder((b) => {
@@ -356,17 +567,6 @@ function buildRoundedRectStrokePath(rect: RectFrame, radius: number) {
     b.quadTo(x, y + h, x, y + h - r);
     b.lineTo(x, y + r);
     b.quadTo(x, y, x + r, y);
-  });
-}
-
-function buildHeadingUnderlinePath(rect: RectFrame) {
-  const { x, y, width: w, height: h } = rect;
-  if (w <= 0 || h <= 0) return makeEmptyPath();
-  const inset = Math.min(28, w * 0.1);
-  const lineY = y + h - 4;
-  return makePathFromBuilder((b) => {
-    b.moveTo(x + inset, lineY);
-    b.lineTo(x + w - inset, lineY);
   });
 }
 
@@ -482,14 +682,30 @@ function resolveWhiteboardBlocks(
         resetBoard();
         continue;
       }
-      if (!action.slot) continue;
 
-      // Always place wb_heading in a full-width slot so headings never wrap inside narrow half-width columns
-      const targetSlot: WhiteboardSlot =
+      const rawSlot: WhiteboardSlot | undefined =
+        action.slot ??
+        (action.type === "wb_table"
+          ? "main_top"
+          : action.type === "wb_note"
+          ? "bottom_summary"
+          : undefined);
+      if (!rawSlot) continue;
+
+      // Always promote wb_heading and wb_table to full contentWidth so headings & tables
+      // never crush inside narrow left_col / right_col half-width columns
+      let targetSlot: WhiteboardSlot = rawSlot;
+      if (
         action.type === "wb_heading" &&
-        (action.slot === "left_col" || action.slot === "right_col")
-          ? "header"
-          : action.slot;
+        (rawSlot === "left_col" || rawSlot === "right_col")
+      ) {
+        targetSlot = "header";
+      } else if (
+        action.type === "wb_table" &&
+        (rawSlot === "left_col" || rawSlot === "right_col")
+      ) {
+        targetSlot = bandSlots.has("main_top") ? "full_canvas" : "main_top";
+      }
 
       const resolvedItem: ResolvedAction = {
         key: `s${step.step_id}-i${i}-a${j}-${action.type}-${targetSlot}`,
@@ -535,8 +751,8 @@ function resolveWhiteboardBlocks(
       blocks.push(newBlock);
       bandSlots.set(targetSlot, newBlock);
       latestBySlot.set(targetSlot, newBlock);
-      if (targetSlot !== action.slot) {
-        latestBySlot.set(action.slot, newBlock);
+      if (targetSlot !== rawSlot) {
+        latestBySlot.set(rawSlot, newBlock);
       }
     }
   }
@@ -545,7 +761,7 @@ function resolveWhiteboardBlocks(
 }
 
 function estimateWrappedLines(text: string, charsPerLine: number): number {
-  const safeChars = Math.max(10, Math.floor(charsPerLine));
+  const safeChars = Math.max(8, Math.floor(charsPerLine));
   const paragraphs = text.split("\n");
   let total = 0;
 
@@ -584,6 +800,92 @@ function estimateWrappedLines(text: string, charsPerLine: number): number {
   return Math.max(1, total);
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive Table Metrics (Shared 1:1 by Layout Estimation & Skia/RN Renderer)
+// ---------------------------------------------------------------------------
+interface TableLayoutMetrics {
+  headers: string[];
+  rows: string[][];
+  colCount: number;
+  colWidths: number[];
+  tableWidth: number;
+  headerHeight: number;
+  rowHeights: number[];
+  gridHeight: number;
+  needsHorizontalScroll: boolean;
+  totalSlotHeight: number;
+}
+
+function computeTableMetrics(
+  action: VisualAction,
+  availableWidth: number
+): TableLayoutMetrics {
+  const rawHeaders = Array.isArray(action.headers)
+    ? action.headers.map((h) => normalizeBlockText(h))
+    : [];
+  const headers = rawHeaders.length > 0 ? rawHeaders : ["Item", "Details"];
+  const colCount = Math.max(1, headers.length);
+
+  const rawRows = Array.isArray(action.rows) ? action.rows : [];
+  const rows: string[][] = rawRows
+    .filter((r) => Array.isArray(r) && r.some((cell) => normalizeBlockText(cell).length > 0))
+    .map((row) => {
+      const normalized = row.slice(0, colCount).map((cell) => normalizeBlockText(cell));
+      while (normalized.length < colCount) {
+        normalized.push("");
+      }
+      return normalized;
+    });
+
+  // 8px inset leaves 4px room on left & right so rough marker strokes never clip
+  const innerAvailW = Math.max(120, availableWidth - 8);
+  const minTotalWidth = colCount * MIN_TABLE_COL_WIDTH;
+  const needsHorizontalScroll = minTotalWidth > innerAvailW;
+  const tableWidth = needsHorizontalScroll ? minTotalWidth : innerAvailW;
+  const colWidth = tableWidth / colCount;
+  const colWidths = Array.from({ length: colCount }, () => colWidth);
+
+  const headerCharsPerLine = Math.max(8, Math.floor((colWidth - 16) / 8.2));
+  let maxHeaderLines = 1;
+  for (const h of headers) {
+    maxHeaderLines = Math.max(
+      maxHeaderLines,
+      estimateWrappedLines(h || " ", headerCharsPerLine)
+    );
+  }
+  const headerHeight = Math.max(42, 18 + maxHeaderLines * 20);
+
+  const cellCharsPerLine = Math.max(8, Math.floor((colWidth - 16) / 7.8));
+  const rowHeights: number[] = rows.map((row) => {
+    let maxLines = 1;
+    for (const cell of row) {
+      maxLines = Math.max(
+        maxLines,
+        estimateWrappedLines(cell || " ", cellCharsPerLine)
+      );
+    }
+    return Math.max(38, 18 + maxLines * 19);
+  });
+
+  const gridHeight =
+    headerHeight + rowHeights.reduce((sum, h) => sum + h, 0);
+  // Extra bottom space for scroll bar + subtle swipe hint when horizontally scrollable
+  const totalSlotHeight = gridHeight + (needsHorizontalScroll ? 30 : 10);
+
+  return {
+    headers,
+    rows,
+    colCount,
+    colWidths,
+    tableWidth,
+    headerHeight,
+    rowHeights,
+    gridHeight,
+    needsHorizontalScroll,
+    totalSlotHeight,
+  };
+}
+
 function estimateSlotHeight(
   items: ResolvedAction[] | undefined,
   slotWidth: number,
@@ -592,12 +894,28 @@ function estimateSlotHeight(
   if (!items || items.length === 0 || slotWidth <= 0) return 0;
   const primary = items[0].action;
 
+  if (primary.type === "wb_table") {
+    return computeTableMetrics(primary, slotWidth).totalSlotHeight;
+  }
+
+  if (primary.type === "wb_note") {
+    const clean = normalizeBlockText(primary.text);
+    const charsPerLine = Math.max(11, Math.floor((slotWidth - 48) / 8.2));
+    const lines = estimateWrappedLines(clean, charsPerLine);
+    // Accounts for NOTE badge row + top/bottom padding + handwritten serif line height
+    return Math.max(92, 62 + lines * 22);
+  }
+
   if (primary.type === "wb_heading") {
     const clean = normalizeBlockText(primary.text);
-    const charsPerLine = Math.max(14, Math.floor((slotWidth - 32) / 10.2));
+    const iconReserve = primary.icon ? 44 : 0;
+    const charsPerLine = Math.max(
+      12,
+      Math.floor((slotWidth - 32 - iconReserve) / 10.2)
+    );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Generous vertical padding + bottom clearance above the Skia underline at y + height - 4
-    return Math.max(64, 42 + lines * 26);
+    // Generous vertical padding + bottom clearance above the rough Skia underline
+    return Math.max(66, 44 + lines * 26);
   }
 
   if (primary.type === "wb_code") {
@@ -608,7 +926,7 @@ function estimateSlotHeight(
     const charWidth = isCompactColumn ? 6.8 : 7.4;
     const rowHeight = isCompactColumn ? 18.5 : 21.5;
     const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / charWidth);
-    // 32px header + 36px vertical padding (includes +12px bottom breathing room) + per-line height
+    // 32px header + 36px vertical padding + per-line height
     return Math.max(126, 32 + 36 + wrappedLines * rowHeight);
   }
 
@@ -621,8 +939,11 @@ function estimateSlotHeight(
 
   if (primary.type === "wb_flow_card") {
     const clean = normalizeBlockText(primary.text);
-    // Conservative chars-per-line estimate + generous +24px padding so half-width cards never clip
-    const charsPerLine = Math.max(11, Math.floor((slotWidth - 28) / 8.5));
+    const iconReserve = primary.icon ? (isCompactColumn ? 30 : 38) : 0;
+    const charsPerLine = Math.max(
+      10,
+      Math.floor((slotWidth - 28 - iconReserve) / 8.5)
+    );
     const lines = estimateWrappedLines(clean, charsPerLine);
     return Math.max(104, 56 + lines * 23);
   }
@@ -643,16 +964,19 @@ function computeCumulativeWhiteboardLayout(
   viewportH: number,
   blocks: WhiteboardBlock[],
   topInset: number,
-  bottomInset: number
+  bottomInset: number,
+  isTablet: boolean
 ): CumulativeBoardLayout {
-  const padX = 16;
-  const rowGap = 18;
-  const bandGap = 24;
-  const colGap = 28; // Clean channel for horizontal connector arrows
+  const rowGap = isTablet ? 20 : 18;
+  const bandGap = isTablet ? 28 : 24;
+  const colGap = isTablet ? 32 : 28; // Clean channel for horizontal connector arrows
 
   const boardWidth = Math.max(viewportW, 340);
-  const innerW = Math.max(0, boardWidth - padX * 2);
-  const halfW = Math.max(0, (innerW - colGap) / 2);
+  const innerW = Math.max(0, boardWidth - 32);
+  // Constrain active whiteboard content to 860px on tablets while keeping full-bleed paper grid
+  const contentWidth = Math.min(innerW, 860);
+  const padX = Math.max(16, (boardWidth - contentWidth) / 2);
+  const halfW = Math.max(0, (contentWidth - colGap) / 2);
 
   const blockRects = new Map<string, RectFrame>();
   const bandsMap = new Map<number, Map<WhiteboardSlot, WhiteboardBlock>>();
@@ -678,22 +1002,22 @@ function computeCumulativeWhiteboardLayout(
     const fullBlock = slotMap.get("full_canvas");
 
     if (headerBlock) {
-      const h = estimateSlotHeight(headerBlock.items, innerW);
+      const h = estimateSlotHeight(headerBlock.items, contentWidth);
       blockRects.set(headerBlock.blockId, {
         x: padX,
         y: cursorY,
-        width: innerW,
+        width: contentWidth,
         height: h,
       });
       cursorY += h + rowGap;
     }
 
     if (mainTopBlock) {
-      const h = estimateSlotHeight(mainTopBlock.items, innerW);
+      const h = estimateSlotHeight(mainTopBlock.items, contentWidth);
       blockRects.set(mainTopBlock.blockId, {
         x: padX,
         y: cursorY,
-        width: innerW,
+        width: contentWidth,
         height: h,
       });
       cursorY += h + rowGap;
@@ -728,22 +1052,22 @@ function computeCumulativeWhiteboardLayout(
     }
 
     if (bottomBlock) {
-      const h = estimateSlotHeight(bottomBlock.items, innerW);
+      const h = estimateSlotHeight(bottomBlock.items, contentWidth);
       blockRects.set(bottomBlock.blockId, {
         x: padX,
         y: cursorY,
-        width: innerW,
+        width: contentWidth,
         height: h,
       });
       cursorY += h + rowGap;
     }
 
     if (fullBlock) {
-      const h = estimateSlotHeight(fullBlock.items, innerW);
+      const h = estimateSlotHeight(fullBlock.items, contentWidth);
       blockRects.set(fullBlock.blockId, {
         x: padX,
         y: cursorY,
-        width: innerW,
+        width: contentWidth,
         height: h,
       });
       cursorY += h + rowGap;
@@ -758,82 +1082,21 @@ function computeCumulativeWhiteboardLayout(
   return { blockRects, boardWidth, boardHeight };
 }
 
-function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
-  if (!from || !to || from.width <= 0 || to.width <= 0) {
-    return makeEmptyPath();
-  }
-
-  const fromCx = from.x + from.width / 2;
-  const fromCy = from.y + from.height / 2;
-  const toCx = to.x + to.width / 2;
-  const toCy = to.y + to.height / 2;
-
-  const dx = toCx - fromCx;
-  const dy = toCy - fromCy;
-
-  let startX = fromCx;
-  let startY = fromCy;
-  let endX = toCx;
-  let endY = toCy;
-  const margin = 5;
-
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    if (dx > 0) {
-      startX = from.x + from.width + margin;
-      endX = to.x - margin;
-    } else {
-      startX = from.x - margin;
-      endX = to.x + to.width + margin;
-    }
-  } else {
-    if (dy > 0) {
-      startY = from.y + from.height + margin;
-      endY = to.y - margin;
-    } else {
-      startY = from.y - margin;
-      endY = to.y + to.height + margin;
-    }
-  }
-
-  const midX = (startX + endX) / 2;
-  const midY = (startY + endY) / 2;
-  const isDiagonal = Math.abs(startX - endX) > 12 && Math.abs(startY - endY) > 12;
-  const ctrlX = midX;
-  const ctrlY = isDiagonal ? startY : midY;
-
-  const angle = Math.atan2(endY - ctrlY, endX - ctrlX);
-  const headLen = 10;
-  const spread = Math.PI / 6;
-
-  return makePathFromBuilder((builder) => {
-    builder.moveTo(startX, startY);
-    builder.quadTo(ctrlX, ctrlY, endX, endY);
-
-    builder.moveTo(endX, endY);
-    builder.lineTo(
-      endX - headLen * Math.cos(angle - spread),
-      endY - headLen * Math.sin(angle - spread)
-    );
-    builder.moveTo(endX, endY);
-    builder.lineTo(
-      endX - headLen * Math.cos(angle + spread),
-      endY - headLen * Math.sin(angle + spread)
-    );
-  });
-}
-
 // ---------------------------------------------------------------------------
-// Animated Skia Primitives (60fps UI Thread Synchronized to stepProgress)
+// Memoized Animated Skia Primitives (ZERO Path Rebuilds on 50ms Audio Ticks)
 // ---------------------------------------------------------------------------
 const AnimatedHighlightRect: React.FC<{
-  rect: RectFrame;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
   color: string;
   progress: SharedValue<number>;
-}> = ({ rect, color, progress }) => {
-  const targetWidth = useSharedValue(rect.width);
+}> = React.memo(({ x, y, width, height, color, progress }) => {
+  const targetWidth = useSharedValue(width);
   useEffect(() => {
-    targetWidth.value = rect.width;
-  }, [rect.width, targetWidth]);
+    targetWidth.value = width;
+  }, [width, targetWidth]);
 
   const animatedWidth = useDerivedValue(
     () => targetWidth.value * progress.value
@@ -841,33 +1104,29 @@ const AnimatedHighlightRect: React.FC<{
 
   return (
     <RoundedRect
-      x={rect.x}
-      y={rect.y}
+      x={x}
+      y={y}
       width={animatedWidth}
-      height={rect.height}
+      height={height}
       r={6}
       color={color}
     />
   );
-};
+});
 
 const AnimatedCircleAnnotation: React.FC<{
-  rect: RectFrame;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  seed: number;
   strokeColor: string;
   progress: SharedValue<number>;
-}> = ({ rect, strokeColor, progress }) => {
-  const ovalPath = useMemo(() => {
-    const pad = 4;
-    const ovalRect = Skia.XYWHRect(
-      rect.x - pad,
-      rect.y - pad,
-      rect.width + pad * 2,
-      rect.height + pad * 2
-    );
-    return makePathFromBuilder((builder) => {
-      builder.addOval(ovalRect);
-    });
-  }, [rect.x, rect.y, rect.width, rect.height]);
+}> = React.memo(({ x, y, width, height, seed, strokeColor, progress }) => {
+  const ovalPath = useMemo(
+    () => createRoughCirclePath({ x, y, width, height }, seed, 1),
+    [x, y, width, height, seed]
+  );
 
   return (
     <Path
@@ -881,98 +1140,156 @@ const AnimatedCircleAnnotation: React.FC<{
       end={progress}
     />
   );
-};
+});
 
 const AnimatedCardFrame: React.FC<{
-  rect: RectFrame;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
   radius: number;
+  seed: number;
   fillColor: string;
   strokeColor: string;
   strokeWidth: number;
+  isCode: boolean;
   isHeading: boolean;
+  isNote: boolean;
   animate: boolean;
   borderProgress: SharedValue<number>;
-}> = ({
-  rect,
-  radius,
-  fillColor,
-  strokeColor,
-  strokeWidth,
-  isHeading,
-  animate,
-  borderProgress,
-}) => {
-  const borderPath = useMemo(
-    () => buildRoundedRectStrokePath(rect, radius),
-    [rect, radius]
-  );
-  const underlinePath = useMemo(
-    () => (isHeading ? buildHeadingUnderlinePath(rect) : makeEmptyPath()),
-    [rect, isHeading]
-  );
+}> = React.memo(
+  ({
+    x,
+    y,
+    width,
+    height,
+    radius,
+    seed,
+    fillColor,
+    strokeColor,
+    strokeWidth,
+    isCode,
+    isHeading,
+    isNote,
+    animate,
+    borderProgress,
+  }) => {
+    const borderPath = useMemo(() => {
+      const rect = { x, y, width, height };
+      if (isCode) {
+        return buildRoundedRectStrokePath(rect, radius);
+      }
+      return createRoughRectPath(rect, radius, seed, isNote ? 0.85 : 1);
+    }, [x, y, width, height, radius, seed, isCode, isNote]);
 
-  const fillOpacity = useDerivedValue(() =>
-    animate ? Math.min(1, borderProgress.value * 1.15) : 1
-  );
+    const underlinePath = useMemo(() => {
+      if (!isHeading) return makeEmptySkiaPath();
+      return createRoughUnderlinePath(
+        { x, y, width, height },
+        (seed ^ 0x51f15e) >>> 0,
+        1
+      );
+    }, [x, y, width, height, seed, isHeading]);
 
-  return (
-    <>
-      <RoundedRect
-        x={rect.x}
-        y={rect.y + 3}
-        width={rect.width}
-        height={rect.height}
-        r={radius}
-        color="rgba(15, 23, 42, 0.06)"
-        opacity={fillOpacity}
-      />
-      <RoundedRect
-        x={rect.x}
-        y={rect.y}
-        width={rect.width}
-        height={rect.height}
-        r={radius}
-        color={fillColor}
-        opacity={fillOpacity}
-      />
-      <Path
-        path={borderPath}
-        style="stroke"
-        strokeWidth={strokeWidth}
-        strokeCap="round"
-        strokeJoin="round"
-        color={strokeColor}
-        start={0}
-        end={animate ? borderProgress : 1}
-      />
-      {isHeading && (
+    const noteAccentBarPath = useMemo(() => {
+      if (!isNote) return makeEmptySkiaPath();
+      return createRoughRectPath(
+        {
+          x: x + 4,
+          y: y + 8,
+          width: 4.2,
+          height: Math.max(12, height - 16),
+        },
+        2,
+        (seed ^ 0x9e3779b9) >>> 0,
+        0.65
+      );
+    }, [x, y, height, seed, isNote]);
+
+    const fillOpacity = useDerivedValue(() =>
+      animate ? Math.min(1, borderProgress.value * 1.15) : 1
+    );
+
+    return (
+      <>
+        <RoundedRect
+          x={x}
+          y={y + 3}
+          width={width}
+          height={height}
+          r={radius}
+          color="rgba(15, 23, 42, 0.06)"
+          opacity={fillOpacity}
+        />
+        <RoundedRect
+          x={x}
+          y={y}
+          width={width}
+          height={height}
+          r={radius}
+          color={fillColor}
+          opacity={fillOpacity}
+        />
         <Path
-          path={underlinePath}
+          path={borderPath}
           style="stroke"
-          strokeWidth={2.5}
+          strokeWidth={isNote ? 1.2 : strokeWidth}
           strokeCap="round"
+          strokeJoin="round"
           color={strokeColor}
+          opacity={isNote ? 0.45 : 1}
           start={0}
           end={animate ? borderProgress : 1}
         />
-      )}
-    </>
-  );
-};
+        {isNote && (
+          <Path
+            path={noteAccentBarPath}
+            style="stroke"
+            strokeWidth={2.5}
+            strokeCap="round"
+            strokeJoin="round"
+            color={strokeColor}
+            start={0}
+            end={animate ? borderProgress : 1}
+          />
+        )}
+        {isHeading && (
+          <Path
+            path={underlinePath}
+            style="stroke"
+            strokeWidth={2.35}
+            strokeCap="round"
+            strokeJoin="round"
+            color={strokeColor}
+            start={0}
+            end={animate ? borderProgress : 1}
+          />
+        )}
+      </>
+    );
+  }
+);
 
-const AnimatedArrowPath: React.FC<{
-  from: RectFrame;
-  to: RectFrame;
+const AnimatedSketchIcon: React.FC<{
+  icon: SketchIcon;
+  cx: number;
+  cy: number;
+  size: number;
+  seed: number;
   strokeColor: string;
   animate: boolean;
   progress: SharedValue<number>;
-}> = ({ from, to, strokeColor, animate, progress }) => {
-  const arrowPath = useMemo(() => buildConnectorArrowPath(from, to), [from, to]);
+}> = React.memo(({ icon, cx, cy, size, seed, strokeColor, animate, progress }) => {
+  const iconPath = useMemo(
+    () => createSketchIconPath(icon, cx, cy, size, seed),
+    [icon, cx, cy, size, seed]
+  );
+
   return (
     <Path
-      path={arrowPath}
+      path={iconPath}
       style="stroke"
-      strokeWidth={2.75}
+      strokeWidth={1.9}
       strokeCap="round"
       strokeJoin="round"
       color={strokeColor}
@@ -980,6 +1297,381 @@ const AnimatedArrowPath: React.FC<{
       end={animate ? progress : 1}
     />
   );
+});
+
+const AnimatedArrowPath: React.FC<{
+  fromX: number;
+  fromY: number;
+  fromW: number;
+  fromH: number;
+  toX: number;
+  toY: number;
+  toW: number;
+  toH: number;
+  seed: number;
+  strokeColor: string;
+  animate: boolean;
+  progress: SharedValue<number>;
+}> = React.memo(
+  ({
+    fromX,
+    fromY,
+    fromW,
+    fromH,
+    toX,
+    toY,
+    toW,
+    toH,
+    seed,
+    strokeColor,
+    animate,
+    progress,
+  }) => {
+    const arrowPath = useMemo(
+      () =>
+        createRoughArrowPath(
+          { x: fromX, y: fromY, width: fromW, height: fromH },
+          { x: toX, y: toY, width: toW, height: toH },
+          seed,
+          1
+        ),
+      [fromX, fromY, fromW, fromH, toX, toY, toW, toH, seed]
+    );
+
+    return (
+      <Path
+        path={arrowPath}
+        style="stroke"
+        strokeWidth={2.5}
+        strokeCap="round"
+        strokeJoin="round"
+        color={strokeColor}
+        start={0}
+        end={animate ? progress : 1}
+      />
+    );
+  }
+);
+
+const AnimatedTableGrid: React.FC<{
+  tableWidth: number;
+  gridHeight: number;
+  headerHeight: number;
+  colWidthsKey: string;
+  rowHeightsKey: string;
+  colWidths: number[];
+  rowHeights: number[];
+  seed: number;
+  fillColor: string;
+  headerBgColor: string;
+  strokeColor: string;
+  animate: boolean;
+  progress: SharedValue<number>;
+}> = React.memo(
+  ({
+    tableWidth,
+    gridHeight,
+    headerHeight,
+    colWidthsKey,
+    rowHeightsKey,
+    colWidths,
+    rowHeights,
+    seed,
+    fillColor,
+    headerBgColor,
+    strokeColor,
+    animate,
+    progress,
+  }) => {
+    const gridPath = useMemo(
+      () =>
+        createRoughTableGridPath(
+          { x: 4, y: 4, width: tableWidth, height: gridHeight },
+          colWidths,
+          headerHeight,
+          rowHeights,
+          seed,
+          0.95
+        ),
+      // colWidthsKey & rowHeightsKey deterministically represent colWidths & rowHeights
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [tableWidth, gridHeight, headerHeight, colWidthsKey, rowHeightsKey, seed]
+    );
+
+    const fillOpacity = useDerivedValue(() =>
+      animate ? Math.min(1, progress.value * 1.2) : 1
+    );
+
+    return (
+      <Canvas
+        style={{
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: tableWidth + 8,
+          height: gridHeight + 8,
+        }}
+        pointerEvents="none"
+      >
+        <RoundedRect
+          x={4}
+          y={7}
+          width={tableWidth}
+          height={gridHeight}
+          r={10}
+          color="rgba(15, 23, 42, 0.05)"
+          opacity={fillOpacity}
+        />
+        <RoundedRect
+          x={4}
+          y={4}
+          width={tableWidth}
+          height={gridHeight}
+          r={10}
+          color={fillColor}
+          opacity={fillOpacity}
+        />
+        <RoundedRect
+          x={4}
+          y={4}
+          width={tableWidth}
+          height={headerHeight}
+          r={10}
+          color={headerBgColor}
+          opacity={fillOpacity}
+        />
+        <Path
+          path={gridPath}
+          style="stroke"
+          strokeWidth={1.65}
+          strokeCap="round"
+          strokeJoin="round"
+          color={strokeColor}
+          start={0}
+          end={animate ? progress : 1}
+        />
+      </Canvas>
+    );
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Progressive RN Table View (Adaptive Scroll + Rough Skia Grid + WordBoundary Sync)
+// ---------------------------------------------------------------------------
+const TableBlockView: React.FC<{
+  blockId: string;
+  action: VisualAction;
+  slotWidth: number;
+  isCurrentStep: boolean;
+  stepProgress: number;
+  currentTimeMs?: number;
+  wordTimings?: WordTiming[];
+  isPlaying: boolean;
+  tableGridProgress: SharedValue<number>;
+}> = ({
+  blockId,
+  action,
+  slotWidth,
+  isCurrentStep,
+  stepProgress,
+  currentTimeMs,
+  wordTimings,
+  isPlaying,
+  tableGridProgress,
+}) => {
+  const token = getColorToken(action.color);
+  const metrics = useMemo(
+    () => computeTableMetrics(action, slotWidth),
+    [action, slotWidth]
+  );
+
+  const colWidthsKey = useMemo(
+    () => metrics.colWidths.map((w) => w.toFixed(1)).join(","),
+    [metrics.colWidths]
+  );
+  const rowHeightsKey = useMemo(
+    () => metrics.rowHeights.map((h) => h.toFixed(1)).join(","),
+    [metrics.rowHeights]
+  );
+  const tableSeed = useMemo(() => hashSeed(`table-${blockId}`), [blockId]);
+
+  // Precompute spoken trigger start_ms for each row once when action or wordTimings changes
+  const rowTriggerMs = useMemo(() => {
+    const rowTexts = metrics.rows.map((r) => r.join(" "));
+    return computeItemTriggerMsList(rowTexts, wordTimings);
+  }, [metrics.rows, wordTimings]);
+
+  const clampedStep = clamp01(stepProgress);
+  const canUseWordTiming =
+    isCurrentStep &&
+    typeof currentTimeMs === "number" &&
+    Number.isFinite(currentTimeMs) &&
+    Array.isArray(wordTimings) &&
+    wordTimings.length > 0 &&
+    (currentTimeMs > 0 || clampedStep <= 0.05);
+
+  const headerOpacity = !isCurrentStep
+    ? 1
+    : clampedStep >= 0.995
+    ? 1
+    : clamp01((clampedStep - 0.08) / 0.22);
+
+  const rowCount = Math.max(1, metrics.rows.length);
+
+  const getRowRevealRatio = (rowIdx: number): number => {
+    if (!isCurrentStep || clampedStep >= 0.995) return 1;
+    const triggerMs = rowTriggerMs[rowIdx];
+    if (canUseWordTiming && triggerMs !== null) {
+      // Ensure every row finishes revealing smoothly by the tail of the step
+      if (clampedStep >= 0.96) return 1;
+      if ((currentTimeMs as number) < triggerMs) return 0;
+      return clamp01(
+        ((currentTimeMs as number) - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS
+      );
+    }
+    // Proportional stepProgress fallback (0.24 -> 0.92 across all rows)
+    const start = 0.24 + (rowIdx / rowCount) * 0.64;
+    const windowSpan = Math.max(0.12, 0.64 / rowCount);
+    return clamp01((clampedStep - start) / windowSpan);
+  };
+
+  const tableInner = (
+    <View
+      style={{
+        width: metrics.tableWidth + 8,
+        height: metrics.gridHeight + 8,
+      }}
+    >
+      <AnimatedTableGrid
+        tableWidth={metrics.tableWidth}
+        gridHeight={metrics.gridHeight}
+        headerHeight={metrics.headerHeight}
+        colWidthsKey={colWidthsKey}
+        rowHeightsKey={rowHeightsKey}
+        colWidths={metrics.colWidths}
+        rowHeights={metrics.rowHeights}
+        seed={tableSeed}
+        fillColor="#FFFFFF"
+        headerBgColor={token.badgeBg}
+        strokeColor={token.stroke}
+        animate={isCurrentStep}
+        progress={tableGridProgress}
+      />
+
+      {/* RN Table Text Overlay aligned 1:1 with Skia Rough Table Grid */}
+      <View
+        style={{
+          position: "absolute",
+          left: 4,
+          top: 4,
+          width: metrics.tableWidth,
+          height: metrics.gridHeight,
+        }}
+      >
+        {/* Header Row */}
+        <View
+          style={[
+            styles.tableRow,
+            {
+              height: metrics.headerHeight,
+              opacity: headerOpacity,
+            },
+          ]}
+        >
+          {metrics.headers.map((header, cIdx) => (
+            <View
+              key={`th-${cIdx}`}
+              style={[
+                styles.tableCell,
+                { width: metrics.colWidths[cIdx] },
+              ]}
+            >
+              <Text
+                style={[styles.tableHeaderText, { color: token.text }]}
+              >
+                {header}
+              </Text>
+            </View>
+          ))}
+        </View>
+
+        {/* Data Rows (Progressive Reveal via WordBoundary Sync or Step Progress) */}
+        {metrics.rows.map((row, rIdx) => {
+          const ratio = getRowRevealRatio(rIdx);
+          const rowOpacity = ratio <= 0 ? 0 : Math.min(1, ratio * 1.45);
+          const isRowTyping = isCurrentStep && isPlaying && ratio > 0 && ratio < 0.995;
+
+          return (
+            <View
+              key={`tr-${rIdx}`}
+              style={[
+                styles.tableRow,
+                {
+                  height: metrics.rowHeights[rIdx],
+                  opacity: rowOpacity,
+                  backgroundColor:
+                    rIdx % 2 === 1 ? "rgba(15, 23, 42, 0.024)" : "transparent",
+                },
+              ]}
+            >
+              {row.map((cell, cIdx) => {
+                const visibleCell =
+                  ratio >= 0.995
+                    ? cell
+                    : cell.slice(0, Math.max(0, Math.round(cell.length * ratio)));
+                const showCellCursor =
+                  isRowTyping && cIdx === row.length - 1 && visibleCell.length > 0;
+
+                return (
+                  <View
+                    key={`td-${rIdx}-${cIdx}`}
+                    style={[
+                      styles.tableCell,
+                      { width: metrics.colWidths[cIdx] },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.tableCellText,
+                        cIdx === 0 && styles.tableFirstColText,
+                        { color: cIdx === 0 ? token.text : "#1E293B" },
+                      ]}
+                    >
+                      {visibleCell}
+                      {showCellCursor && (
+                        <Text style={{ color: token.stroke }}>▍</Text>
+                      )}
+                    </Text>
+                  </View>
+                );
+              })}
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+
+  if (metrics.needsHorizontalScroll) {
+    return (
+      <View style={styles.tableWrapper}>
+        <ScrollView
+          horizontal
+          nestedScrollEnabled
+          showsHorizontalScrollIndicator
+          directionalLockEnabled
+          contentContainerStyle={styles.tableScrollContent}
+        >
+          {tableInner}
+        </ScrollView>
+        <Text style={styles.tableScrollHintText}>
+          ↔ Swipe table horizontally
+        </Text>
+      </View>
+    );
+  }
+
+  return <View style={styles.tableWrapperCentered}>{tableInner}</View>;
 };
 
 // ---------------------------------------------------------------------------
@@ -1113,12 +1805,49 @@ const CodeBlockView: React.FC<{
   );
 };
 
+// ---------------------------------------------------------------------------
+// Slot Content View (Heading, Flow Card, Equation, Note, Code, Table, Bullets)
+// ---------------------------------------------------------------------------
 const SlotContentView: React.FC<{
+  blockId: string;
   items: ResolvedAction[];
+  slotWidth: number;
+  stepProgress: number;
   textProgress: number;
+  currentTimeMs?: number;
+  wordTimings?: WordTiming[];
   isPlaying: boolean;
   isCompact: boolean;
-}> = ({ items, textProgress, isPlaying, isCompact }) => {
+  tableGridProgress: SharedValue<number>;
+}> = ({
+  blockId,
+  items,
+  slotWidth,
+  stepProgress,
+  textProgress,
+  currentTimeMs,
+  wordTimings,
+  isPlaying,
+  isCompact,
+  tableGridProgress,
+}) => {
+  // Memoize WordBoundary trigger times for stacked current-step bullets
+  const currentStepBullets = useMemo(
+    () => items.filter((it) => it.isCurrentStep && it.action.type === "wb_bullet"),
+    [items]
+  );
+
+  const bulletTriggerMap = useMemo(() => {
+    const map = new Map<string, number | null>();
+    if (currentStepBullets.length === 0) return map;
+    const texts = currentStepBullets.map((it) => normalizeBlockText(it.action.text));
+    const triggers = computeItemTriggerMsList(texts, wordTimings);
+    currentStepBullets.forEach((it, idx) => {
+      map.set(it.key, triggers[idx] ?? null);
+    });
+    return map;
+  }, [currentStepBullets, wordTimings]);
+
   if (!items || items.length === 0) return null;
   const primaryItem = items[0];
   const primary = primaryItem.action;
@@ -1128,6 +1857,22 @@ const SlotContentView: React.FC<{
     isPlaying &&
     textProgress > 0 &&
     textProgress < 0.995;
+
+  if (primary.type === "wb_table") {
+    return (
+      <TableBlockView
+        blockId={blockId}
+        action={primary}
+        slotWidth={slotWidth}
+        isCurrentStep={primaryItem.isCurrentStep}
+        stepProgress={stepProgress}
+        currentTimeMs={currentTimeMs}
+        wordTimings={wordTimings}
+        isPlaying={isPlaying}
+        tableGridProgress={tableGridProgress}
+      />
+    );
+  }
 
   if (primary.type === "wb_code") {
     return (
@@ -1140,7 +1885,7 @@ const SlotContentView: React.FC<{
     );
   }
 
-  if (primary.type === "wb_heading") {
+  if (primary.type === "wb_note") {
     const token = getColorToken(primary.color);
     const full = normalizeBlockText(primary.text);
     const visible =
@@ -1148,7 +1893,39 @@ const SlotContentView: React.FC<{
         ? full
         : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
     return (
-      <View style={styles.headingBox}>
+      <View style={styles.noteBox}>
+        <View style={styles.noteHeaderRow}>
+          <View style={[styles.noteBadge, { backgroundColor: token.badgeBg }]}>
+            <Text style={[styles.noteBadgeText, { color: token.stroke }]}>
+              NOTE
+            </Text>
+          </View>
+        </View>
+        <Text style={[styles.noteText, { color: token.text }]}>
+          {visible}
+          {primaryShowCursor && (
+            <Text style={{ color: token.stroke }}>▍</Text>
+          )}
+        </Text>
+      </View>
+    );
+  }
+
+  if (primary.type === "wb_heading") {
+    const token = getColorToken(primary.color);
+    const full = normalizeBlockText(primary.text);
+    const visible =
+      primaryRatio >= 0.995
+        ? full
+        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const hasIcon = Boolean(primary.icon);
+    return (
+      <View
+        style={[
+          styles.headingBox,
+          hasIcon && styles.headingBoxWithIcon,
+        ]}
+      >
         <Text style={[styles.headingText, { color: token.text }]}>
           {visible}
           {primaryShowCursor && (
@@ -1185,8 +1962,17 @@ const SlotContentView: React.FC<{
       primaryRatio >= 0.995
         ? full
         : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
+    const hasIcon = Boolean(primary.icon);
     return (
-      <View style={styles.flowCardBox}>
+      <View
+        style={[
+          styles.flowCardBox,
+          hasIcon &&
+            (isCompact
+              ? styles.flowCardBoxWithIconCompact
+              : styles.flowCardBoxWithIcon),
+        ]}
+      >
         <Text style={[styles.flowCardText, { color: token.text }]}>
           {visible}
           {primaryShowCursor && (
@@ -1197,9 +1983,101 @@ const SlotContentView: React.FC<{
     );
   }
 
-  // Stacked wb_bullet items: completed prior bullets render at 100%,
-  // current step's bullets reveal sequentially across textProgress
-  const currentStepBullets = items.filter((it) => it.isCurrentStep);
+  // Stacked wb_bullet items:
+  // - Completed prior bullets render at 100%
+  // - Current-step bullets use exact WordBoundary sync when matched (280ms reveal window),
+  //   gracefully falling back to proportional sequential textProgress when unmatched/empty.
+  const clampedStep = clamp01(stepProgress);
+  const canUseWordTiming =
+    typeof currentTimeMs === "number" &&
+    Number.isFinite(currentTimeMs) &&
+    Array.isArray(wordTimings) &&
+    wordTimings.length > 0 &&
+    (currentTimeMs > 0 || clampedStep <= 0.05);
+
+  const hasAnyBulletWordMatch =
+    canUseWordTiming &&
+    currentStepBullets.some((it) => bulletTriggerMap.get(it.key) != null);
+
+  if (hasAnyBulletWordMatch) {
+    const totalCurrent = Math.max(1, currentStepBullets.length);
+    return (
+      <View style={styles.bulletList}>
+        {items.map((item) => {
+          const token = getColorToken(item.action.color);
+          const full = normalizeBlockText(item.action.text);
+
+          if (!item.isCurrentStep || clampedStep >= 0.995) {
+            return (
+              <View key={item.key} style={styles.bulletRow}>
+                <View
+                  style={[styles.bulletDot, { backgroundColor: token.stroke }]}
+                />
+                <Text style={[styles.bulletText, { color: token.text }]}>
+                  {full}
+                </Text>
+              </View>
+            );
+          }
+
+          const triggerMs = bulletTriggerMap.get(item.key) ?? null;
+          let ratio: number;
+          if (triggerMs !== null) {
+            if (clampedStep >= 0.96) {
+              ratio = 1;
+            } else if ((currentTimeMs as number) < triggerMs) {
+              ratio = 0;
+            } else {
+              ratio = clamp01(
+                ((currentTimeMs as number) - triggerMs) /
+                  WORD_SYNC_REVEAL_WINDOW_MS
+              );
+            }
+          } else {
+            const cIdx = Math.max(
+              0,
+              currentStepBullets.findIndex((b) => b.key === item.key)
+            );
+            const start = 0.18 + (cIdx / totalCurrent) * 0.68;
+            const span = Math.max(0.14, 0.68 / totalCurrent);
+            ratio = clamp01((clampedStep - start) / span);
+          }
+
+          if (ratio <= 0) {
+            return null;
+          }
+
+          const visible =
+            ratio >= 0.995
+              ? full
+              : full.slice(0, Math.max(1, Math.round(full.length * ratio)));
+          const isTypingThisBullet = isPlaying && ratio > 0 && ratio < 0.995;
+
+          return (
+            <View
+              key={item.key}
+              style={[
+                styles.bulletRow,
+                { opacity: Math.min(1, ratio * 1.4) },
+              ]}
+            >
+              <View
+                style={[styles.bulletDot, { backgroundColor: token.stroke }]}
+              />
+              <Text style={[styles.bulletText, { color: token.text }]}>
+                {visible}
+                {isTypingThisBullet && (
+                  <Text style={{ color: token.stroke }}>▍</Text>
+                )}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+    );
+  }
+
+  // Default sequential typewriter budget fallback for stacked wb_bullet items
   const currentTotalChars = currentStepBullets.reduce(
     (sum, it) => sum + Math.max(1, normalizeBlockText(it.action.text).length),
     0
@@ -1265,13 +2143,21 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   slideAspectRatio = 16 / 9,
   renderPdfLayer,
   stepProgress = 1,
+  currentTimeMs,
+  wordTimings,
   isPlaying = false,
   replayToken = 0,
   topInset = 76,
   bottomInset = 112,
 }) => {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [detectedAspect, setDetectedAspect] = useState<number>(slideAspectRatio);
+
+  // Dynamic responsive viewport dimensions (handles rotation & tablet Split View)
+  const viewportWidth = canvasSize.width > 0 ? canvasSize.width : windowWidth;
+  const viewportHeight = canvasSize.height > 0 ? canvasSize.height : windowHeight;
+  const isTablet = viewportWidth >= 600;
 
   // 60fps UI-thread Pan & Pinch-to-Zoom Shared Values + Manual Override Flag
   const scale = useSharedValue(1);
@@ -1349,11 +2235,15 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   }, [clampedProgress, activeProgressSV]);
 
   // Choreography phase curves on the UI thread:
-  // - Card borders & heading underlines: 0% -> 35%
+  // - Card rough borders, sketch icons & heading underlines: 0% -> 35%
+  // - Table rough Skia grid lines: 0% -> 30%
   // - Connector arrows: 75% -> 100%
-  // - PDF overlay highlights/circles: 0% -> 45%
+  // - PDF overlay highlights & rough circles: 0% -> 45%
   const borderProgressSV = useDerivedValue(() =>
     Math.max(0, Math.min(1, activeProgressSV.value / 0.35))
+  );
+  const tableGridProgressSV = useDerivedValue(() =>
+    Math.max(0, Math.min(1, activeProgressSV.value / 0.3))
   );
   const arrowProgressSV = useDerivedValue(() =>
     Math.max(0, Math.min(1, (activeProgressSV.value - 0.75) / 0.25))
@@ -1368,7 +2258,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   // Simultaneous Pan + Pinch + Double-Tap Reset gestures (60fps UI thread)
   const composedGesture = useMemo(() => {
     const panGesture = Gesture.Pan()
-      .minDistance(4)
+      .minDistance(6)
       .onStart(() => {
         userHasManuallyPanned.value = true;
         savedX.value = translateX.value;
@@ -1459,13 +2349,13 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   const contentRect = useMemo(
     () =>
       computeContainRect(
-        canvasSize.width,
-        canvasSize.height,
+        viewportWidth,
+        viewportHeight,
         detectedAspect,
         topInset,
         bottomInset
       ),
-    [canvasSize.width, canvasSize.height, detectedAspect, topInset, bottomInset]
+    [viewportWidth, viewportHeight, detectedAspect, topInset, bottomInset]
   );
 
   // Compute cumulative multi-band whiteboard blocks & dynamic rects
@@ -1477,13 +2367,14 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   const cumulativeLayout = useMemo(
     () =>
       computeCumulativeWhiteboardLayout(
-        canvasSize.width,
-        canvasSize.height,
+        viewportWidth,
+        viewportHeight,
         wbBlocks,
         topInset,
-        bottomInset
+        bottomInset,
+        isTablet
       ),
-    [canvasSize.width, canvasSize.height, wbBlocks, topInset, bottomInset]
+    [viewportWidth, viewportHeight, wbBlocks, topInset, bottomInset, isTablet]
   );
 
   // Gesture-Safe Auto-Pan Camera Follow: smoothly centers on active blocks below viewport
@@ -1491,7 +2382,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     if (
       !currentStep ||
       currentStep.mode !== "whiteboard" ||
-      canvasSize.height <= 0
+      viewportHeight <= 0
     ) {
       return;
     }
@@ -1516,7 +2407,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     }
 
     const visibleTop = topInset + 8;
-    const visibleBottom = canvasSize.height - bottomInset - 12;
+    const visibleBottom = viewportHeight - bottomInset - 12;
     const visibleCenterY = (visibleTop + visibleBottom) / 2;
 
     let targetY = translateY.value;
@@ -1541,7 +2432,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     currentStep,
     wbBlocks,
     cumulativeLayout.blockRects,
-    canvasSize.height,
+    viewportHeight,
     topInset,
     bottomInset,
     userHasManuallyPanned,
@@ -1549,11 +2440,11 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     savedY,
   ]);
 
-  // Single-draw-call subtle warm paper grid covering an expanded infinite area
+  // Single-draw-call subtle warm paper grid covering an expanded infinite full-bleed area
   const gridOverscan = 480;
   const gridPath = useMemo(() => {
     if (cumulativeLayout.boardWidth <= 0 || cumulativeLayout.boardHeight <= 0) {
-      return makeEmptyPath();
+      return makeEmptySkiaPath();
     }
     const spacing = 28;
     const minX = -gridOverscan;
@@ -1582,7 +2473,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   }
 
   // =========================================================================
-  // MODE 1: PDF OVERLAY (Interactive Pan & Zoom Slide + Progressive Skia)
+  // MODE 1: PDF OVERLAY (Interactive Pan & Zoom Slide + Rough Skia Circles)
   // =========================================================================
   if (currentStep.mode === "pdf_overlay") {
     const pdfActions = (currentStep.actions ?? []).filter(
@@ -1597,7 +2488,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
         <GestureDetector gesture={composedGesture}>
           <Animated.View style={[styles.gestureStage, viewportTransformStyle]}>
             {/* Layer 1: Underlying PDF slide locked strictly to contentRect */}
-            {canvasSize.width > 0 &&
+            {viewportWidth > 0 &&
               (renderPdfLayer ? (
                 <View
                   style={[
@@ -1652,7 +2543,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
               ))}
 
             {/* Layer 2: Transparent 60fps Skia Vector Overlay mapped via [0-1000] bbox */}
-            {canvasSize.width > 0 && (
+            {viewportWidth > 0 && (
               <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
                 {pdfActions.map((action, idx) => {
                   const screenRect = mapBboxToScreenRect(
@@ -1666,7 +2557,10 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                     return (
                       <AnimatedHighlightRect
                         key={key}
-                        rect={screenRect}
+                        x={screenRect.x}
+                        y={screenRect.y}
+                        width={screenRect.width}
+                        height={screenRect.height}
                         color={token.highlight}
                         progress={pdfProgressSV}
                       />
@@ -1675,7 +2569,11 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   return (
                     <AnimatedCircleAnnotation
                       key={key}
-                      rect={screenRect}
+                      x={screenRect.x}
+                      y={screenRect.y}
+                      width={screenRect.width}
+                      height={screenRect.height}
+                      seed={hashSeed(key)}
                       strokeColor={token.stroke}
                       progress={pdfProgressSV}
                     />
@@ -1703,7 +2601,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   }
 
   // =========================================================================
-  // MODE 2: LIVE PROGRESSIVE INFINITE WHITEBOARD (#FAF8F5 Paper + Auto-Pan)
+  // MODE 2: LIVE PROGRESSIVE INFINITE WHITEBOARD (#FAF8F5 Paper + Rough Skia)
   // =========================================================================
   const { blockRects, boardWidth, boardHeight } = cumulativeLayout;
   const arrowBlocks = wbBlocks.filter(
@@ -1723,8 +2621,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
               height: boardHeight,
             }}
           >
-            {/* Layer 1: 60fps Skia Vector Layer (Grid, Progressive Card Frames, Arrows) */}
-            {canvasSize.width > 0 && (
+            {/* Layer 1: 60fps Skia Vector Layer (Full-Bleed Paper Grid, Rough Frames, Icons, Arrows) */}
+            {viewportWidth > 0 && (
               <Canvas
                 style={{
                   position: "absolute",
@@ -1747,62 +2645,100 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   ]}
                 />
 
-                {/* Progressive Card Frames & Heading Underlines (0% -> 35% of stepProgress) */}
+                {/* Progressive Rough Card Frames, Heading Underlines & Sketch Icons (0% -> 35%) */}
                 {wbBlocks.map((block) => {
                   const rect = blockRects.get(block.blockId);
                   if (!rect || rect.width <= 0 || rect.height <= 0) return null;
                   const primary = block.items[0]?.action;
                   if (!primary) return null;
+
+                  // wb_table renders its own memoized rough Skia grid inside TableBlockView
+                  // so horizontal scrolling on narrow phones keeps grid lines locked 1:1 with cells
+                  if (primary.type === "wb_table") {
+                    return null;
+                  }
+
                   const token = getColorToken(primary.color);
                   const isCode = primary.type === "wb_code";
                   const isHeading = primary.type === "wb_heading";
-                  const radius = isHeading ? 12 : 16;
+                  const isNote = primary.type === "wb_note";
+                  const isFlowCard = primary.type === "wb_flow_card";
+                  const isCompact =
+                    block.slot === "left_col" || block.slot === "right_col";
+                  const radius = isHeading ? 12 : isNote ? 10 : 16;
                   const isNewCard = block.createdAtStepIdx === safeIndex;
+                  const cardSeed = hashSeed(`frame-${block.blockId}`);
 
-                  const shiftedRect: RectFrame = {
-                    x: rect.x + gridOverscan,
-                    y: rect.y + gridOverscan,
-                    width: rect.width,
-                    height: rect.height,
-                  };
+                  const shiftedX = rect.x + gridOverscan;
+                  const shiftedY = rect.y + gridOverscan;
+
+                  const showSketchIcon =
+                    Boolean(primary.icon) && (isHeading || isFlowCard);
+                  const iconSize = isHeading ? 24 : isCompact ? 18 : 22;
+                  const iconCx = shiftedX + (isCompact ? 20 : 25);
+                  const iconCy =
+                    shiftedY + (isHeading ? (rect.height - 6) / 2 : rect.height / 2);
 
                   return (
-                    <AnimatedCardFrame
-                      key={`frame-${block.blockId}`}
-                      rect={shiftedRect}
-                      radius={radius}
-                      fillColor={isCode ? "#0F172A" : token.fill}
-                      strokeColor={isCode ? "#334155" : token.stroke}
-                      strokeWidth={primary.type === "wb_flow_card" ? 2 : 1.5}
-                      isHeading={isHeading}
-                      animate={isNewCard}
-                      borderProgress={borderProgressSV}
-                    />
+                    <React.Fragment key={`frame-${block.blockId}`}>
+                      <AnimatedCardFrame
+                        x={shiftedX}
+                        y={shiftedY}
+                        width={rect.width}
+                        height={rect.height}
+                        radius={radius}
+                        seed={cardSeed}
+                        fillColor={
+                          isCode
+                            ? "#0F172A"
+                            : isNote
+                            ? token.noteFill
+                            : token.fill
+                        }
+                        strokeColor={isCode ? "#334155" : token.stroke}
+                        strokeWidth={isFlowCard ? 2 : 1.55}
+                        isCode={isCode}
+                        isHeading={isHeading}
+                        isNote={isNote}
+                        animate={isNewCard}
+                        borderProgress={borderProgressSV}
+                      />
+                      {showSketchIcon && primary.icon && (
+                        <AnimatedSketchIcon
+                          icon={primary.icon}
+                          cx={iconCx}
+                          cy={iconCy}
+                          size={iconSize}
+                          seed={hashSeed(`icon-${block.blockId}-${primary.icon}`)}
+                          strokeColor={token.stroke}
+                          animate={isNewCard}
+                          progress={borderProgressSV}
+                        />
+                      )}
+                    </React.Fragment>
                   );
                 })}
 
-                {/* Cause-and-Effect Connector Arrows (75% -> 100% of stepProgress) */}
+                {/* Hand-Drawn Cause-and-Effect Connector Arrows (75% -> 100% of stepProgress) */}
                 {arrowBlocks.map((block) => {
                   const fromRect = blockRects.get(block.connectFromBlockId!);
                   const toRect = blockRects.get(block.blockId);
                   if (!fromRect || !toRect) return null;
                   const primary = block.items[0].action;
                   const token = getColorToken(primary.color);
-                  const shiftedFrom: RectFrame = {
-                    ...fromRect,
-                    x: fromRect.x + gridOverscan,
-                    y: fromRect.y + gridOverscan,
-                  };
-                  const shiftedTo: RectFrame = {
-                    ...toRect,
-                    x: toRect.x + gridOverscan,
-                    y: toRect.y + gridOverscan,
-                  };
+
                   return (
                     <AnimatedArrowPath
                       key={`arrow-${block.blockId}`}
-                      from={shiftedFrom}
-                      to={shiftedTo}
+                      fromX={fromRect.x + gridOverscan}
+                      fromY={fromRect.y + gridOverscan}
+                      fromW={fromRect.width}
+                      fromH={fromRect.height}
+                      toX={toRect.x + gridOverscan}
+                      toY={toRect.y + gridOverscan}
+                      toW={toRect.width}
+                      toH={toRect.height}
+                      seed={hashSeed(`arrow-${block.blockId}`)}
                       strokeColor={token.stroke}
                       animate={block.createdAtStepIdx === safeIndex}
                       progress={arrowProgressSV}
@@ -1812,12 +2748,14 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
               </Canvas>
             )}
 
-            {/* Layer 2: Live Typewriter RN Text & Syntax-Highlighted Code Overlays (15% -> 92%) */}
-            {canvasSize.width > 0 &&
+            {/* Layer 2: Live Typewriter RN Text, Notes, Tables & Syntax-Highlighted Code */}
+            {viewportWidth > 0 &&
               wbBlocks.map((block) => {
                 const rect = blockRects.get(block.blockId);
                 if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-                const isCode = block.items[0]?.action.type === "wb_code";
+                const primaryType = block.items[0]?.action.type;
+                const isCode = primaryType === "wb_code";
+                const isTable = primaryType === "wb_table";
                 const isCompact =
                   block.slot === "left_col" || block.slot === "right_col";
 
@@ -1827,6 +2765,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                     style={[
                       styles.slotContainer,
                       isCode && styles.codeSlotContainer,
+                      isTable && styles.tableSlotContainer,
                       {
                         left: rect.x,
                         top: rect.y,
@@ -1836,10 +2775,16 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                     ]}
                   >
                     <SlotContentView
+                      blockId={block.blockId}
                       items={block.items}
+                      slotWidth={rect.width}
+                      stepProgress={clampedProgress}
                       textProgress={textProgress}
+                      currentTimeMs={currentTimeMs}
+                      wordTimings={wordTimings}
                       isPlaying={isPlaying}
                       isCompact={isCompact}
+                      tableGridProgress={tableGridProgressSV}
                     />
                   </View>
                 );
@@ -1865,7 +2810,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
 };
 
 // ---------------------------------------------------------------------------
-// Styles
+// Styles (with includeFontPadding: false & Platform.select Font Parity)
 // ---------------------------------------------------------------------------
 const styles = StyleSheet.create({
   emptyContainer: {
@@ -1877,6 +2822,7 @@ const styles = StyleSheet.create({
   emptyText: {
     color: "#64748B",
     fontSize: 14,
+    includeFontPadding: false,
   },
   pdfRoot: {
     flex: 1,
@@ -1905,6 +2851,7 @@ const styles = StyleSheet.create({
   pdfPlaceholderText: {
     color: "#94A3B8",
     fontSize: 13,
+    includeFontPadding: false,
   },
   slotContainer: {
     position: "absolute",
@@ -1919,26 +2866,45 @@ const styles = StyleSheet.create({
     overflow: "hidden",
     borderRadius: 16,
   },
+  tableSlotContainer: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    justifyContent: "flex-start",
+  },
   headingBox: {
     justifyContent: "center",
     alignItems: "center",
     paddingBottom: 8,
+  },
+  headingBoxWithIcon: {
+    paddingLeft: 32,
+    paddingRight: 10,
   },
   headingText: {
     fontSize: 17.5,
     fontWeight: "700",
     textAlign: "center",
     lineHeight: 24,
+    includeFontPadding: false,
   },
   flowCardBox: {
     justifyContent: "center",
     alignItems: "center",
+  },
+  flowCardBoxWithIcon: {
+    paddingLeft: 30,
+    paddingRight: 6,
+  },
+  flowCardBoxWithIconCompact: {
+    paddingLeft: 24,
+    paddingRight: 4,
   },
   flowCardText: {
     fontSize: 14.5,
     fontWeight: "600",
     textAlign: "center",
     lineHeight: 21,
+    includeFontPadding: false,
   },
   equationBox: {
     justifyContent: "center",
@@ -1948,9 +2914,83 @@ const styles = StyleSheet.create({
   equationText: {
     fontSize: 16.5,
     fontWeight: "600",
-    fontFamily: Platform.OS === "ios" ? "Georgia" : "serif",
+    fontFamily: SERIF_FONT_FAMILY,
     textAlign: "center",
     lineHeight: 24,
+    includeFontPadding: false,
+  },
+  noteBox: {
+    paddingLeft: 12,
+    paddingRight: 4,
+    gap: 5,
+    justifyContent: "center",
+  },
+  noteHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  noteBadge: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  noteBadgeText: {
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 0.9,
+    includeFontPadding: false,
+  },
+  noteText: {
+    fontSize: 14,
+    lineHeight: 21,
+    fontFamily: SERIF_FONT_FAMILY,
+    fontStyle: "italic",
+    fontWeight: "500",
+    includeFontPadding: false,
+  },
+  tableWrapper: {
+    width: "100%",
+  },
+  tableWrapperCentered: {
+    width: "100%",
+    alignItems: "center",
+  },
+  tableScrollContent: {
+    paddingBottom: 2,
+  },
+  tableRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  tableCell: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    justifyContent: "center",
+  },
+  tableHeaderText: {
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 18,
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  tableCellText: {
+    fontSize: 12.5,
+    fontWeight: "500",
+    lineHeight: 18,
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  tableFirstColText: {
+    fontWeight: "700",
+  },
+  tableScrollHintText: {
+    marginTop: 2,
+    fontSize: 10.5,
+    fontWeight: "600",
+    color: "#64748B",
+    textAlign: "center",
+    includeFontPadding: false,
   },
   bulletList: {
     gap: 8,
@@ -1971,6 +3011,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     fontWeight: "500",
+    includeFontPadding: false,
   },
   codeContainer: {
     flex: 1,
@@ -2003,11 +3044,13 @@ const styles = StyleSheet.create({
     fontSize: 10.5,
     fontWeight: "700",
     letterSpacing: 1,
+    includeFontPadding: false,
   },
   codeLineCount: {
     color: "#94A3B8",
     fontSize: 10,
     fontWeight: "600",
+    includeFontPadding: false,
   },
   codeBody: {
     paddingTop: 10,
@@ -2034,7 +3077,8 @@ const styles = StyleSheet.create({
     color: "#64748B",
     fontSize: 11.5,
     lineHeight: 19,
-    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontFamily: CODE_FONT_FAMILY,
+    includeFontPadding: false,
   },
   codeLineNumberCompact: {
     width: 18,
@@ -2047,7 +3091,8 @@ const styles = StyleSheet.create({
     color: "#F8FAFC",
     fontSize: 12,
     lineHeight: 19,
-    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontFamily: CODE_FONT_FAMILY,
+    includeFontPadding: false,
   },
   codeLineTextCompact: {
     fontSize: 11.5,
@@ -2079,6 +3124,7 @@ const styles = StyleSheet.create({
     color: "#FAF8F5",
     fontSize: 12,
     fontWeight: "700",
+    includeFontPadding: false,
   },
 });
 

@@ -22,11 +22,15 @@ BASE_TUTOR_SYSTEM_PROMPT = r"""You are an expert Iraqi university professor in I
    - In `"pdf_overlay"` mode: ONLY use `pdf_highlight` or `pdf_circle` with tight `[0-1000]` normalized `bbox` coordinates pointing to the exact text or diagram part being explained in that step.
    - In `"whiteboard"` mode: NEVER output `bbox`. ONLY place elements into the predefined `slot` zones (`header`, `main_top`, `left_col`, `right_col`, `bottom_summary`, `full_canvas`).
    - **MANDATORY for `wb_code` actions:** Every `wb_code` action MUST populate a non-empty multi-line `code` field containing **3 to 8 lines of real, runnable code** (e.g., Python) separated by real `\n` newlines, plus `code_lang` and `highlight_lines`. NEVER leave `code` empty, null, or placeholder text.
+   - **Rich Whiteboard Teaching Primitives:**
+     * `wb_table`: Use whenever comparing concepts (e.g., `for` vs `while`, `break` vs `continue`, Type 1 vs Type 2 diabetes, differential diagnoses). Provide `headers` with **2 to 4 columns** and `rows` with **2 to 5 concise rows** (**2–5 words per cell**).
+     * `wb_note`: Use a short `red` or `blue` handwritten margin callout (`text`) for quick rules, common exam pitfalls, warnings, or professor tips.
+     * `icon`: Optionally add a small hand-drawn icon (`"lightbulb"`, `"brain"`, `"check"`, `"warning"`, `"code"`, `"compare"`) on `wb_heading` and `wb_flow_card` actions (placed right before `text` in JSON field order).
    - Always emit `{"type": "clear_board", "color": "blue"}` as the first action whenever switching from `pdf_overlay` to `whiteboard` or starting a new diagram.
    - Use `connect_from_slot` on `wb_flow_card` to automatically draw cause-and-effect arrows between slots.
 
-### ONE-SHOT REFERENCE EXAMPLE (5-STEP THOROUGH PROGRESSION — FOLLOW THIS DEPTH & STYLE):
-Input Slide Topic: Insulin resistance mechanism, diagnostic threshold equation & Python check.
+### ONE-SHOT REFERENCE EXAMPLE (6-STEP THOROUGH PROGRESSION — FOLLOW THIS DEPTH & STYLE):
+Input Slide Topic: Insulin resistance mechanism, normal vs. resistance comparison & Python diagnostic check.
 Expected Output Pattern:
 {
   "title": "Insulin Resistance & Glucose Threshold",
@@ -58,8 +62,8 @@ Expected Output Pattern:
       "en_terms": ["Type 2 Diabetes", "Insulin Resistance", "GLUT4"],
       "actions": [
         {"type": "clear_board", "color": "blue"},
-        {"type": "wb_heading", "color": "blue", "slot": "header", "text": "Insulin Resistance Pathway"},
-        {"type": "wb_flow_card", "color": "red", "slot": "left_col", "text": "Receptor Resistance\n(Blocked Signal & Closed GLUT4)"}
+        {"type": "wb_heading", "color": "blue", "slot": "header", "icon": "brain", "text": "Insulin Resistance Pathway"},
+        {"type": "wb_flow_card", "color": "red", "slot": "left_col", "icon": "warning", "text": "Receptor Resistance\n(Blocked Signal & Closed GLUT4)"}
       ]
     },
     {
@@ -68,13 +72,25 @@ Expected Output Pattern:
       "speech_ar": "ونتيجة لهذا الانسداد، يتراكم السكر في مجرى الدم وتظهر حالة Hyperglycemia. في البداية يحاول البنكرياس التعويض فيفرز كميات أكبر من Insulin، لكن مع الوقت تتعب خلايا Beta Cells.",
       "en_terms": ["Hyperglycemia", "Insulin", "Beta Cells"],
       "actions": [
-        {"type": "wb_flow_card", "color": "red", "slot": "right_col", "connect_from_slot": "left_col", "text": "Hyperglycemia\n(High Blood Glucose & Beta Cell Fatigue)"}
+        {"type": "wb_flow_card", "color": "red", "slot": "right_col", "connect_from_slot": "left_col", "icon": "warning", "text": "Hyperglycemia\n(High Blood Glucose & Beta Cell Fatigue)"},
+        {"type": "wb_note", "color": "red", "slot": "bottom_summary", "text": "Exam Rule: Early stage shows BOTH high insulin and high glucose!"}
       ]
     },
     {
       "step_id": 5,
       "mode": "whiteboard",
-      "speech_ar": "خلونا نشوف شلون نطبق هذا الفحص بلغة Python: نكتب دالة check_glucose داخل كتلة try وكتلة except حتى تفحص قراءة Fasting Blood Glucose وتنبه الطبيب تلقائيا.",
+      "speech_ar": "خلونا نلخص الفرق بجدول مقارنة سريع بين الحالة الطبيعية وحالة Insulin Resistance من ناحية إشارة المستقبل وقنوات GLUT4 وقراءة سكر Fasting Blood Glucose.",
+      "en_terms": ["Insulin Resistance", "GLUT4", "Fasting Blood Glucose"],
+      "actions": [
+        {"type": "clear_board", "color": "blue"},
+        {"type": "wb_heading", "color": "blue", "slot": "header", "icon": "compare", "text": "Normal vs. Insulin Resistance"},
+        {"type": "wb_table", "color": "blue", "slot": "main_top", "headers": ["Metric", "Normal", "Resistance"], "rows": [["Receptor Signal", "Active binding", "Blocked response"], ["GLUT4 Channels", "Open for glucose", "Remain closed"], ["Fasting Glucose", "< 100 mg/dL", ">= 126 mg/dL"]]}
+      ]
+    },
+    {
+      "step_id": 6,
+      "mode": "whiteboard",
+      "speech_ar": "وهسة خلونا نشوف شلون نطبق هذا الفحص بلغة Python: نكتب دالة check_glucose داخل كتلة try وكتلة except حتى تفحص قراءة Fasting Blood Glucose وتنبه الطبيب تلقائيا.",
       "en_terms": ["Fasting Blood Glucose", "Python", "try", "except"],
       "actions": [
         {"type": "wb_code", "color": "blue", "slot": "bottom_summary", "code_lang": "python", "highlight_lines": [3, 4], "code": "def check_glucose(mg_dl):\n    try:\n        value = float(mg_dl)\n        return 'Diabetic Alert' if value >= 126 else 'Normal'\n    except ValueError:\n        return 'Invalid reading'"}
@@ -149,6 +165,9 @@ QA_TUTOR_SYSTEM_PROMPT = r"""You are an expert Iraqi university professor in Int
 3. **Visual Board Discipline:**
    - In `"whiteboard"` mode: NEVER emit `bbox`. Place visual elements into valid `slot` zones (`header`, `main_top`, `left_col`, `right_col`, `bottom_summary`, `full_canvas`).
    - For EVERY `wb_code` action: you MUST populate the `code` field with **3 to 8 lines of real, runnable code** separated by real `\n` newlines, plus `code_lang` and optional `highlight_lines` (at most 3 lines).
+   - Use `wb_table` (`headers`: 2 to 4 columns; `rows`: 2 to 5 concise rows with 2–5 words per cell) whenever the student asks for a comparison (e.g., `for` vs `while`, `break` vs `continue`, differential diagnoses).
+   - Use `wb_note` (`color`: `"red"` or `"blue"`, short handwritten margin callout in `text`) for quick rules, warnings, or exam tips.
+   - Optionally include `icon` (`"lightbulb"`, `"brain"`, `"check"`, `"warning"`, `"code"`, `"compare"`) on `wb_heading` and `wb_flow_card` actions (placed right before `text`).
    - Use `connect_from_slot` on `wb_flow_card` when comparing or linking two concepts.
    - Set `quiz_question_ar` to a brief, helpful follow-up check question in warm Iraqi Arabic related to their question."""
 

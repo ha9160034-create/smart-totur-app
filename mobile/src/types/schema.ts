@@ -6,6 +6,20 @@ export type WhiteboardSlot =
   | "bottom_summary"
   | "full_canvas";
 
+export type SketchIcon =
+  | "lightbulb"
+  | "brain"
+  | "check"
+  | "warning"
+  | "code"
+  | "compare";
+
+export interface WordTiming {
+  word: string;
+  start_ms: number;
+  duration_ms: number;
+}
+
 export interface BoundingBox {
   ymin: number; // 0-1000
   xmin: number; // 0-1000
@@ -22,15 +36,20 @@ export interface VisualAction {
     | "wb_bullet"
     | "wb_equation"
     | "wb_code"
-    | "wb_flow_card";
+    | "wb_flow_card"
+    | "wb_table"
+    | "wb_note";
   color: "blue" | "red" | "green" | "yellow" | "black";
   bbox?: BoundingBox;
   slot?: WhiteboardSlot;
   connect_from_slot?: WhiteboardSlot;
+  icon?: SketchIcon;
   text?: string;
   code?: string;
   code_lang?: "python" | "cpp" | "java" | "r" | "sql" | "pseudocode";
   highlight_lines?: number[];
+  headers?: string[];
+  rows?: string[][];
 }
 
 export interface TeachingStep {
