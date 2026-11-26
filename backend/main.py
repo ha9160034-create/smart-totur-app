@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -12,15 +13,16 @@ import edge_tts
 import fitz  # PyMuPDF
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field, ValidationError
 
 import db
-from prompts import build_tutor_system_prompt
+from prompts import build_qa_system_prompt, build_tutor_system_prompt
 from schema import ExplainSlideResponse, LecturePlan
 
 load_dotenv()
@@ -69,6 +71,9 @@ EDGE_TTS_EN_RATE: str = os.getenv("EDGE_TTS_EN_RATE", "+5%").strip() or "+5%"
 TTS_VOICE: str = EDGE_TTS_VOICE
 TTS_TIMEOUT_SEC: float = max(5.0, float(os.getenv("TTS_TIMEOUT_SEC", "20.0")))
 
+# Optional shared API key guard for cloud deployments (leave empty for local dev)
+APP_API_KEY: str = os.getenv("APP_API_KEY", "").strip()
+
 _raw_cors = os.getenv("CORS_ORIGINS", "*").strip()
 CORS_ORIGINS: list[str] = (
     ["*"]
@@ -89,7 +94,7 @@ async def lifespan(_app: FastAPI):
     if GEMINI_API_KEY:
         _genai_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info(
-            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | embed=%s(%dd) | dpi=%d | tts_primary=%s(enabled=%s) | tts_fallback=%s | supabase=%s",
+            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | embed=%s(%dd) | dpi=%d | tts_primary=%s(enabled=%s) | tts_fallback=%s+%s | supabase=%s | auth_required=%s",
             FAST_TUTOR_MODEL,
             DEEP_TUTOR_MODEL,
             FALLBACK_TUTOR_MODEL,
@@ -97,12 +102,14 @@ async def lifespan(_app: FastAPI):
             EMBEDDING_DIM,
             PDF_RENDER_DPI,
             GOOGLE_TTS_VOICE,
-            GOOGLE_TTS_ENABLED and bool(GOOGLE_TTS_API_KEY),
-            TTS_VOICE,
+            GOOGLE_TTS_ENABLED,
+            EDGE_TTS_VOICE,
+            EDGE_TTS_EN_VOICE,
             db.is_configured(),
+            bool(APP_API_KEY),
         )
     else:
-        logger.warning("GEMINI_API_KEY is not set; /api/explain will fail until configured.")
+        logger.warning("GEMINI_API_KEY is not set; /api/explain and /api/ask will fail until configured.")
     yield
     _genai_client = None
     if _http_client is not None:
@@ -113,10 +120,31 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="AI Smart Whiteboard Tutor API",
-    version="0.2.0",
+    version="0.3.0",
     description="Contract-first FastAPI backend returning structured LecturePlan JSON for Intelligent Medical Systems slides.",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def verify_app_api_key(request: Request, call_next):
+    """
+    Require matching X-App-Key header on /api/* endpoints when APP_API_KEY is set.
+    Leaves /health, /docs, and CORS preflight OPTIONS open; passes freely when APP_API_KEY is unset.
+    """
+    if (
+        APP_API_KEY
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+    ):
+        provided = request.headers.get("X-App-Key", "").strip()
+        if not provided or not hmac.compare_digest(provided, APP_API_KEY):
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"detail": "Invalid or missing X-App-Key header."},
+            )
+    return await call_next(request)
+
 
 # Per CORS spec, allow_credentials cannot be True when allow_origins=["*"]
 app.add_middleware(
@@ -271,11 +299,16 @@ def _chunk_page_text(
 # ---------------------------------------------------------------------------
 # Defensive Post-Sanitization (Preserves Exact LecturePlan Schema Contract)
 # ---------------------------------------------------------------------------
-def _sanitize_plan(plan: LecturePlan, board_mode: BoardMode) -> LecturePlan:
+def _sanitize_plan(
+    plan: LecturePlan,
+    board_mode: BoardMode,
+    strip_clear_board: bool = False,
+) -> LecturePlan:
     """
     Fix minor geometric/field slips from fast models without changing the schema:
     - Ensure bounding boxes satisfy ymin <= ymax and xmin <= xmax.
     - Strip mismatched bbox/slot fields so Skia renderer never receives conflicting hints.
+    - When strip_clear_board=True (Q&A no-wipe mode), drop stray clear_board actions if other actions exist.
     """
     pdf_action_types = {"pdf_highlight", "pdf_circle"}
     wb_action_types = {
@@ -289,6 +322,11 @@ def _sanitize_plan(plan: LecturePlan, board_mode: BoardMode) -> LecturePlan:
     for step in plan.steps:
         if board_mode in ("whiteboard", "pdf_overlay"):
             step.mode = board_mode
+
+        if strip_clear_board and step.mode == "whiteboard":
+            non_clear = [a for a in step.actions if a.type != "clear_board"]
+            if non_clear:
+                step.actions = non_clear
 
         for action in step.actions:
             if action.type in pdf_action_types:
@@ -357,6 +395,23 @@ class LectureSummary(BaseModel):
 class RecentLecturesResponse(BaseModel):
     lectures: list[LectureSummary] = Field(default_factory=list)
     supabase_configured: bool = False
+
+
+class AskSlideRequest(BaseModel):
+    lecture_id: Optional[str] = Field(
+        default=None,
+        description="Supabase UUID of the indexed lecture (for cached slide image + full-document RAG).",
+    )
+    page_number: int = Field(..., ge=1, description="Active 1-based page number.")
+    question: str = Field(..., min_length=1, max_length=1000, description="Student's follow-up question.")
+    board_mode: BoardMode = Field(
+        default="auto",
+        description="Requested board mode: auto, whiteboard, or pdf_overlay.",
+    )
+    current_plan_context: Optional[str] = Field(
+        default=None,
+        description="Optional summary of the active slide's explanation for conversational continuity.",
+    )
 
 
 async def _embed_texts(
@@ -472,14 +527,18 @@ async def _ensure_lecture_indexed(
 
 async def _retrieve_rag_context(
     lecture_id: Optional[str],
-    page_number: int,
-    page_text: str,
+    exclude_page_number: int,
+    query_source_text: str,
+    match_count: int = 3,
 ) -> Optional[str]:
-    """Fetch top 3 related chunks from OTHER pages of the same lecture for prompt injection."""
+    """
+    Fetch top related chunks from a lecture via pgvector similarity search.
+    Pass exclude_page_number=0 to search across ALL pages (used by /api/ask).
+    """
     if not lecture_id or not db.is_configured():
         return None
 
-    query_text = " ".join((page_text or "").split())[:1500]
+    query_text = " ".join((query_source_text or "").split())[:1500]
     if not query_text:
         return None
 
@@ -489,9 +548,9 @@ async def _retrieve_rag_context(
             return None
         matches = await db.match_lecture_chunks(
             lecture_id=lecture_id,
-            exclude_page_number=page_number,
+            exclude_page_number=exclude_page_number,
             query_embedding=query_vecs[0],
-            match_count=3,
+            match_count=match_count,
         )
         if not matches:
             return None
@@ -506,10 +565,10 @@ async def _retrieve_rag_context(
             return None
 
         logger.info(
-            "RAG retrieved %d related chunks for lecture=%s page=%d from pages=%s",
+            "RAG retrieved %d related chunks for lecture=%s exclude_page=%d from pages=%s",
             len(formatted_lines),
             lecture_id,
-            page_number,
+            exclude_page_number,
             [m.get("page_number") for m in matches],
         )
         return "\n".join(formatted_lines)
@@ -836,6 +895,7 @@ async def health_check() -> dict[str, object]:
         "status": "ok",
         "gemini_configured": _genai_client is not None,
         "supabase_configured": db.is_configured(),
+        "auth_required": bool(APP_API_KEY),
         "fast_model": FAST_TUTOR_MODEL,
         "deep_model": DEEP_TUTOR_MODEL,
         "fallback_model": FALLBACK_TUTOR_MODEL,
@@ -922,134 +982,22 @@ def _build_model_fallback_chain(use_deep_model: bool) -> list[str]:
     return chain
 
 
-@app.post(
-    "/api/explain",
-    response_model=ExplainSlideWithAudioResponse,
-    summary="Generate a thorough 5-8 step LecturePlan + aligned slide image + synchronized Iraqi TTS audio",
-)
-async def explain_slide(
-    file: UploadFile = File(..., description="Lecture PDF file"),
-    page_number: int = Form(..., ge=1, description="1-based page number to explain"),
-    board_mode: BoardMode = Form(
-        "auto",
-        description="Visual explanation mode: auto, whiteboard, or pdf_overlay",
-    ),
-    use_deep_model: bool = Form(
-        False,
-        description="False -> FAST_TUTOR_MODEL (default 85%), True -> DEEP_TUTOR_MODEL (complex 15%)",
-    ),
-) -> ExplainSlideWithAudioResponse:
+async def _generate_plan_with_fallback(
+    image_bytes: Optional[bytes],
+    system_prompt: str,
+    user_instruction: str,
+    model_chain: list[str],
+) -> tuple[LecturePlan, str]:
+    """
+    Call official google-genai SDK asynchronously across model_chain with transient 503/429
+    retries and schema-validation retries, returning (validated_plan, used_model).
+    """
     if _genai_client is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server misconfiguration: GEMINI_API_KEY is missing.",
         )
 
-    # 1. Validate & read uploaded PDF in memory with size limit
-    if file.content_type and file.content_type not in (
-        "application/pdf",
-        "application/octet-stream",
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported content type '{file.content_type}'. Please upload a PDF file.",
-        )
-
-    req_started = time.perf_counter()
-    pdf_bytes = await _read_upload_bounded(file, MAX_PDF_SIZE_BYTES)
-    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
-
-    # 1b. Fast Cache Hit Path (< 0.5s): skip rendering, Gemini, and edge-tts if already cached
-    existing_lecture: Optional[dict[str, Any]] = None
-    if db.is_configured():
-        existing_lecture = await db.get_lecture_by_hash(file_hash)
-        if existing_lecture is not None:
-            cached_row = await db.get_cached_explained_page(
-                lecture_id=existing_lecture["id"],
-                page_number=page_number,
-                board_mode=board_mode,
-                use_deep_model=use_deep_model,
-            )
-            if cached_row is not None:
-                try:
-                    cached_response = _build_response_from_cache(existing_lecture, cached_row)
-                    elapsed_ms = (time.perf_counter() - req_started) * 1000.0
-                    logger.info(
-                        "CACHE HIT | lecture=%s | page=%d/%d | mode=%s | deep=%s | %.1fms",
-                        existing_lecture["id"],
-                        page_number,
-                        existing_lecture["total_pages"],
-                        board_mode,
-                        use_deep_model,
-                        elapsed_ms,
-                    )
-                    return cached_response
-                except (ValidationError, KeyError, ValueError) as exc:
-                    logger.warning("Cached row invalid; regenerating page %d: %s", page_number, exc)
-
-    # 2. Convert requested PDF page to in-memory JPEG bytes (offloaded from event loop)
-    try:
-        image_bytes, total_pages, slide_width, slide_height, current_page_text = (
-            await asyncio.to_thread(
-                _render_pdf_page_in_memory,
-                pdf_bytes,
-                page_number,
-                PDF_RENDER_DPI,
-                MAX_RENDER_DIM_PX,
-            )
-        )
-    except PdfEncryptedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
-    except PdfPageRangeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
-    except (fitz.FileDataError, RuntimeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Corrupted or unreadable PDF document.",
-        ) from exc
-
-    # 2b. First-Time Full-Document Indexing & Cross-Page RAG Retrieval
-    lecture_row = await _ensure_lecture_indexed(
-        file_hash=file_hash,
-        pdf_bytes=pdf_bytes,
-        filename=file.filename or "lecture.pdf",
-        existing_lecture=existing_lecture,
-    )
-    lecture_id: Optional[str] = str(lecture_row["id"]) if lecture_row else None
-    rag_context = await _retrieve_rag_context(
-        lecture_id=lecture_id,
-        page_number=page_number,
-        page_text=current_page_text,
-    )
-
-    # 3. Build deduplicated model fallback chain & assemble locked system prompt (with RAG context)
-    model_chain = _build_model_fallback_chain(use_deep_model)
-    system_prompt = build_tutor_system_prompt(board_mode, rag_context=rag_context)
-    user_instruction = (
-        f"Explain slide page {page_number} of {total_pages} from this lecture PDF thoroughly. "
-        f"Do NOT summarize briefly: break down every concept, diagram component, equation, or code line into "
-        f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in clear, natural Iraqi academic Arabic "
-        f"(لهجة عراقية بيضاء مفهومة) WITHOUT Arabic harakat or raw code symbols (#, {{}}, [], ;) inside speech_ar, using natural punctuation and clean spacing around "
-        f"English technical terms. For EVERY wb_code action, you MUST populate the `code` field with 3 to 8 lines of real runnable code separated by real newlines (never empty). "
-        f"Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
-    )
-
-    logger.info(
-        "Explaining page %d/%d | mode=%s | chain=%s | img_kb=%.1f",
-        page_number,
-        total_pages,
-        board_mode,
-        " -> ".join(model_chain),
-        len(image_bytes) / 1024.0,
-    )
-
-    # 4. Call official google-genai SDK asynchronously across fallback chain with backoff + validation retry
     plan: Optional[LecturePlan] = None
     used_model: Optional[str] = None
     last_api_error: Optional[genai_errors.APIError] = None
@@ -1057,6 +1005,16 @@ async def explain_slide(
     last_error_code: Optional[int] = None
     last_failed_model: str = model_chain[0] if model_chain else FAST_TUTOR_MODEL
     max_attempts_per_model = 2
+
+    contents: list[object] = []
+    if image_bytes:
+        contents.append(
+            genai_types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg",
+            )
+        )
+    contents.append(user_instruction)
 
     for model_idx, candidate_model in enumerate(model_chain):
         has_next_model = model_idx < len(model_chain) - 1
@@ -1077,18 +1035,10 @@ async def explain_slide(
             try:
                 response = await _genai_client.aio.models.generate_content(
                     model=candidate_model,
-                    contents=[
-                        genai_types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type="image/jpeg",
-                        ),
-                        user_instruction,
-                    ],
+                    contents=contents,
                     config=gen_config,
                 )
 
-                # Parse & validate inside the retry/fallback loop so malformed JSON or
-                # empty wb_code triggers automatic retry / fallback instead of an immediate 502.
                 if isinstance(response.parsed, LecturePlan):
                     plan = response.parsed
                 elif response.text:
@@ -1199,7 +1149,7 @@ async def explain_slide(
         if plan is not None:
             break
 
-    if plan is None:
+    if plan is None or used_model is None:
         if last_validation_error is not None and last_api_error is None:
             logger.error(
                 "All models failed LecturePlan schema validation (%s) | last_model=%s | error=%s",
@@ -1238,6 +1188,145 @@ async def explain_slide(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Upstream Gemini API error (status={last_error_code}).",
         ) from last_api_error
+
+    return plan, used_model
+
+
+@app.post(
+    "/api/explain",
+    response_model=ExplainSlideWithAudioResponse,
+    summary="Generate a thorough 5-8 step LecturePlan + aligned slide image + synchronized Iraqi TTS audio",
+)
+async def explain_slide(
+    file: UploadFile = File(..., description="Lecture PDF file"),
+    page_number: int = Form(..., ge=1, description="1-based page number to explain"),
+    board_mode: BoardMode = Form(
+        "auto",
+        description="Visual explanation mode: auto, whiteboard, or pdf_overlay",
+    ),
+    use_deep_model: bool = Form(
+        False,
+        description="False -> FAST_TUTOR_MODEL (default 85%), True -> DEEP_TUTOR_MODEL (complex 15%)",
+    ),
+) -> ExplainSlideWithAudioResponse:
+    if _genai_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfiguration: GEMINI_API_KEY is missing.",
+        )
+
+    # 1. Validate & read uploaded PDF in memory with size limit
+    if file.content_type and file.content_type not in (
+        "application/pdf",
+        "application/octet-stream",
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported content type '{file.content_type}'. Please upload a PDF file.",
+        )
+
+    req_started = time.perf_counter()
+    pdf_bytes = await _read_upload_bounded(file, MAX_PDF_SIZE_BYTES)
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    # 1b. Fast Cache Hit Path (< 0.5s): skip rendering, Gemini, and edge-tts if already cached
+    existing_lecture: Optional[dict[str, Any]] = None
+    if db.is_configured():
+        existing_lecture = await db.get_lecture_by_hash(file_hash)
+        if existing_lecture is not None:
+            cached_row = await db.get_cached_explained_page(
+                lecture_id=existing_lecture["id"],
+                page_number=page_number,
+                board_mode=board_mode,
+                use_deep_model=use_deep_model,
+            )
+            if cached_row is not None:
+                try:
+                    cached_response = _build_response_from_cache(existing_lecture, cached_row)
+                    elapsed_ms = (time.perf_counter() - req_started) * 1000.0
+                    logger.info(
+                        "CACHE HIT | lecture=%s | page=%d/%d | mode=%s | deep=%s | %.1fms",
+                        existing_lecture["id"],
+                        page_number,
+                        existing_lecture["total_pages"],
+                        board_mode,
+                        use_deep_model,
+                        elapsed_ms,
+                    )
+                    return cached_response
+                except (ValidationError, KeyError, ValueError) as exc:
+                    logger.warning("Cached row invalid; regenerating page %d: %s", page_number, exc)
+
+    # 2. Convert requested PDF page to in-memory JPEG bytes (offloaded from event loop)
+    try:
+        image_bytes, total_pages, slide_width, slide_height, current_page_text = (
+            await asyncio.to_thread(
+                _render_pdf_page_in_memory,
+                pdf_bytes,
+                page_number,
+                PDF_RENDER_DPI,
+                MAX_RENDER_DIM_PX,
+            )
+        )
+    except PdfEncryptedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except PdfPageRangeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except (fitz.FileDataError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Corrupted or unreadable PDF document.",
+        ) from exc
+
+    # 2b. First-Time Full-Document Indexing & Cross-Page RAG Retrieval
+    lecture_row = await _ensure_lecture_indexed(
+        file_hash=file_hash,
+        pdf_bytes=pdf_bytes,
+        filename=file.filename or "lecture.pdf",
+        existing_lecture=existing_lecture,
+    )
+    lecture_id: Optional[str] = str(lecture_row["id"]) if lecture_row else None
+    rag_context = await _retrieve_rag_context(
+        lecture_id=lecture_id,
+        exclude_page_number=page_number,
+        query_source_text=current_page_text,
+        match_count=3,
+    )
+
+    # 3. Build deduplicated model fallback chain & assemble locked system prompt (with RAG context)
+    model_chain = _build_model_fallback_chain(use_deep_model)
+    system_prompt = build_tutor_system_prompt(board_mode, rag_context=rag_context)
+    user_instruction = (
+        f"Explain slide page {page_number} of {total_pages} from this lecture PDF thoroughly. "
+        f"Do NOT summarize briefly: break down every concept, diagram component, equation, or code line into "
+        f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in clear, natural Iraqi academic Arabic "
+        f"(لهجة عراقية بيضاء مفهومة) WITHOUT Arabic harakat or raw code symbols (#, {{}}, [], ;) inside speech_ar, using natural punctuation and clean spacing around "
+        f"English technical terms. For EVERY wb_code action, you MUST populate the `code` field with 3 to 8 lines of real runnable code separated by real newlines (never empty). "
+        f"Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
+    )
+
+    logger.info(
+        "Explaining page %d/%d | mode=%s | chain=%s | img_kb=%.1f",
+        page_number,
+        total_pages,
+        board_mode,
+        " -> ".join(model_chain),
+        len(image_bytes) / 1024.0,
+    )
+
+    # 4. Call official google-genai SDK asynchronously across fallback chain with backoff + validation retry
+    plan, used_model = await _generate_plan_with_fallback(
+        image_bytes=image_bytes,
+        system_prompt=system_prompt,
+        user_instruction=user_instruction,
+        model_chain=model_chain,
+    )
 
     sanitized_plan = _sanitize_plan(plan, board_mode)
     encoded_b64 = base64.b64encode(image_bytes).decode("ascii")
@@ -1281,4 +1370,133 @@ async def explain_slide(
         step_audio=step_audio,
         cached=False,
         lecture_id=lecture_id,
+    )
+
+
+@app.post(
+    "/api/ask",
+    response_model=ExplainSlideWithAudioResponse,
+    summary="Interactive Slide Q&A: answer a student's follow-up question in 1-3 live whiteboard steps + bilingual audio",
+)
+async def ask_slide_question(payload: AskSlideRequest) -> ExplainSlideWithAudioResponse:
+    if _genai_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server misconfiguration: GEMINI_API_KEY is missing.",
+        )
+
+    cleaned_question = payload.question.strip()
+    if not cleaned_question:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Question cannot be empty.",
+        )
+
+    # 1. Retrieve cached slide JPEG + full-lecture RAG chunks (exclude_page_number=0 -> all pages)
+    image_bytes: Optional[bytes] = None
+    slide_image_data_uri = ""
+    slide_width = 1280
+    slide_height = 720
+    total_pages = max(1, payload.page_number)
+    rag_context: Optional[str] = None
+
+    if payload.lecture_id and db.is_configured():
+        found_page = await db.get_cached_page_by_lecture_id(
+            lecture_id=payload.lecture_id,
+            page_number=payload.page_number,
+        )
+        if found_page is not None:
+            lecture_row, cached_row = found_page
+            total_pages = max(1, int(lecture_row.get("total_pages") or payload.page_number))
+            slide_width = max(1, int(cached_row.get("slide_width") or 1280))
+            slide_height = max(1, int(cached_row.get("slide_height") or 720))
+            raw_img = str(cached_row.get("page_image_base64") or "")
+            if raw_img:
+                raw_b64 = raw_img.split("base64,", 1)[1] if "base64," in raw_img else raw_img
+                try:
+                    image_bytes = base64.b64decode(raw_b64)
+                    slide_image_data_uri = (
+                        raw_img
+                        if raw_img.startswith("data:image/")
+                        else f"data:image/jpeg;base64,{raw_b64}"
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to decode cached slide image for /api/ask: %s", exc)
+
+        rag_context = await _retrieve_rag_context(
+            lecture_id=payload.lecture_id,
+            exclude_page_number=0,  # Search across ALL pages of the lecture
+            query_source_text=cleaned_question,
+            match_count=4,
+        )
+
+    # Without an image, force whiteboard mode so Gemini never emits pdf_highlight coordinates
+    effective_board_mode: BoardMode = (
+        payload.board_mode
+        if (image_bytes is not None or payload.board_mode == "whiteboard")
+        else "whiteboard"
+    )
+
+    # 2. Build focused 1-3 step Q&A prompt & run Gemini fallback chain
+    model_chain = _build_model_fallback_chain(use_deep_model=False)
+    system_prompt = build_qa_system_prompt(
+        board_mode=effective_board_mode,
+        current_plan_context=payload.current_plan_context,
+        rag_context=rag_context,
+    )
+    user_instruction = (
+        f"Student question about slide page {payload.page_number}: \"{cleaned_question}\"\n"
+        f"Answer ONLY this question directly in 1 to 3 focused teaching steps using warm Iraqi academic Arabic "
+        f"with natural Arabic classifier nouns right before English technical terms (no harakat or raw symbols in speech_ar). "
+        f"Follow board_mode='{effective_board_mode}' strictly, NEVER emit clear_board when using whiteboard/auto mode, "
+        f"and populate real multi-line `code` for any wb_code action."
+    )
+
+    logger.info(
+        "Answering Q&A | lecture=%s | page=%d | mode=%s | has_img=%s | has_rag=%s | q=%r",
+        payload.lecture_id,
+        payload.page_number,
+        effective_board_mode,
+        image_bytes is not None,
+        bool(rag_context),
+        cleaned_question[:80],
+    )
+
+    plan, used_model = await _generate_plan_with_fallback(
+        image_bytes=image_bytes,
+        system_prompt=system_prompt,
+        user_instruction=user_instruction,
+        model_chain=model_chain,
+    )
+
+    # Belt-and-suspenders no-wipe guardrail: strip clear_board for auto/whiteboard Q&A steps
+    sanitized_plan = _sanitize_plan(
+        plan,
+        effective_board_mode,
+        strip_clear_board=(effective_board_mode in ("auto", "whiteboard")),
+    )
+
+    # 3. Synthesize bilingual Arabic + English MP3 audio concurrently
+    step_audio = await _synthesize_plan_audio(sanitized_plan)
+
+    logger.info(
+        "Completed Q&A | lecture=%s | page=%d | used_model=%s | steps=%d | audio_ready=%d/%d",
+        payload.lecture_id,
+        payload.page_number,
+        used_model,
+        len(sanitized_plan.steps),
+        sum(1 for a in step_audio if a.audio_base64),
+        len(step_audio),
+    )
+
+    return ExplainSlideWithAudioResponse(
+        plan=sanitized_plan,
+        slide_image_data_uri=slide_image_data_uri,
+        slide_width=slide_width,
+        slide_height=slide_height,
+        page_number=payload.page_number,
+        total_pages=total_pages,
+        step_audio=step_audio,
+        cached=False,
+        lecture_id=payload.lecture_id,
     )

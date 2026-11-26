@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Keyboard,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StatusBar,
@@ -23,13 +26,15 @@ import {
   useAudioPlayerStatus,
 } from "expo-audio";
 import { SmartBoardCanvas } from "./src/components/SmartBoardCanvas";
-import type { ExplainSlideResponse } from "./src/types/schema";
+import type { ExplainSlideResponse, TeachingStep } from "./src/types/schema";
 
 // ---------------------------------------------------------------------------
-// Configuration: Replace with your machine's LAN IP (run backend with --host 0.0.0.0)
-// Android Emulator can use "http://10.0.2.2:8000"
+// Configuration: Env-driven for Cloud Deployment (Render/Railway), with LAN fallback
 // ---------------------------------------------------------------------------
-const API_BASE_URL = "http://192.168.0.138:8000";
+const API_BASE_URL = (
+  process.env.EXPO_PUBLIC_API_URL || "http://192.168.0.138:8000"
+).replace(/\/+$/, "");
+const APP_API_KEY = (process.env.EXPO_PUBLIC_APP_API_KEY || "").trim();
 const REQUEST_TIMEOUT_MS = 90_000;
 
 type BoardMode = "auto" | "whiteboard" | "pdf_overlay";
@@ -96,12 +101,18 @@ function formatBidiArabicCaption(text: string): string {
   );
 }
 
-function requestJson<T>(url: string, timeoutMs: number): Promise<T> {
+function requestJson<T>(
+  url: string,
+  timeoutMs: number = REQUEST_TIMEOUT_MS
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("GET", url);
     xhr.timeout = timeoutMs;
     xhr.setRequestHeader("Accept", "application/json");
+    if (APP_API_KEY) {
+      xhr.setRequestHeader("X-App-Key", APP_API_KEY);
+    }
 
     xhr.onload = () => {
       const rawText = xhr.responseText ?? "";
@@ -156,6 +167,74 @@ function requestJson<T>(url: string, timeoutMs: number): Promise<T> {
   });
 }
 
+function postJson<T>(
+  url: string,
+  body: Record<string, unknown>,
+  timeoutMs: number = REQUEST_TIMEOUT_MS
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.timeout = timeoutMs;
+    xhr.setRequestHeader("Accept", "application/json");
+    xhr.setRequestHeader("Content-Type", "application/json");
+    if (APP_API_KEY) {
+      xhr.setRequestHeader("X-App-Key", APP_API_KEY);
+    }
+
+    xhr.onload = () => {
+      const rawText = xhr.responseText ?? "";
+      let payload: unknown;
+      try {
+        payload = JSON.parse(rawText);
+      } catch {
+        reject(
+          new Error(
+            `Unexpected non-JSON response (HTTP ${xhr.status}): ${rawText.slice(0, 140)}`
+          )
+        );
+        return;
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(payload as T);
+        return;
+      }
+
+      const detail =
+        typeof payload === "object" &&
+          payload !== null &&
+          "detail" in payload &&
+          typeof (payload as { detail: unknown }).detail === "string"
+          ? (payload as { detail: string }).detail
+          : `Server error (HTTP ${xhr.status})`;
+      reject(new Error(detail));
+    };
+
+    xhr.onerror = () => {
+      reject(
+        new Error(
+          `Network request failed. Verify API_BASE_URL (${API_BASE_URL}) and connection.`
+        )
+      );
+    };
+
+    xhr.ontimeout = () => {
+      reject(
+        new Error(
+          `Request timed out after ${timeoutMs / 1000}s. Verify API_BASE_URL (${API_BASE_URL}) and server status.`
+        )
+      );
+    };
+
+    xhr.onabort = () => {
+      reject(new Error("Request was aborted."));
+    };
+
+    xhr.send(JSON.stringify(body));
+  });
+}
+
 function TutorWorkspace() {
   const insets = useSafeAreaInsets();
 
@@ -178,6 +257,11 @@ function TutorWorkspace() {
   const [recentError, setRecentError] = useState<string | null>(null);
   const [recentLectures, setRecentLectures] = useState<LectureSummary[]>([]);
   const [supabaseConfigured, setSupabaseConfigured] = useState<boolean>(true);
+
+  // Interactive Slide Q&A ("Ask the Professor") State
+  const [askExpanded, setAskExpanded] = useState<boolean>(false);
+  const [askInput, setAskInput] = useState<string>("");
+  const [askLoading, setAskLoading] = useState<boolean>(false);
 
   // Audio-Visual Sync Engine State (expo-audio at 50ms update cadence for smooth progressive drawing)
   const player = useAudioPlayer(null, { updateInterval: 50 });
@@ -433,21 +517,21 @@ function TutorWorkspace() {
     }
   };
 
-  const activateSlideResponse = async (data: ExplainSlideWithAudioResponse) => {
-    if (!data.plan?.steps?.length) {
-      throw new Error("Server returned a LecturePlan with zero steps.");
-    }
-
-    // Pre-cache all step MP3 files to FileSystem.cacheDirectory upfront before playback starts
+  const preCacheStepAudios = async (
+    targetSteps: TeachingStep[],
+    audioPayloads?: StepAudioPayload[]
+  ): Promise<Array<string | null>> => {
     const cacheSessionId = ++cacheSessionRef.current;
+    const batchTs = Date.now();
     const cacheDir = FileSystem.cacheDirectory;
-    const cachedUris = await Promise.all(
-      data.plan.steps.map(async (step, idx): Promise<string | null> => {
+
+    return Promise.all(
+      targetSteps.map(async (step, idx): Promise<string | null> => {
         if (!cacheDir) return null;
-        const byIndex = data.step_audio?.[idx];
+        const byIndex = audioPayloads?.[idx];
         const rawBase64 =
           byIndex?.audio_base64 ??
-          data.step_audio?.find((item) => item.step_id === step.step_id)
+          audioPayloads?.find((item) => item.step_id === step.step_id)
             ?.audio_base64 ??
           null;
         if (!rawBase64) return null;
@@ -456,7 +540,8 @@ function TutorWorkspace() {
           const cleanBase64 = rawBase64.includes("base64,")
             ? rawBase64.split("base64,")[1]
             : rawBase64;
-          const fileUri = `${cacheDir}slide_${cacheSessionId}_step_${step.step_id}_${idx}.mp3`;
+          // Unique timestamped filename prevents iOS AVPlayer from playing stale cached audio
+          const fileUri = `${cacheDir}step_${step.step_id}_${idx}_${cacheSessionId}_${batchTs}.mp3`;
           await FileSystem.writeAsStringAsync(fileUri, cleanBase64, {
             encoding: FileSystem.EncodingType.Base64,
           });
@@ -470,7 +555,20 @@ function TutorWorkspace() {
         }
       })
     );
+  };
 
+  const activateSlideResponse = async (data: ExplainSlideWithAudioResponse) => {
+    if (!data.plan?.steps?.length) {
+      throw new Error("Server returned a LecturePlan with zero steps.");
+    }
+
+    const cachedUris = await preCacheStepAudios(
+      data.plan.steps,
+      data.step_audio
+    );
+
+    setAskExpanded(false);
+    setAskInput("");
     shouldAutoPlayRef.current = true;
     advancedFromStepRef.current = 0;
     setIsPlaying(Boolean(cachedUris[0]));
@@ -480,13 +578,110 @@ function TutorWorkspace() {
     setReplayToken((t) => t + 1);
   };
 
+  const handleAskQuestion = async () => {
+    if (!result || askLoading) return;
+    const cleanedQuestion = askInput.trim();
+    if (!cleanedQuestion) return;
+
+    Keyboard.dismiss();
+    setAskLoading(true);
+    setError(null);
+
+    // Pause active narration while fetching the professor's answer
+    shouldAutoPlayRef.current = false;
+    setIsPlaying(false);
+    try {
+      player.pause();
+    } catch {
+      // Ignore if idle
+    }
+
+    try {
+      const existingSteps = result.plan.steps;
+      const contextLines = [
+        `Slide Title: ${result.plan.title}`,
+        ...existingSteps
+          .slice(-6)
+          .map((s) => `Step ${s.step_id}: ${s.speech_ar}`),
+      ];
+      const currentPlanContext = contextLines.join("\n").slice(0, 1800);
+
+      const qaData = await postJson<ExplainSlideWithAudioResponse>(
+        `${API_BASE_URL}/api/ask`,
+        {
+          lecture_id: result.lecture_id ?? null,
+          page_number: result.page_number,
+          question: cleanedQuestion,
+          board_mode: boardMode,
+          current_plan_context: currentPlanContext,
+        },
+        REQUEST_TIMEOUT_MS
+      );
+
+      if (!qaData.plan?.steps?.length) {
+        throw new Error("Server returned an empty Q&A explanation.");
+      }
+
+      // Renumber incoming Q&A step_ids sequentially after existing steps for clean canvas keys
+      const startIndex = existingSteps.length;
+      const renumberedSteps: TeachingStep[] = qaData.plan.steps.map(
+        (step, idx) => ({
+          ...step,
+          step_id: startIndex + idx + 1,
+        })
+      );
+      const alignedAudioPayloads: StepAudioPayload[] = renumberedSteps.map(
+        (step, idx) => ({
+          step_id: step.step_id,
+          audio_base64: qaData.step_audio?.[idx]?.audio_base64 ?? null,
+        })
+      );
+
+      const newCachedUris = await preCacheStepAudios(
+        renumberedSteps,
+        alignedAudioPayloads
+      );
+
+      setAskInput("");
+      setAskExpanded(false);
+      shouldAutoPlayRef.current = true;
+      advancedFromStepRef.current = startIndex;
+      setIsPlaying(Boolean(newCachedUris[0]));
+
+      setResult((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          plan: {
+            ...prev.plan,
+            steps: [...prev.plan.steps, ...renumberedSteps],
+            quiz_question_ar:
+              qaData.plan.quiz_question_ar || prev.plan.quiz_question_ar,
+          },
+          step_audio: [
+            ...(prev.step_audio ?? []),
+            ...alignedAudioPayloads,
+          ],
+        };
+      });
+      setStepAudioUris((prev) => [...prev, ...newCachedUris]);
+      setStepIndex(startIndex);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to answer question."
+      );
+    } finally {
+      setAskLoading(false);
+    }
+  };
+
   const fetchRecentLectures = async () => {
     setRecentLoading(true);
     setRecentError(null);
     try {
       const payload = await requestJson<RecentLecturesResponse>(
         `${API_BASE_URL}/api/lectures`,
-        15_000
+        REQUEST_TIMEOUT_MS
       );
       setRecentLectures(payload.lectures ?? []);
       setSupabaseConfigured(payload.supabase_configured ?? false);
@@ -530,7 +725,10 @@ function TutorWorkspace() {
         `/pages/${cachedPage.page_number}` +
         `?board_mode=${encodeURIComponent(cachedPage.board_mode)}` +
         `&use_deep_model=${String(cachedPage.use_deep_model)}`;
-      const data = await requestJson<ExplainSlideWithAudioResponse>(url, 30_000);
+      const data = await requestJson<ExplainSlideWithAudioResponse>(
+        url,
+        REQUEST_TIMEOUT_MS
+      );
       await activateSlideResponse(data);
     } catch (err) {
       setError(
@@ -585,6 +783,9 @@ function TutorWorkspace() {
           xhr.timeout = REQUEST_TIMEOUT_MS;
           // IMPORTANT: Do NOT set Content-Type manually; XHR must generate the multipart boundary
           xhr.setRequestHeader("Accept", "application/json");
+          if (APP_API_KEY) {
+            xhr.setRequestHeader("X-App-Key", APP_API_KEY);
+          }
 
           xhr.onload = () => {
             const rawText = xhr.responseText ?? "";
@@ -654,7 +855,14 @@ function TutorWorkspace() {
 
   const topHudInset = insets.top + 62;
   const bottomHudInset =
-    insets.bottom + (result && currentStep && showCaptions ? 174 : 84);
+    insets.bottom +
+    (result && currentStep && showCaptions
+      ? askExpanded
+        ? 236
+        : 184
+      : askExpanded
+        ? 144
+        : 118);
 
   const activeDocLabel = pdfFile
     ? pdfFile.name.replace(/\.pdf$/i, "")
@@ -846,11 +1054,14 @@ function TutorWorkspace() {
       )}
 
       {/* ================================================================= */}
-      {/* LAYER 2: Collapsible Compact Captions Strip (Above Bottom Dock)   */}
+      {/* LAYER 2: Collapsible Compact Captions Strip (Above Ask + Dock)    */}
       {/* ================================================================= */}
       {result && currentStep && showCaptions && (
         <View
-          style={[styles.captionStripCard, { bottom: insets.bottom + 72 }]}
+          style={[
+            styles.captionStripCard,
+            { bottom: insets.bottom + (askExpanded ? 132 : 114) },
+          ]}
         >
           <ScrollView
             style={styles.captionScroll}
@@ -869,6 +1080,64 @@ function TutorWorkspace() {
             )}
           </ScrollView>
         </View>
+      )}
+
+      {/* ================================================================= */}
+      {/* LAYER 2B: Collapsible "Ask Anything..." Spatial Pill              */}
+      {/* ================================================================= */}
+      {result && currentStep && !loading && (
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          pointerEvents="box-none"
+          style={[styles.askOverlayWrap, { bottom: insets.bottom + 72 }]}
+        >
+          {askExpanded ? (
+            <View style={styles.askExpandedPill}>
+              <TextInput
+                value={askInput}
+                onChangeText={setAskInput}
+                placeholder="Ask anything about this slide..."
+                placeholderTextColor="#94A3B8"
+                style={styles.askTextInput}
+                returnKeyType="send"
+                editable={!askLoading}
+                autoFocus
+                onSubmitEditing={() => void handleAskQuestion()}
+              />
+              <Pressable
+                style={[
+                  styles.askSendBtn,
+                  (!askInput.trim() || askLoading) && styles.dockDisabled,
+                ]}
+                onPress={() => void handleAskQuestion()}
+                disabled={!askInput.trim() || askLoading}
+              >
+                {askLoading ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.askSendBtnText}>↑</Text>
+                )}
+              </Pressable>
+              <Pressable
+                style={styles.askCloseBtn}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  setAskExpanded(false);
+                }}
+                disabled={askLoading}
+              >
+                <Text style={styles.askCloseBtnText}>✕</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <Pressable
+              style={styles.askCollapsedPill}
+              onPress={() => setAskExpanded(true)}
+            >
+              <Text style={styles.askCollapsedText}>✦ Ask anything...</Text>
+            </Pressable>
+          )}
+        </KeyboardAvoidingView>
       )}
 
       {/* ================================================================= */}
@@ -1393,6 +1662,83 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     textAlign: "right",
     writingDirection: "rtl",
+  },
+
+  // Collapsible "Ask Anything..." Spatial Pill
+  askOverlayWrap: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    zIndex: 28,
+    alignItems: "flex-start",
+  },
+  askCollapsedPill: {
+    backgroundColor: "rgba(255, 255, 255, 0.94)",
+    borderWidth: 1,
+    borderColor: "#E7E2D9",
+    borderRadius: 999,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  askCollapsedText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1E293B",
+  },
+  askExpandedPill: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.98)",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 999,
+    paddingLeft: 14,
+    paddingRight: 6,
+    paddingVertical: 5,
+    gap: 6,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.14,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
+  },
+  askTextInput: {
+    flex: 1,
+    fontSize: 13.5,
+    color: "#0F172A",
+    paddingVertical: 6,
+  },
+  askSendBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#18181B",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  askSendBtnText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  askCloseBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  askCloseBtnText: {
+    color: "#475569",
+    fontSize: 12,
+    fontWeight: "800",
   },
 
   // Bottom Floating Dark Pill Bar
