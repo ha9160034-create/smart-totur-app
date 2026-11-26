@@ -130,6 +130,10 @@ const DIAGRAM_EDGE_DRAW_MS = 400;
 const DIAGRAM_EDGE_DELAY_MS = 140;
 const DIAGRAM_MIN_NODE_W = 76; // Safeguard #1: minimum readable node width on narrow phones
 const DIAGRAM_MIN_NODE_H = 38; // Safeguard #1: minimum readable node height on narrow phones
+const DIAGRAM_MIN_GAP_Y = 38; // Stage 12: guaranteed vertical arrow/label channel between siblings
+const DIAGRAM_MIN_GAP_X = 34; // Stage 12: guaranteed horizontal arrow/label channel between siblings
+const DIAGRAM_DIAGONAL_GAP_X = 28; // Stage 12 Safeguard #2: diagonal staircase corner-proximity X guard
+const DIAGRAM_DIAGONAL_GAP_Y = 32; // Stage 12 Safeguard #2: diagonal staircase corner-proximity Y guard
 const HANDWRITTEN_WIDTH_FACTOR = 1.12; // PlaypenSansArabic / PatrickHand glyph advance factor
 
 const FONT_AR_REGULAR = "PlaypenSansArabic-Regular";
@@ -947,19 +951,13 @@ function resolveWhiteboardBlocks(
   let bandSlots = new Map<WhiteboardSlot, WhiteboardBlock>();
   let latestBySlot = new Map<WhiteboardSlot, WhiteboardBlock>();
 
-  const resetBoard = () => {
-    blocks = [];
-    currentBand = 0;
-    bandSlots = new Map();
-    latestBySlot = new Map();
-  };
-
   for (let i = 0; i <= currentStepIndex; i++) {
     const step = safeSteps[i];
     if (!step) continue;
 
+    // Zero-Wipe Infinite Canvas: never erase previously drawn whiteboard blocks
+    // when stepping across interleaved pdf_overlay steps or legacy clear_board actions
     if (step.mode !== "whiteboard") {
-      resetBoard();
       continue;
     }
 
@@ -970,7 +968,6 @@ function resolveWhiteboardBlocks(
       const action = actions[j];
       if (!action) continue;
       if (action.type === "clear_board") {
-        resetBoard();
         continue;
       }
 
@@ -1250,20 +1247,16 @@ function computeDiagramMetrics(
   const rawEdges = Array.isArray(action.edges) ? action.edges : [];
 
   const innerAvailW = Math.max(260, availableWidth - DIAGRAM_CANVAS_BLEED * 2);
-  // Wide multi-column diagrams get a comfortable minimum canvas width with smooth horizontal scroll on tiny phones
-  const minReadableWidth = rawNodes.length >= 7 ? 380 : 300;
-  const needsHorizontalScroll = minReadableWidth > innerAvailW;
-  const diagramWidth = needsHorizontalScroll ? minReadableWidth : innerAvailW;
+  let diagramWidth = innerAvailW;
 
   const aspect = Math.max(
     0.65,
     Math.min(1.5, Number.isFinite(action.diagram_aspect) ? Number(action.diagram_aspect) : 0.85)
   );
-  let diagramHeight = Math.max(260, Math.round(diagramWidth * aspect));
-
+  const initialWorkingH = Math.max(260, Math.round(diagramWidth * aspect));
   const bleed = DIAGRAM_CANVAS_BLEED;
 
-  // 1. Map every 0..1000 node rect into pixel coordinates enforcing minW=76, minH=38 (Safeguard #1)
+  // 1. Project 0..1000 node rects into initial pixel coordinates enforcing minW=76, minH=38
   const rectById = new Map<string, RectFrame>();
   const nodeById = new Map<string, DiagramNode>();
 
@@ -1274,84 +1267,248 @@ function computeDiagramMetrics(
     const wPct = Math.max(40, Math.min(1000 - xPct, Number(node.w) || 120));
     const hPct = Math.max(40, Math.min(1000 - yPct, Number(node.h) || 80));
 
-    let pxW = Math.max(DIAGRAM_MIN_NODE_W, (wPct / 1000) * diagramWidth);
-    let pxH = Math.max(DIAGRAM_MIN_NODE_H, (hPct / 1000) * diagramHeight);
-    pxW = Math.min(pxW, diagramWidth);
-    pxH = Math.min(pxH, diagramHeight);
-
-    let pxX = bleed + (xPct / 1000) * diagramWidth;
-    let pxY = bleed + (yPct / 1000) * diagramHeight;
-
-    // Clamp inside diagram canvas bounds so boxes never overflow right/bottom edges
-    pxX = Math.max(bleed, Math.min(bleed + diagramWidth - pxW, pxX));
-    pxY = Math.max(bleed, Math.min(bleed + diagramHeight - pxH, pxY));
+    const pxW = Math.min(diagramWidth, Math.max(DIAGRAM_MIN_NODE_W, (wPct / 1000) * diagramWidth));
+    const pxH = Math.max(DIAGRAM_MIN_NODE_H, (hPct / 1000) * initialWorkingH);
+    const pxX = bleed + (xPct / 1000) * diagramWidth;
+    const pxY = bleed + (yPct / 1000) * initialWorkingH;
 
     rectById.set(node.id, { x: pxX, y: pxY, width: pxW, height: pxH });
     nodeById.set(node.id, node);
   }
 
-  // 2. Auto-Fit Enclosing Containers (Safeguard #1):
-  // Expand every "container" node to enclose the union bbox of all child nodes referencing
-  // its parent_id (+34px top header clearance, +14px side/bottom padding). Run 2 passes for nested containers.
+  // Build parent -> direct children lookup (cycle-safe)
   const childrenByParent = new Map<string, string[]>();
+  const validParentById = new Map<string, string>();
   for (const node of rawNodes) {
     if (node?.parent_id && rectById.has(node.parent_id) && node.parent_id !== node.id) {
+      validParentById.set(node.id, node.parent_id);
       const list = childrenByParent.get(node.parent_id) ?? [];
       list.push(node.id);
       childrenByParent.set(node.parent_id, list);
     }
   }
 
-  for (let pass = 0; pass < 2; pass++) {
-    for (const node of rawNodes) {
-      if (!node || node.kind !== "container") continue;
-      const childIds = childrenByParent.get(node.id);
-      if (!childIds || childIds.length === 0) continue;
-
-      const cRect = rectById.get(node.id);
-      if (!cRect) continue;
-
-      let minX = Infinity;
-      let minY = Infinity;
-      let maxX = -Infinity;
-      let maxY = -Infinity;
-      for (const cid of childIds) {
-        const cr = rectById.get(cid);
-        if (!cr) continue;
-        minX = Math.min(minX, cr.x);
-        minY = Math.min(minY, cr.y);
-        maxX = Math.max(maxX, cr.x + cr.width);
-        maxY = Math.max(maxY, cr.y + cr.height);
+  const collectSubtreeIds = (rootId: string): string[] => {
+    const out: string[] = [];
+    const stack = [rootId];
+    const seen = new Set<string>();
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      out.push(cur);
+      for (const cid of childrenByParent.get(cur) ?? []) {
+        if (!seen.has(cid)) stack.push(cid);
       }
+    }
+    return out;
+  };
 
-      if (!Number.isFinite(minX)) continue;
-
-      const padSide = 14;
-      const padTop = 34; // Top header clearance for container title pill
-      const padBottom = 14;
-
-      const targetLeft = Math.max(bleed, Math.min(cRect.x, minX - padSide));
-      const targetTop = Math.max(bleed, Math.min(cRect.y, minY - padTop));
-      const targetRight = Math.min(
-        bleed + diagramWidth,
-        Math.max(cRect.x + cRect.width, maxX + padSide)
-      );
-      const targetBottom = Math.max(cRect.y + cRect.height, maxY + padBottom);
-
-      if (targetBottom > bleed + diagramHeight) {
-        diagramHeight = Math.ceil(targetBottom - bleed);
+  const shiftSubtree = (rootId: string, dx: number, dy: number) => {
+    if (dx === 0 && dy === 0) return;
+    for (const id of collectSubtreeIds(rootId)) {
+      const r = rectById.get(id);
+      if (r) {
+        r.x += dx;
+        r.y += dy;
       }
+    }
+  };
 
-      rectById.set(node.id, {
-        x: targetLeft,
-        y: targetTop,
-        width: Math.max(DIAGRAM_MIN_NODE_W, targetRight - targetLeft),
-        height: Math.max(DIAGRAM_MIN_NODE_H, targetBottom - targetTop),
-      });
+  /**
+   * Enforces minimum sibling gaps (minGapY=38px, minGapX=34px) PLUS diagonal
+   * corner-proximity guard (horizontalGap < 28 && verticalGap < 32 -> push down
+   * to a.y + a.height + 38px) across a set of sibling ids, shifting rigid subtrees together.
+   */
+  const enforceSiblingGaps = (siblingIds: string[], moveSubtrees: boolean) => {
+    if (siblingIds.length < 2) return;
+
+    // Pass A: Vertical gap + diagonal corner-proximity guard (top-to-bottom)
+    const byTop = [...siblingIds].sort((idA, idB) => {
+      const a = rectById.get(idA)!;
+      const b = rectById.get(idB)!;
+      return a.y !== b.y ? a.y - b.y : a.x - b.x;
+    });
+
+    for (let i = 0; i < byTop.length; i++) {
+      const a = rectById.get(byTop[i])!;
+      for (let j = i + 1; j < byTop.length; j++) {
+        const bId = byTop[j];
+        const b = rectById.get(bId)!;
+        const horizontalGap = Math.max(b.x - (a.x + a.width), a.x - (b.x + b.width));
+        const verticalGap = b.y - (a.y + a.height);
+
+        const overlapsHorizontally = horizontalGap < -8;
+        const diagonalCornerClose =
+          horizontalGap < DIAGRAM_DIAGONAL_GAP_X &&
+          verticalGap < DIAGRAM_DIAGONAL_GAP_Y &&
+          verticalGap >= -Math.min(a.height, b.height) * 0.45;
+
+        if (
+          (overlapsHorizontally && verticalGap < DIAGRAM_MIN_GAP_Y) ||
+          diagonalCornerClose
+        ) {
+          const dy = a.y + a.height + DIAGRAM_MIN_GAP_Y - b.y;
+          if (dy > 0) {
+            if (moveSubtrees) {
+              shiftSubtree(bId, 0, dy);
+            } else {
+              b.y += dy;
+            }
+          }
+        }
+      }
+    }
+
+    // Pass B: Horizontal gap enforcement (left-to-right for vertically overlapping siblings)
+    const byLeft = [...siblingIds].sort((idA, idB) => {
+      const a = rectById.get(idA)!;
+      const b = rectById.get(idB)!;
+      return a.x !== b.x ? a.x - b.x : a.y - b.y;
+    });
+
+    for (let i = 0; i < byLeft.length; i++) {
+      const a = rectById.get(byLeft[i])!;
+      for (let j = i + 1; j < byLeft.length; j++) {
+        const bId = byLeft[j];
+        const b = rectById.get(bId)!;
+        const verticalOverlap =
+          Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+        if (verticalOverlap > 8) {
+          const horizontalGap = b.x - (a.x + a.width);
+          if (horizontalGap < DIAGRAM_MIN_GAP_X) {
+            const dx = a.x + a.width + DIAGRAM_MIN_GAP_X - b.x;
+            if (dx > 0) {
+              if (moveSubtrees) {
+                shiftSubtree(bId, dx, 0);
+              } else {
+                b.x += dx;
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // Helper: Auto-Fit every "container" node around the union bbox of its direct children
+  // (+34px top header clearance, +14px side/bottom padding; 2 passes for nested containers)
+  const autoFitContainers = () => {
+    for (let pass = 0; pass < 2; pass++) {
+      for (const node of rawNodes) {
+        if (!node || node.kind !== "container") continue;
+        const childIds = childrenByParent.get(node.id);
+        if (!childIds || childIds.length === 0) continue;
+
+        const cRect = rectById.get(node.id);
+        if (!cRect) continue;
+
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const cid of childIds) {
+          const cr = rectById.get(cid);
+          if (!cr) continue;
+          minX = Math.min(minX, cr.x);
+          minY = Math.min(minY, cr.y);
+          maxX = Math.max(maxX, cr.x + cr.width);
+          maxY = Math.max(maxY, cr.y + cr.height);
+        }
+        if (!Number.isFinite(minX)) continue;
+
+        const padSide = 14;
+        const padTop = 34; // Top header clearance for container title pill
+        const padBottom = 14;
+
+        const targetLeft = minX - padSide;
+        const targetTop = minY - padTop;
+        const targetRight = maxX + padSide;
+        const targetBottom = maxY + padBottom;
+
+        rectById.set(node.id, {
+          x: targetLeft,
+          y: targetTop,
+          width: Math.max(DIAGRAM_MIN_NODE_W, targetRight - targetLeft),
+          height: Math.max(DIAGRAM_MIN_NODE_H, targetBottom - targetTop),
+        });
+      }
+    }
+  };
+
+  // 2. Inner-sibling gap solver (per enclosing parent container)
+  for (const [, childIds] of childrenByParent.entries()) {
+    const nonContainerChildren = childIds.filter(
+      (cid) => nodeById.get(cid)?.kind !== "container"
+    );
+    enforceSiblingGaps(nonContainerChildren, false);
+  }
+
+  // 3. Auto-fit enclosing containers tightly around their spaced children
+  autoFitContainers();
+
+  // 4. Top-level rigid-subtree gap solver (shifts root containers + children together)
+  const topLevelIds = rawNodes
+    .filter((n) => n && rectById.has(n.id) && !validParentById.has(n.id))
+    .map((n) => n.id);
+  enforceSiblingGaps(topLevelIds, true);
+  autoFitContainers();
+
+  // 5. Full-Width Normalization (94% Auto-Fill) + Top Whitespace Trim
+  const allRects = Array.from(rectById.values());
+  let needsHorizontalScroll = false;
+
+  if (allRects.length > 0) {
+    let unionMinX = Infinity;
+    let unionMaxX = -Infinity;
+    let unionMinY = Infinity;
+    for (const r of allRects) {
+      unionMinX = Math.min(unionMinX, r.x);
+      unionMaxX = Math.max(unionMaxX, r.x + r.width);
+      unionMinY = Math.min(unionMinY, r.y);
+    }
+
+    // Remove dead whitespace above the topmost node
+    const topTargetY = bleed + 10;
+    const shiftY = topTargetY - unionMinY;
+    if (Math.abs(shiftY) > 0.5) {
+      for (const r of allRects) {
+        r.y += shiftY;
+      }
+    }
+
+    const unionSpanW = Math.max(1, unionMaxX - unionMinX);
+    if (unionSpanW > innerAvailW * 1.06) {
+      // Wide multi-cycle diagram on narrow phone: preserve readable boxes & 34px gaps via horizontal scroll
+      diagramWidth = Math.ceil(unionSpanW / 0.94);
+      needsHorizontalScroll = true;
+      const targetLeft = bleed + diagramWidth * 0.03;
+      const shiftX = targetLeft - unionMinX;
+      for (const r of allRects) {
+        r.x += shiftX;
+      }
+    } else {
+      // Normalize union width cleanly across 94% of diagramWidth so right half is never empty
+      const targetSpanW = diagramWidth * 0.94;
+      const targetLeft = bleed + diagramWidth * 0.03;
+      const scaleX = targetSpanW / unionSpanW;
+      for (const r of allRects) {
+        r.x = targetLeft + (r.x - unionMinX) * scaleX;
+        r.width = Math.max(DIAGRAM_MIN_NODE_W, r.width * scaleX);
+      }
+      // Keep container bounds tight after horizontal normalization
+      autoFitContainers();
     }
   }
 
-  // 3. Separate containers (Layer 1) vs inner boxes/pills/decisions (Layer 2)
+  // 6. Shrink-Wrapped Diagram Height: maxBottomOfAllNodes + 28px (zero rigid blank bottom)
+  let maxBottom = bleed + 160;
+  for (const r of rectById.values()) {
+    maxBottom = Math.max(maxBottom, r.y + r.height);
+  }
+  const diagramHeight = Math.max(180, Math.ceil(maxBottom - bleed + 28));
+
+  // 7. Separate containers (Layer 1) vs inner boxes/pills/decisions (Layer 2)
   const containers: ResolvedDiagramNode[] = [];
   const innerNodes: ResolvedDiagramNode[] = [];
   for (const node of rawNodes) {
@@ -1416,7 +1573,7 @@ function computeDiagramMetrics(
   const sortedInner = [...topoInner, ...remaining];
   const orderedNodes = [...containers, ...sortedInner];
 
-  // 4. Resolve valid edges & compute automatic opposite curveOffsets for bidirectional pairs
+  // 8. Resolve valid edges AFTER final normalized coordinates & compute bidirectional curveOffsets
   const validEdges = rawEdges.filter(
     (e) => e && rectById.has(e.from_id) && rectById.has(e.to_id) && e.from_id !== e.to_id
   );
@@ -4309,25 +4466,57 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   );
                 })}
 
-                {/* Hand-Drawn Cause-and-Effect Connector Arrows (75% -> 100% of stepProgress) */}
+                {/* Strictly Vertical Gap Connectors Between Consecutive Stacked Cards (Zero Cross-Card Diagonals) */}
                 {arrowBlocks.map((block) => {
                   const fromRect = blockRects.get(block.connectFromBlockId!);
                   const toRect = blockRects.get(block.blockId);
                   if (!fromRect || !toRect) return null;
+
+                  // Restrict strictly to clean vertical gaps between consecutive vertically stacked cards
+                  const fromBottom = fromRect.y + fromRect.height;
+                  const toTop = toRect.y;
+                  const verticalGap = toTop - fromBottom;
+                  if (verticalGap < 12 || verticalGap > 52) return null;
+
+                  const overlapStart = Math.max(fromRect.x, toRect.x);
+                  const overlapEnd = Math.min(
+                    fromRect.x + fromRect.width,
+                    toRect.x + toRect.width
+                  );
+                  if (overlapEnd - overlapStart < 48) return null;
+
+                  // Ensure no intervening card sits inside the vertical channel
+                  const sharedCx = (overlapStart + overlapEnd) / 2;
+                  const hasInterveningBlock = wbBlocks.some((other) => {
+                    if (
+                      other.blockId === block.blockId ||
+                      other.blockId === block.connectFromBlockId
+                    ) {
+                      return false;
+                    }
+                    const oRect = blockRects.get(other.blockId);
+                    if (!oRect) return false;
+                    const hitsY = oRect.y < toTop && oRect.y + oRect.height > fromBottom;
+                    const hitsX = sharedCx >= oRect.x - 8 && sharedCx <= oRect.x + oRect.width + 8;
+                    return hitsY && hitsX;
+                  });
+                  if (hasInterveningBlock) return null;
+
                   const primary = block.items[0].action;
                   const token = getColorToken(primary.color);
+                  const anchorX = sharedCx - 10 + gridOverscan;
 
                   return (
                     <AnimatedArrowPath
                       key={`arrow-${block.blockId}`}
-                      fromX={fromRect.x + gridOverscan}
-                      fromY={fromRect.y + gridOverscan}
-                      fromW={fromRect.width}
-                      fromH={fromRect.height}
-                      toX={toRect.x + gridOverscan}
-                      toY={toRect.y + gridOverscan}
-                      toW={toRect.width}
-                      toH={toRect.height}
+                      fromX={anchorX}
+                      fromY={fromBottom - 3 + gridOverscan}
+                      fromW={20}
+                      fromH={2}
+                      toX={anchorX}
+                      toY={toTop + 1 + gridOverscan}
+                      toW={20}
+                      toH={2}
                       seed={hashSeed(`arrow-${block.blockId}`)}
                       strokeColor={token.stroke}
                       animate={block.createdAtStepIdx === safeIndex}

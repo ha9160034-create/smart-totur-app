@@ -302,13 +302,14 @@ def _chunk_page_text(
 def _sanitize_plan(
     plan: LecturePlan,
     board_mode: BoardMode,
-    strip_clear_board: bool = False,
+    strip_clear_board: bool = True,
 ) -> LecturePlan:
     """
     Fix minor geometric/field slips from fast models without changing the schema:
     - Ensure bounding boxes satisfy ymin <= ymax and xmin <= xmax.
     - Strip mismatched bbox/slot fields so Skia renderer never receives conflicting hints.
-    - When strip_clear_board=True (Q&A no-wipe mode), drop stray clear_board actions if other actions exist.
+    - Enforce Zero-Wipe Cumulative Whiteboard: strip stray clear_board actions in whiteboard/auto mode
+      so earlier cards, diagrams, and tables never vanish mid-lecture.
     """
     pdf_action_types = {"pdf_highlight", "pdf_circle"}
     wb_action_types = {
@@ -322,11 +323,13 @@ def _sanitize_plan(
         "wb_diagram",
     }
 
+    enforce_zero_wipe = strip_clear_board or board_mode in ("whiteboard", "auto")
+
     for step in plan.steps:
         if board_mode in ("whiteboard", "pdf_overlay"):
             step.mode = board_mode
 
-        if strip_clear_board and step.mode == "whiteboard":
+        if enforce_zero_wipe and step.mode == "whiteboard":
             non_clear = [a for a in step.actions if a.type != "clear_board"]
             if non_clear:
                 step.actions = non_clear

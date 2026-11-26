@@ -141,12 +141,12 @@ class VisualAction(BaseModel):
 
     nodes: Optional[List[DiagramNode]] = Field(
         default=None,
-        description="REQUIRED for wb_diagram actions: 2 to 14 DiagramNode objects positioned in 0..1000 space."
+        description="REQUIRED for wb_diagram actions: 2 to 18 DiagramNode objects positioned in 0..1000 space."
     )
 
     edges: Optional[List[DiagramEdge]] = Field(
         default=None,
-        description="Optional directed DiagramEdge connectors (0 to 18) referencing valid node ids."
+        description="Optional directed DiagramEdge connectors (0 to 24) referencing valid node ids."
     )
 
     @model_validator(mode="after")
@@ -218,7 +218,7 @@ class VisualAction(BaseModel):
                         tint=node.tint,
                     )
                 )
-                if len(cleaned_nodes) >= 14:
+                if len(cleaned_nodes) >= 18:
                     break
 
             if len(cleaned_nodes) < 2:
@@ -245,7 +245,7 @@ class VisualAction(BaseModel):
                             dashed=bool(edge.dashed),
                         )
                     )
-                    if len(cleaned_edges) >= 18:
+                    if len(cleaned_edges) >= 24:
                         break
 
             aspect = 0.85 if self.diagram_aspect is None else float(self.diagram_aspect)
