@@ -23,6 +23,7 @@ import Animated, {
   useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
+  withDelay,
   withSpring,
   withTiming,
 } from "react-native-reanimated";
@@ -99,7 +100,14 @@ const PAPER_GRID_COLOR = "rgba(148, 138, 122, 0.17)";
 const MIN_SCALE = 0.6;
 const MAX_SCALE = 3.0;
 const MIN_TABLE_COL_WIDTH = 105;
-const WORD_SYNC_REVEAL_WINDOW_MS = 280;
+const TABLE_CANVAS_BLEED = 8; // >= 6px bleed on all sides so 3-4px corner overshoots & double-strokes never clip
+const WORD_SYNC_REVEAL_WINDOW_MS = 240;
+const WORD_SYNC_LEAD_MS = 150; // Leading edge so visuals arrive slightly ahead of speech
+const CARD_BORDER_DRAW_MS = 480;
+const TABLE_GRID_DRAW_MS = 580;
+const ARROW_DRAW_DELAY_MS = 320;
+const ARROW_DRAW_MS = 440;
+const PDF_STROKE_DRAW_MS = 460;
 
 const CODE_FONT_FAMILY = Platform.select({
   ios: "Menlo",
@@ -367,6 +375,68 @@ function computeItemTriggerMsList(
   return results;
 }
 
+/**
+ * Computes per-annotation spoken trigger timestamps (ms) for pdf_circle / pdf_highlight
+ * actions in a single step so multiple annotations fire on cue as each term is spoken
+ * instead of simultaneously at t = 0.
+ */
+function computePdfActionTriggerMsList(
+  pdfActions: VisualAction[],
+  step: TeachingStep | undefined,
+  wordTimings?: WordTiming[]
+): Array<number | null> {
+  const count = pdfActions.length;
+  if (count === 0) return [];
+  if (count === 1) return [0];
+
+  const hasTimings = Array.isArray(wordTimings) && wordTimings.length > 0;
+  if (!hasTimings) {
+    return pdfActions.map(() => null);
+  }
+
+  const enTerms = Array.isArray(step?.en_terms)
+    ? step!.en_terms.filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+    : [];
+
+  // Build search hints for each PDF action (prefer explicit action.text, then sequential en_terms)
+  const hintTexts = pdfActions.map((action, idx) => {
+    const actionText = normalizeBlockText(action.text);
+    if (actionText.length > 0) return actionText;
+    if (enTerms.length >= count) {
+      const start = Math.floor((idx * enTerms.length) / count);
+      const end = Math.max(start + 1, Math.floor(((idx + 1) * enTerms.length) / count));
+      return enTerms.slice(start, end).join(" ");
+    }
+    if (idx < enTerms.length) {
+      return enTerms[idx];
+    }
+    return "";
+  });
+
+  const matched = computeItemTriggerMsList(hintTexts, wordTimings);
+
+  // Estimate step spoken duration from wordTimings for clean monotonic stagger fallback
+  let maxEndMs = 0;
+  for (const wt of wordTimings!) {
+    if (Number.isFinite(wt.start_ms) && Number.isFinite(wt.duration_ms)) {
+      maxEndMs = Math.max(maxEndMs, wt.start_ms + wt.duration_ms);
+    } else if (Number.isFinite(wt.start_ms)) {
+      maxEndMs = Math.max(maxEndMs, wt.start_ms + 300);
+    }
+  }
+  const staggerSpanMs = maxEndMs > 600 ? Math.min(maxEndMs * 0.65, maxEndMs - 500) : 0;
+
+  return matched.map((triggerMs, idx) => {
+    if (triggerMs !== null) {
+      return idx === 0 ? Math.min(triggerMs, 650) : triggerMs;
+    }
+    if (staggerSpanMs > 0) {
+      return Math.round((idx / count) * staggerSpanMs);
+    }
+    return null;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Lightweight Multi-Language Syntax Highlighter
 // ---------------------------------------------------------------------------
@@ -606,17 +676,71 @@ function computeContainRect(
   };
 }
 
-function mapBboxToScreenRect(bbox: BoundingBox, contentRect: RectFrame): RectFrame {
+function mapBboxToScreenRect(bbox: BoundingBox, pdfDrawRect: RectFrame): RectFrame {
   const ymin = Math.max(0, Math.min(1000, Math.min(bbox.ymin, bbox.ymax)));
   const ymax = Math.max(0, Math.min(1000, Math.max(bbox.ymin, bbox.ymax)));
   const xmin = Math.max(0, Math.min(1000, Math.min(bbox.xmin, bbox.xmax)));
   const xmax = Math.max(0, Math.min(1000, Math.max(bbox.xmin, bbox.xmax)));
 
   return {
-    x: contentRect.x + (xmin / 1000) * contentRect.width,
-    y: contentRect.y + (ymin / 1000) * contentRect.height,
-    width: Math.max(4, ((xmax - xmin) / 1000) * contentRect.width),
-    height: Math.max(4, ((ymax - ymin) / 1000) * contentRect.height),
+    x: pdfDrawRect.x + (xmin / 1000) * pdfDrawRect.width,
+    y: pdfDrawRect.y + (ymin / 1000) * pdfDrawRect.height,
+    width: Math.max(4, ((xmax - xmin) / 1000) * pdfDrawRect.width),
+    height: Math.max(4, ((ymax - ymin) / 1000) * pdfDrawRect.height),
+  };
+}
+
+/**
+ * Maps a [0-1000] bbox inside rendered pdfDrawRect to a symmetrically centered
+ * oval frame (cy = imgY + ((ymin + ymax)/2000)*imgH, padX = 14, padY = 10).
+ */
+function mapPdfCircleRect(bbox: BoundingBox, pdfDrawRect: RectFrame): RectFrame {
+  const ymin = Math.max(0, Math.min(1000, Math.min(bbox.ymin, bbox.ymax)));
+  const ymax = Math.max(0, Math.min(1000, Math.max(bbox.ymin, bbox.ymax)));
+  const xmin = Math.max(0, Math.min(1000, Math.min(bbox.xmin, bbox.xmax)));
+  const xmax = Math.max(0, Math.min(1000, Math.max(bbox.xmin, bbox.xmax)));
+
+  const cx = pdfDrawRect.x + ((xmin + xmax) / 2000) * pdfDrawRect.width;
+  const cy = pdfDrawRect.y + ((ymin + ymax) / 2000) * pdfDrawRect.height;
+  const rawW = Math.max(12, ((xmax - xmin) / 1000) * pdfDrawRect.width);
+  const rawH = Math.max(12, ((ymax - ymin) / 1000) * pdfDrawRect.height);
+
+  const padX = 14;
+  const padY = 10;
+  const width = rawW + padX * 2;
+  const height = rawH + padY * 2;
+
+  return {
+    x: cx - width / 2,
+    y: cy - height / 2,
+    width,
+    height,
+  };
+}
+
+/**
+ * Maps a [0-1000] bbox inside rendered pdfDrawRect to a vertically centered,
+ * baseline-aligned translucent marker highlight rect.
+ */
+function mapPdfHighlightRect(bbox: BoundingBox, pdfDrawRect: RectFrame): RectFrame {
+  const ymin = Math.max(0, Math.min(1000, Math.min(bbox.ymin, bbox.ymax)));
+  const ymax = Math.max(0, Math.min(1000, Math.max(bbox.ymin, bbox.ymax)));
+  const xmin = Math.max(0, Math.min(1000, Math.min(bbox.xmin, bbox.xmax)));
+  const xmax = Math.max(0, Math.min(1000, Math.max(bbox.xmin, bbox.xmax)));
+
+  const cx = pdfDrawRect.x + ((xmin + xmax) / 2000) * pdfDrawRect.width;
+  const cy = pdfDrawRect.y + ((ymin + ymax) / 2000) * pdfDrawRect.height;
+  const rawW = Math.max(8, ((xmax - xmin) / 1000) * pdfDrawRect.width);
+  const rawH = Math.max(10, ((ymax - ymin) / 1000) * pdfDrawRect.height);
+
+  const width = rawW + 8;
+  const height = Math.max(14, rawH * 1.08);
+
+  return {
+    x: cx - width / 2,
+    y: cy - height / 2,
+    width,
+    height,
   };
 }
 
@@ -837,8 +961,8 @@ function computeTableMetrics(
       return normalized;
     });
 
-  // 8px inset leaves 4px room on left & right so rough marker strokes never clip
-  const innerAvailW = Math.max(120, availableWidth - 8);
+  // Leave TABLE_CANVAS_BLEED (8px) on left & right so corner overshoots & double-strokes never clip
+  const innerAvailW = Math.max(120, availableWidth - TABLE_CANVAS_BLEED * 2);
   const minTotalWidth = colCount * MIN_TABLE_COL_WIDTH;
   const needsHorizontalScroll = minTotalWidth > innerAvailW;
   const tableWidth = needsHorizontalScroll ? minTotalWidth : innerAvailW;
@@ -853,7 +977,8 @@ function computeTableMetrics(
       estimateWrappedLines(h || " ", headerCharsPerLine)
     );
   }
-  const headerHeight = Math.max(42, 18 + maxHeaderLines * 20);
+  // Includes +8px cross-platform safe bottom text buffer so Android/iOS cells never clip
+  const headerHeight = Math.max(46, 26 + maxHeaderLines * 20);
 
   const cellCharsPerLine = Math.max(8, Math.floor((colWidth - 16) / 7.8));
   const rowHeights: number[] = rows.map((row) => {
@@ -864,13 +989,14 @@ function computeTableMetrics(
         estimateWrappedLines(cell || " ", cellCharsPerLine)
       );
     }
-    return Math.max(38, 18 + maxLines * 19);
+    return Math.max(44, 26 + maxLines * 19);
   });
 
   const gridHeight =
     headerHeight + rowHeights.reduce((sum, h) => sum + h, 0);
-  // Extra bottom space for scroll bar + subtle swipe hint when horizontally scrollable
-  const totalSlotHeight = gridHeight + (needsHorizontalScroll ? 30 : 10);
+  // Extra bleed (TABLE_CANVAS_BLEED * 2) + bottom scroll hint clearance when horizontally scrollable
+  const totalSlotHeight =
+    gridHeight + TABLE_CANVAS_BLEED * 2 + (needsHorizontalScroll ? 24 : 4);
 
   return {
     headers,
@@ -902,8 +1028,8 @@ function estimateSlotHeight(
     const clean = normalizeBlockText(primary.text);
     const charsPerLine = Math.max(11, Math.floor((slotWidth - 48) / 8.2));
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Accounts for NOTE badge row + top/bottom padding + handwritten serif line height
-    return Math.max(92, 62 + lines * 22);
+    // Accounts for NOTE badge row + top/bottom padding + +8px safe cross-platform text buffer
+    return Math.max(100, 70 + lines * 22);
   }
 
   if (primary.type === "wb_heading") {
@@ -914,8 +1040,8 @@ function estimateSlotHeight(
       Math.floor((slotWidth - 32 - iconReserve) / 10.2)
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Generous vertical padding + bottom clearance above the rough Skia underline
-    return Math.max(66, 44 + lines * 26);
+    // Generous vertical padding + +8px safe buffer above the rough Skia underline
+    return Math.max(74, 52 + lines * 26);
   }
 
   if (primary.type === "wb_code") {
@@ -926,15 +1052,15 @@ function estimateSlotHeight(
     const charWidth = isCompactColumn ? 6.8 : 7.4;
     const rowHeight = isCompactColumn ? 18.5 : 21.5;
     const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / charWidth);
-    // 32px header + 36px vertical padding + per-line height
-    return Math.max(126, 32 + 36 + wrappedLines * rowHeight);
+    // 32px header + 42px vertical padding + per-line height
+    return Math.max(132, 32 + 42 + wrappedLines * rowHeight);
   }
 
   if (primary.type === "wb_equation") {
     const clean = normalizeBlockText(primary.text);
     const charsPerLine = Math.max(12, Math.floor((slotWidth - 28) / 9.5));
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(84, 48 + lines * 26);
+    return Math.max(92, 56 + lines * 26);
   }
 
   if (primary.type === "wb_flow_card") {
@@ -945,18 +1071,18 @@ function estimateSlotHeight(
       Math.floor((slotWidth - 28 - iconReserve) / 8.5)
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(104, 56 + lines * 23);
+    return Math.max(112, 64 + lines * 23);
   }
 
-  // Stacked wb_bullet items with conservative word-wrap estimate & generous vertical padding
+  // Stacked wb_bullet items with conservative word-wrap estimate & +8px safe bottom text buffer
   const bulletCharsPerLine = Math.max(11, Math.floor((slotWidth - 46) / 8.5));
-  let totalH = 50;
+  let totalH = 58;
   for (const item of items) {
     const clean = normalizeBlockText(item.action.text);
     const lines = estimateWrappedLines(clean, bulletCharsPerLine);
     totalH += lines * 22 + 10;
   }
-  return Math.max(104, totalH);
+  return Math.max(112, totalH);
 }
 
 function computeCumulativeWhiteboardLayout(
@@ -1091,28 +1217,53 @@ const AnimatedHighlightRect: React.FC<{
   width: number;
   height: number;
   color: string;
-  progress: SharedValue<number>;
-}> = React.memo(({ x, y, width, height, color, progress }) => {
-  const targetWidth = useSharedValue(width);
-  useEffect(() => {
-    targetWidth.value = width;
-  }, [width, targetWidth]);
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+}> = React.memo(
+  ({ x, y, width, height, color, triggered, instantComplete, resetKey }) => {
+    const targetWidth = useSharedValue(width);
+    const strokeProgress = useSharedValue(instantComplete ? 1 : 0);
 
-  const animatedWidth = useDerivedValue(
-    () => targetWidth.value * progress.value
-  );
+    useEffect(() => {
+      targetWidth.value = width;
+    }, [width, targetWidth]);
 
-  return (
-    <RoundedRect
-      x={x}
-      y={y}
-      width={animatedWidth}
-      height={height}
-      r={6}
-      color={color}
-    />
-  );
-});
+    useEffect(() => {
+      strokeProgress.value = instantComplete ? 1 : 0;
+    }, [resetKey, instantComplete, strokeProgress]);
+
+    useEffect(() => {
+      if (instantComplete) {
+        strokeProgress.value = 1;
+        return;
+      }
+      if (triggered) {
+        strokeProgress.value = withTiming(1, {
+          duration: PDF_STROKE_DRAW_MS,
+          easing: Easing.out(Easing.cubic),
+        });
+      } else {
+        strokeProgress.value = 0;
+      }
+    }, [triggered, instantComplete, strokeProgress]);
+
+    const animatedWidth = useDerivedValue(
+      () => targetWidth.value * strokeProgress.value
+    );
+
+    return (
+      <RoundedRect
+        x={x}
+        y={y}
+        width={animatedWidth}
+        height={height}
+        r={6}
+        color={color}
+      />
+    );
+  }
+);
 
 const AnimatedCircleAnnotation: React.FC<{
   x: number;
@@ -1121,26 +1272,60 @@ const AnimatedCircleAnnotation: React.FC<{
   height: number;
   seed: number;
   strokeColor: string;
-  progress: SharedValue<number>;
-}> = React.memo(({ x, y, width, height, seed, strokeColor, progress }) => {
-  const ovalPath = useMemo(
-    () => createRoughCirclePath({ x, y, width, height }, seed, 1),
-    [x, y, width, height, seed]
-  );
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+}> = React.memo(
+  ({
+    x,
+    y,
+    width,
+    height,
+    seed,
+    strokeColor,
+    triggered,
+    instantComplete,
+    resetKey,
+  }) => {
+    const ovalPath = useMemo(
+      () => createRoughCirclePath({ x, y, width, height }, seed, 1),
+      [x, y, width, height, seed]
+    );
+    const strokeProgress = useSharedValue(instantComplete ? 1 : 0);
 
-  return (
-    <Path
-      path={ovalPath}
-      style="stroke"
-      strokeWidth={3.5}
-      strokeCap="round"
-      strokeJoin="round"
-      color={strokeColor}
-      start={0}
-      end={progress}
-    />
-  );
-});
+    useEffect(() => {
+      strokeProgress.value = instantComplete ? 1 : 0;
+    }, [resetKey, instantComplete, strokeProgress]);
+
+    useEffect(() => {
+      if (instantComplete) {
+        strokeProgress.value = 1;
+        return;
+      }
+      if (triggered) {
+        strokeProgress.value = withTiming(1, {
+          duration: PDF_STROKE_DRAW_MS,
+          easing: Easing.out(Easing.cubic),
+        });
+      } else {
+        strokeProgress.value = 0;
+      }
+    }, [triggered, instantComplete, strokeProgress]);
+
+    return (
+      <Path
+        path={ovalPath}
+        style="stroke"
+        strokeWidth={3.5}
+        strokeCap="round"
+        strokeJoin="round"
+        color={strokeColor}
+        start={0}
+        end={strokeProgress}
+      />
+    );
+  }
+);
 
 const AnimatedCardFrame: React.FC<{
   x: number;
@@ -1386,12 +1571,17 @@ const AnimatedTableGrid: React.FC<{
     const gridPath = useMemo(
       () =>
         createRoughTableGridPath(
-          { x: 4, y: 4, width: tableWidth, height: gridHeight },
+          {
+            x: TABLE_CANVAS_BLEED,
+            y: TABLE_CANVAS_BLEED,
+            width: tableWidth,
+            height: gridHeight,
+          },
           colWidths,
           headerHeight,
           rowHeights,
           seed,
-          0.95
+          1.0
         ),
       // colWidthsKey & rowHeightsKey deterministically represent colWidths & rowHeights
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1408,14 +1598,14 @@ const AnimatedTableGrid: React.FC<{
           position: "absolute",
           left: 0,
           top: 0,
-          width: tableWidth + 8,
-          height: gridHeight + 8,
+          width: tableWidth + TABLE_CANVAS_BLEED * 2,
+          height: gridHeight + TABLE_CANVAS_BLEED * 2,
         }}
         pointerEvents="none"
       >
         <RoundedRect
-          x={4}
-          y={7}
+          x={TABLE_CANVAS_BLEED}
+          y={TABLE_CANVAS_BLEED + 3}
           width={tableWidth}
           height={gridHeight}
           r={10}
@@ -1423,8 +1613,8 @@ const AnimatedTableGrid: React.FC<{
           opacity={fillOpacity}
         />
         <RoundedRect
-          x={4}
-          y={4}
+          x={TABLE_CANVAS_BLEED}
+          y={TABLE_CANVAS_BLEED}
           width={tableWidth}
           height={gridHeight}
           r={10}
@@ -1432,8 +1622,8 @@ const AnimatedTableGrid: React.FC<{
           opacity={fillOpacity}
         />
         <RoundedRect
-          x={4}
-          y={4}
+          x={TABLE_CANVAS_BLEED}
+          y={TABLE_CANVAS_BLEED}
           width={tableWidth}
           height={headerHeight}
           r={10}
@@ -1514,7 +1704,7 @@ const TableBlockView: React.FC<{
     ? 1
     : clampedStep >= 0.995
     ? 1
-    : clamp01((clampedStep - 0.08) / 0.22);
+    : clamp01((clampedStep - 0.02) / 0.14);
 
   const rowCount = Math.max(1, metrics.rows.length);
 
@@ -1522,24 +1712,23 @@ const TableBlockView: React.FC<{
     if (!isCurrentStep || clampedStep >= 0.995) return 1;
     const triggerMs = rowTriggerMs[rowIdx];
     if (canUseWordTiming && triggerMs !== null) {
-      // Ensure every row finishes revealing smoothly by the tail of the step
-      if (clampedStep >= 0.96) return 1;
-      if ((currentTimeMs as number) < triggerMs) return 0;
-      return clamp01(
-        ((currentTimeMs as number) - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS
-      );
+      // +150ms leading edge so table rows appear right on or slightly ahead of speech
+      const syncedTimeMs = (currentTimeMs as number) + WORD_SYNC_LEAD_MS;
+      if (clampedStep >= 0.94) return 1;
+      if (syncedTimeMs < triggerMs) return 0;
+      return clamp01((syncedTimeMs - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS);
     }
-    // Proportional stepProgress fallback (0.24 -> 0.92 across all rows)
-    const start = 0.24 + (rowIdx / rowCount) * 0.64;
-    const windowSpan = Math.max(0.12, 0.64 / rowCount);
+    // Proportional stepProgress fallback (0.12 -> 0.86 across all rows)
+    const start = 0.12 + (rowIdx / rowCount) * 0.68;
+    const windowSpan = Math.max(0.1, 0.68 / rowCount);
     return clamp01((clampedStep - start) / windowSpan);
   };
 
   const tableInner = (
     <View
       style={{
-        width: metrics.tableWidth + 8,
-        height: metrics.gridHeight + 8,
+        width: metrics.tableWidth + TABLE_CANVAS_BLEED * 2,
+        height: metrics.gridHeight + TABLE_CANVAS_BLEED * 2,
       }}
     >
       <AnimatedTableGrid
@@ -1562,8 +1751,8 @@ const TableBlockView: React.FC<{
       <View
         style={{
           position: "absolute",
-          left: 4,
-          top: 4,
+          left: TABLE_CANVAS_BLEED,
+          top: TABLE_CANVAS_BLEED,
           width: metrics.tableWidth,
           height: metrics.gridHeight,
         }}
@@ -2023,14 +2212,15 @@ const SlotContentView: React.FC<{
           const triggerMs = bulletTriggerMap.get(item.key) ?? null;
           let ratio: number;
           if (triggerMs !== null) {
-            if (clampedStep >= 0.96) {
+            // +150ms leading edge so bullets arrive crisp and never lag behind speech
+            const syncedTimeMs = (currentTimeMs as number) + WORD_SYNC_LEAD_MS;
+            if (clampedStep >= 0.94) {
               ratio = 1;
-            } else if ((currentTimeMs as number) < triggerMs) {
+            } else if (syncedTimeMs < triggerMs) {
               ratio = 0;
             } else {
               ratio = clamp01(
-                ((currentTimeMs as number) - triggerMs) /
-                  WORD_SYNC_REVEAL_WINDOW_MS
+                (syncedTimeMs - triggerMs) / WORD_SYNC_REVEAL_WINDOW_MS
               );
             }
           } else {
@@ -2038,8 +2228,8 @@ const SlotContentView: React.FC<{
               0,
               currentStepBullets.findIndex((b) => b.key === item.key)
             );
-            const start = 0.18 + (cIdx / totalCurrent) * 0.68;
-            const span = Math.max(0.14, 0.68 / totalCurrent);
+            const start = 0.08 + (cIdx / totalCurrent) * 0.7;
+            const span = Math.max(0.12, 0.7 / totalCurrent);
             ratio = clamp01((clampedStep - start) / span);
           }
 
@@ -2214,46 +2404,62 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   const safeIndex = Math.max(0, Math.min(currentStepIndex, safeSteps.length - 1));
   const currentStep = safeSteps[safeIndex];
 
-  // Smooth 60fps Reanimated progress value synced to 50ms audio stepProgress (0 -> 1)
+  // Snappy decoupled marker stroke animations (fixed 400ms-650ms durations on UI thread)
+  // so borders, underlines, table grids, and arrows never drag across a 10s-14s step!
   const clampedProgress = clamp01(stepProgress);
-  const activeProgressSV = useSharedValue(clampedProgress);
+  const stepResetKey = `${safeIndex}-${currentStep?.step_id ?? "none"}-${replayToken}`;
+  const isStaticComplete = !isPlaying && clampedProgress >= 0.99;
+
+  const borderProgressSV = useSharedValue(isStaticComplete ? 1 : 0);
+  const tableGridProgressSV = useSharedValue(isStaticComplete ? 1 : 0);
+  const arrowProgressSV = useSharedValue(isStaticComplete ? 1 : 0);
 
   useEffect(() => {
-    // Snap cleanly to 0 on step switch or replay so borders/arrows never sweep backward
-    activeProgressSV.value = 0;
-  }, [safeIndex, currentStep?.step_id, replayToken, activeProgressSV]);
-
-  useEffect(() => {
-    if (clampedProgress <= 0.01) {
-      activeProgressSV.value = 0;
-    } else {
-      activeProgressSV.value = withTiming(clampedProgress, {
-        duration: 65,
-        easing: Easing.linear,
-      });
+    if (isStaticComplete) {
+      borderProgressSV.value = 1;
+      tableGridProgressSV.value = 1;
+      arrowProgressSV.value = 1;
+      return;
     }
-  }, [clampedProgress, activeProgressSV]);
 
-  // Choreography phase curves on the UI thread:
-  // - Card rough borders, sketch icons & heading underlines: 0% -> 35%
-  // - Table rough Skia grid lines: 0% -> 30%
-  // - Connector arrows: 75% -> 100%
-  // - PDF overlay highlights & rough circles: 0% -> 45%
-  const borderProgressSV = useDerivedValue(() =>
-    Math.max(0, Math.min(1, activeProgressSV.value / 0.35))
-  );
-  const tableGridProgressSV = useDerivedValue(() =>
-    Math.max(0, Math.min(1, activeProgressSV.value / 0.3))
-  );
-  const arrowProgressSV = useDerivedValue(() =>
-    Math.max(0, Math.min(1, (activeProgressSV.value - 0.75) / 0.25))
-  );
-  const pdfProgressSV = useDerivedValue(() =>
-    Math.max(0, Math.min(1, activeProgressSV.value / 0.45))
-  );
+    // Snap cleanly to 0 on step switch or replay, then sweep briskly in 440ms-580ms
+    borderProgressSV.value = 0;
+    tableGridProgressSV.value = 0;
+    arrowProgressSV.value = 0;
 
-  // Live RN text & code typewriter curve: 15% -> 92% of stepProgress
-  const textProgress = clamp01((clampedProgress - 0.15) / 0.77);
+    borderProgressSV.value = withTiming(1, {
+      duration: CARD_BORDER_DRAW_MS,
+      easing: Easing.out(Easing.cubic),
+    });
+    tableGridProgressSV.value = withTiming(1, {
+      duration: TABLE_GRID_DRAW_MS,
+      easing: Easing.out(Easing.cubic),
+    });
+    arrowProgressSV.value = withDelay(
+      ARROW_DRAW_DELAY_MS,
+      withTiming(1, {
+        duration: ARROW_DRAW_MS,
+        easing: Easing.out(Easing.cubic),
+      })
+    );
+  }, [
+    stepResetKey,
+    isStaticComplete,
+    borderProgressSV,
+    tableGridProgressSV,
+    arrowProgressSV,
+  ]);
+
+  useEffect(() => {
+    if (clampedProgress >= 0.995) {
+      borderProgressSV.value = 1;
+      tableGridProgressSV.value = 1;
+      arrowProgressSV.value = 1;
+    }
+  }, [clampedProgress, borderProgressSV, tableGridProgressSV, arrowProgressSV]);
+
+  // Live RN text & code typewriter curve with leading edge: starts immediately (2% -> 86%)
+  const textProgress = clamp01((clampedProgress - 0.02) / 0.84);
 
   // Simultaneous Pan + Pinch + Double-Tap Reset gestures (60fps UI thread)
   const composedGesture = useMemo(() => {
@@ -2345,8 +2551,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     }
   };
 
-  // Compute aspect-ratio-preserving rect for pdf_overlay
-  const contentRect = useMemo(
+  // Compute aspect-ratio-preserving rendered PDF image rect (locked source of truth for bboxes)
+  const pdfDrawRect = useMemo(
     () =>
       computeContainRect(
         viewportWidth,
@@ -2356,6 +2562,23 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
         bottomInset
       ),
     [viewportWidth, viewportHeight, detectedAspect, topInset, bottomInset]
+  );
+
+  // Memoize PDF actions & per-annotation WordBoundary trigger timestamps (Safeguard #4)
+  const currentPdfActions = useMemo(() => {
+    if (!currentStep || currentStep.mode !== "pdf_overlay") return [];
+    return (currentStep.actions ?? []).filter(
+      (a) =>
+        a &&
+        (a.type === "pdf_highlight" || a.type === "pdf_circle") &&
+        a.bbox != null
+    );
+  }, [currentStep]);
+
+  const pdfActionTriggerMs = useMemo(
+    () =>
+      computePdfActionTriggerMsList(currentPdfActions, currentStep, wordTimings),
+    [currentPdfActions, currentStep, wordTimings]
   );
 
   // Compute cumulative multi-band whiteboard blocks & dynamic rects
@@ -2473,35 +2696,40 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   }
 
   // =========================================================================
-  // MODE 1: PDF OVERLAY (Interactive Pan & Zoom Slide + Rough Skia Circles)
+  // MODE 1: PDF OVERLAY (Interactive Pan & Zoom Slide + Exact Centered Rough Skia)
   // =========================================================================
   if (currentStep.mode === "pdf_overlay") {
-    const pdfActions = (currentStep.actions ?? []).filter(
-      (a) =>
-        a &&
-        (a.type === "pdf_highlight" || a.type === "pdf_circle") &&
-        a.bbox != null
-    );
+    const pdfActions = currentPdfActions;
+    const canUsePdfWordTiming =
+      typeof currentTimeMs === "number" &&
+      Number.isFinite(currentTimeMs) &&
+      Array.isArray(wordTimings) &&
+      wordTimings.length > 0 &&
+      (currentTimeMs > 0 || clampedProgress <= 0.05);
+    const syncedPdfTimeMs =
+      typeof currentTimeMs === "number" && Number.isFinite(currentTimeMs)
+        ? currentTimeMs + WORD_SYNC_LEAD_MS
+        : 0;
 
     return (
       <View style={styles.pdfRoot} onLayout={handleLayout}>
         <GestureDetector gesture={composedGesture}>
           <Animated.View style={[styles.gestureStage, viewportTransformStyle]}>
-            {/* Layer 1: Underlying PDF slide locked strictly to contentRect */}
+            {/* Layer 1: Underlying PDF slide locked strictly to pdfDrawRect */}
             {viewportWidth > 0 &&
               (renderPdfLayer ? (
                 <View
                   style={[
                     styles.absoluteRect,
                     {
-                      left: contentRect.x,
-                      top: contentRect.y,
-                      width: contentRect.width,
-                      height: contentRect.height,
+                      left: pdfDrawRect.x,
+                      top: pdfDrawRect.y,
+                      width: pdfDrawRect.width,
+                      height: pdfDrawRect.height,
                     },
                   ]}
                 >
-                  {renderPdfLayer(contentRect)}
+                  {renderPdfLayer(pdfDrawRect)}
                 </View>
               ) : slideImageUri ? (
                 <Image
@@ -2510,10 +2738,10 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   style={[
                     styles.absoluteRect,
                     {
-                      left: contentRect.x,
-                      top: contentRect.y,
-                      width: contentRect.width,
-                      height: contentRect.height,
+                      left: pdfDrawRect.x,
+                      top: pdfDrawRect.y,
+                      width: pdfDrawRect.width,
+                      height: pdfDrawRect.height,
                     },
                   ]}
                   onLoad={(event) => {
@@ -2528,54 +2756,70 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   style={[
                     styles.pdfPlaceholder,
                     {
-                      left: contentRect.x,
-                      top: contentRect.y,
-                      width: contentRect.width,
-                      height: contentRect.height,
+                      left: pdfDrawRect.x,
+                      top: pdfDrawRect.y,
+                      width: pdfDrawRect.width,
+                      height: pdfDrawRect.height,
                     },
                   ]}
                 >
                   <Text style={styles.pdfPlaceholderText}>
-                    PDF Slide Canvas ({Math.round(contentRect.width)}×
-                    {Math.round(contentRect.height)})
+                    PDF Slide Canvas ({Math.round(pdfDrawRect.width)}×
+                    {Math.round(pdfDrawRect.height)})
                   </Text>
                 </View>
               ))}
 
-            {/* Layer 2: Transparent 60fps Skia Vector Overlay mapped via [0-1000] bbox */}
+            {/* Layer 2: Transparent 60fps Skia Vector Overlay locked strictly to pdfDrawRect */}
             {viewportWidth > 0 && (
               <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
                 {pdfActions.map((action, idx) => {
-                  const screenRect = mapBboxToScreenRect(
-                    action.bbox!,
-                    contentRect
-                  );
                   const token = getColorToken(action.color);
                   const key = `pdf-${currentStep.step_id}-${idx}-${action.type}`;
+                  const triggerMs = pdfActionTriggerMs[idx] ?? null;
+
+                  // Per-annotation trigger: fires snappy 460ms stroke right when spoken
+                  let triggered: boolean;
+                  if (isStaticComplete || clampedProgress >= 0.94) {
+                    triggered = true;
+                  } else if (pdfActions.length <= 1) {
+                    triggered = true;
+                  } else if (canUsePdfWordTiming && triggerMs !== null) {
+                    triggered = syncedPdfTimeMs >= triggerMs;
+                  } else {
+                    const threshold = (idx / pdfActions.length) * 0.52;
+                    triggered = clampedProgress >= threshold;
+                  }
 
                   if (action.type === "pdf_highlight") {
+                    const hlRect = mapPdfHighlightRect(action.bbox!, pdfDrawRect);
                     return (
                       <AnimatedHighlightRect
                         key={key}
-                        x={screenRect.x}
-                        y={screenRect.y}
-                        width={screenRect.width}
-                        height={screenRect.height}
+                        x={hlRect.x}
+                        y={hlRect.y}
+                        width={hlRect.width}
+                        height={hlRect.height}
                         color={token.highlight}
-                        progress={pdfProgressSV}
+                        triggered={triggered}
+                        instantComplete={isStaticComplete}
+                        resetKey={stepResetKey}
                       />
                     );
                   }
+                  const circleRect = mapPdfCircleRect(action.bbox!, pdfDrawRect);
                   return (
                     <AnimatedCircleAnnotation
                       key={key}
-                      x={screenRect.x}
-                      y={screenRect.y}
-                      width={screenRect.width}
-                      height={screenRect.height}
+                      x={circleRect.x}
+                      y={circleRect.y}
+                      width={circleRect.width}
+                      height={circleRect.height}
                       seed={hashSeed(key)}
                       strokeColor={token.stroke}
-                      progress={pdfProgressSV}
+                      triggered={triggered}
+                      instantComplete={isStaticComplete}
+                      resetKey={stepResetKey}
                     />
                   );
                 })}

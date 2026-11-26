@@ -285,6 +285,8 @@ function TutorWorkspace() {
   const shouldAutoPlayRef = useRef<boolean>(false);
   const playbackSpeedRef = useRef<PlaybackSpeed>(1.0);
   const cacheSessionRef = useRef<number>(0);
+  // Per-lecture page summary map for seamless cross-page continuity (Page N-1 -> Page N)
+  const pageSummariesRef = useRef<Map<number, string>>(new Map());
 
   const steps = result?.plan.steps ?? [];
   const currentStep = steps[stepIndex] ?? null;
@@ -539,6 +541,7 @@ function TutorWorkspace() {
       }
 
       const asset = picked.assets[0];
+      pageSummariesRef.current.clear();
       setPdfFile({
         uri: asset.uri,
         name: asset.name ?? "lecture.pdf",
@@ -595,6 +598,19 @@ function TutorWorkspace() {
     if (!data.plan?.steps?.length) {
       throw new Error("Server returned a LecturePlan with zero steps.");
     }
+
+    // Store a compact summary of this page so the next slide (page N+1) transitions seamlessly
+    const summaryParts = [
+      `Title: ${data.plan.title}`,
+      ...data.plan.steps
+        .slice(0, 5)
+        .map((s) => s.speech_ar.trim().slice(0, 110))
+        .filter((s) => s.length > 0),
+    ];
+    pageSummariesRef.current.set(
+      data.page_number,
+      summaryParts.join(" | ").slice(0, 650)
+    );
 
     const cachedUris = await preCacheStepAudios(
       data.plan.steps,
@@ -758,6 +774,10 @@ function TutorWorkspace() {
       // Ignore if idle
     }
 
+    if (result?.lecture_id && lecture.id !== result.lecture_id) {
+      pageSummariesRef.current.clear();
+    }
+
     setLoading(true);
     setError(null);
     setPageInput(String(cachedPage.page_number));
@@ -820,6 +840,12 @@ function TutorWorkspace() {
       formData.append("page_number", String(pageNumber));
       formData.append("board_mode", boardMode);
       formData.append("use_deep_model", String(useDeepModel));
+      if (pageNumber > 1) {
+        const prevSummary = pageSummariesRef.current.get(pageNumber - 1);
+        if (prevSummary) {
+          formData.append("prev_page_summary", prevSummary);
+        }
+      }
 
       const data = await new Promise<ExplainSlideWithAudioResponse>(
         (resolve, reject) => {

@@ -1269,10 +1269,35 @@ async def _generate_plan_with_fallback(
     return plan, used_model
 
 
+def _summarize_cached_plan(plan_json: Any) -> Optional[str]:
+    """Extract a concise, safe text summary from a cached LecturePlan dict for page N-1 continuity."""
+    if not isinstance(plan_json, dict):
+        return None
+    parts: list[str] = []
+    title = str(plan_json.get("title") or "").strip()
+    if title:
+        parts.append(f"Title: {title}")
+
+    raw_steps = plan_json.get("steps")
+    if isinstance(raw_steps, list):
+        key_points: list[str] = []
+        for step in raw_steps[:5]:
+            if not isinstance(step, dict):
+                continue
+            speech = str(step.get("speech_ar") or "").strip()
+            if speech:
+                key_points.append(speech[:110].rstrip(" ,،."))
+        if key_points:
+            parts.append("Covered points: " + " | ".join(key_points))
+
+    summary = "\n".join(parts).strip()
+    return summary[:650] if summary else None
+
+
 @app.post(
     "/api/explain",
     response_model=ExplainSlideWithAudioResponse,
-    summary="Generate a thorough 5-8 step LecturePlan + aligned slide image + synchronized Iraqi TTS audio",
+    summary="Generate a deep 6-8 step LecturePlan + aligned slide image + synchronized bilingual TTS audio",
 )
 async def explain_slide(
     file: UploadFile = File(..., description="Lecture PDF file"),
@@ -1284,6 +1309,10 @@ async def explain_slide(
     use_deep_model: bool = Form(
         False,
         description="False -> FAST_TUTOR_MODEL (default 85%), True -> DEEP_TUTOR_MODEL (complex 15%)",
+    ),
+    prev_page_summary: Optional[str] = Form(
+        default=None,
+        description="Optional brief summary of page N-1 for seamless cross-page transitions",
     ),
 ) -> ExplainSlideWithAudioResponse:
     if _genai_client is None:
@@ -1376,15 +1405,51 @@ async def explain_slide(
         match_count=3,
     )
 
-    # 3. Build deduplicated model fallback chain & assemble locked system prompt (with RAG context)
+    # 2c. Resolve previous slide summary safely for cross-page continuity (Page > 1)
+    effective_prev_summary: Optional[str] = (prev_page_summary or "").strip() or None
+    if page_number > 1 and not effective_prev_summary and lecture_id is not None and db.is_configured():
+        try:
+            prev_cached = await db.get_cached_page_by_lecture_id(
+                lecture_id=lecture_id,
+                page_number=page_number - 1,
+            )
+            if prev_cached is not None:
+                _, prev_row = prev_cached
+                effective_prev_summary = _summarize_cached_plan(prev_row.get("plan_json"))
+        except Exception as exc:
+            logger.warning(
+                "Cross-page summary lookup for lecture=%s page=%d failed safely: %s",
+                lecture_id,
+                page_number - 1,
+                exc,
+            )
+            effective_prev_summary = None
+
+    # 3. Build deduplicated model fallback chain & assemble locked system prompt (with continuity + RAG)
     model_chain = _build_model_fallback_chain(use_deep_model)
-    system_prompt = build_tutor_system_prompt(board_mode, rag_context=rag_context)
+    system_prompt = build_tutor_system_prompt(
+        board_mode,
+        rag_context=rag_context,
+        page_number=page_number,
+        prev_page_summary=effective_prev_summary,
+    )
+    continuity_hint = (
+        "You may open Step 1 with a brief 1-clause welcome since this is Page 1."
+        if page_number == 1
+        else (
+            f"This is Page {page_number} (mid-lecture): DO NOT greet or re-introduce the lecture—open Step 1 "
+            "with a natural 1-sentence transition continuing directly from the previous slide."
+        )
+    )
     user_instruction = (
-        f"Explain slide page {page_number} of {total_pages} from this lecture PDF thoroughly. "
-        f"Do NOT summarize briefly: break down every concept, diagram component, equation, or code line into "
-        f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in clear, natural Iraqi academic Arabic "
-        f"(لهجة عراقية بيضاء مفهومة) WITHOUT Arabic harakat or raw code symbols (#, {{}}, [], ;) inside speech_ar, using natural punctuation and clean spacing around "
-        f"English technical terms. For EVERY wb_code action, you MUST populate the `code` field with 3 to 8 lines of real runnable code separated by real newlines (never empty). "
+        f"Explain slide page {page_number} of {total_pages} from this lecture PDF deeply and thoroughly. "
+        f"Do NOT summarize briefly: unpack every concept, diagram component, equation, or code line into "
+        f"6 to 8 detailed steps, including concrete mental analogies, worked examples, and an exam takeaway wb_note. "
+        f"Keep each step's speech_ar strictly 22 to 42 words in warm, clear White Saudi Educational Arabic "
+        f"(عربية سعودية بيضاء تعليمية قريبة من الفصحى المبسطة) WITHOUT Arabic harakat or raw code symbols "
+        f"(#, {{}}, [], ;) inside speech_ar, placing a natural Arabic classifier noun right before every English "
+        f"technical term. {continuity_hint} For EVERY wb_code action, you MUST populate the `code` field with "
+        f"3 to 8 lines of real runnable code separated by real newlines (never empty). "
         f"Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
     )
 
@@ -1523,7 +1588,7 @@ async def ask_slide_question(payload: AskSlideRequest) -> ExplainSlideWithAudioR
     )
     user_instruction = (
         f"Student question about slide page {payload.page_number}: \"{cleaned_question}\"\n"
-        f"Answer ONLY this question directly in 1 to 3 focused teaching steps using warm Iraqi academic Arabic "
+        f"Answer ONLY this question directly in 1 to 3 focused teaching steps using warm White Saudi Educational Arabic "
         f"with natural Arabic classifier nouns right before English technical terms (no harakat or raw symbols in speech_ar). "
         f"Follow board_mode='{effective_board_mode}' strictly, NEVER emit clear_board when using whiteboard/auto mode, "
         f"and populate real multi-line `code` for any wb_code action."

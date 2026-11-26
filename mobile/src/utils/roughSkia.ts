@@ -89,7 +89,8 @@ function clampRoughness(roughness: number): number {
 
 /**
  * Draws a single gently bowed hand-drawn stroke from (x1, y1) to (x2, y2).
- * If moveFirst is true, starts with moveTo; otherwise continues from the current point.
+ * Enforces a deterministic signed minimum bow so short/narrow phone edges
+ * never collapse into ruler-straight segments on 3x Retina displays.
  */
 function addBowedSegment(
   b: PathDrawOps,
@@ -99,7 +100,8 @@ function addBowedSegment(
   y2: number,
   rng: () => number,
   roughness: number,
-  moveFirst: boolean
+  moveFirst: boolean,
+  preferredSign?: number
 ): void {
   const dx = x2 - x1;
   const dy = y2 - y1;
@@ -107,12 +109,22 @@ function addBowedSegment(
   if (len < 0.5) return;
 
   const r = clampRoughness(roughness);
-  const maxOffset = Math.min(len * 0.08, 2.2 * r);
+  const maxOffset = Math.min(len * 0.085, 2.8 * r);
+  const minBow = Math.min(maxOffset * 0.85, Math.min(len * 0.032, 1.35 * r));
   const nx = -dy / len;
   const ny = dx / len;
 
-  const t = 0.44 + rng() * 0.12;
-  const bow = jitter(rng, maxOffset);
+  const t = 0.43 + rng() * 0.14;
+  const sign =
+    preferredSign !== undefined && preferredSign !== 0
+      ? preferredSign > 0
+        ? 1
+        : -1
+      : rng() > 0.5
+      ? 1
+      : -1;
+  const bowMag = minBow + rng() * Math.max(0, maxOffset - minBow);
+  const bow = sign * bowMag;
   const cx = x1 + dx * t + nx * bow;
   const cy = y1 + dy * t + ny * bow;
 
@@ -123,7 +135,8 @@ function addBowedSegment(
 }
 
 /**
- * Draws a rough straight-ish line with optional double-stroke pass.
+ * Draws a rough hand-drawn line with optional visibly separated double-stroke pass
+ * (2.2px-3.0px perpendicular separation on standard roughness).
  */
 function addRoughLine(
   b: PathDrawOps,
@@ -135,11 +148,14 @@ function addRoughLine(
   roughness: number,
   doubleStroke: boolean
 ): void {
-  const len = Math.hypot(x2 - x1, y2 - y1);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
   if (len < 0.5) return;
 
   const r = clampRoughness(roughness);
-  const endAmp = Math.min(len * 0.04, 0.9 * r);
+  const endAmp = Math.min(len * 0.04, 1.0 * r);
+  const sign1 = rng() > 0.5 ? 1 : -1;
 
   addBowedSegment(
     b,
@@ -149,20 +165,25 @@ function addRoughLine(
     y2 + jitter(rng, endAmp),
     rng,
     r,
-    true
+    true,
+    sign1
   );
 
   if (doubleStroke) {
-    const secondAmp = Math.min(len * 0.05, 1.35 * r);
+    const nx = -dy / len;
+    const ny = dx / len;
+    const sep = Math.min(len * 0.09, (2.2 + rng() * 0.85) * r) * (rng() > 0.5 ? 1 : -1);
+    const secondAmp = Math.min(len * 0.045, 1.15 * r);
     addBowedSegment(
       b,
-      x1 + jitter(rng, secondAmp),
-      y1 + jitter(rng, secondAmp),
-      x2 + jitter(rng, secondAmp),
-      y2 + jitter(rng, secondAmp),
+      x1 + nx * sep + jitter(rng, secondAmp),
+      y1 + ny * sep + jitter(rng, secondAmp),
+      x2 + nx * sep + jitter(rng, secondAmp),
+      y2 + ny * sep + jitter(rng, secondAmp),
       rng,
-      r * 1.15,
-      true
+      r * 1.1,
+      true,
+      -sign1
     );
   }
 }
@@ -192,7 +213,7 @@ function addSmoothPolyCurve(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Hand-Drawn Rounded Rectangle (Double-Stroke Marker)
+// 1. Hand-Drawn Rounded Rectangle (Double-Stroke Marker + Corner Overshoots)
 // ---------------------------------------------------------------------------
 function addRoughRoundedRectPass(
   b: PathDrawOps,
@@ -200,98 +221,120 @@ function addRoughRoundedRectPass(
   radius: number,
   rng: () => number,
   roughness: number,
-  overshoot: number
+  overshoot: number,
+  passIndex = 0
 ): void {
   const { x, y, width: w, height: h } = rect;
   const rad = Math.max(0, Math.min(radius, w / 2, h / 2));
   const r = clampRoughness(roughness);
-  const cornerJit = Math.min(Math.min(w, h) * 0.03, 1.15 * r);
+  const cornerJit = Math.min(Math.min(w, h) * 0.038, 1.55 * r);
 
-  // Corner anchor points with subtle organic variation
-  const tlTopX = x + rad + jitter(rng, cornerJit);
-  const tlTopY = y + jitter(rng, cornerJit);
+  // Intentional 2.2px-3.2px directional separation on secondary pass so double-strokes
+  // stay clearly distinct on high-DPI (3x Retina iPhone) screens
+  const sepMag =
+    passIndex > 0 ? Math.min(Math.min(w, h) * 0.06, (2.2 + rng() * 1.0) * r) : 0;
+  const sepSignX = passIndex > 0 ? (rng() > 0.5 ? 1 : -1) : 0;
+  const sepSignY = passIndex > 0 ? (rng() > 0.5 ? 1 : -1) : 0;
+  const ox = sepSignX * sepMag * 0.78;
+  const oy = sepSignY * sepMag * 0.78;
+  const bowBias = passIndex === 0 ? 1 : -1;
 
-  const trTopX = x + w - rad + jitter(rng, cornerJit);
-  const trTopY = y + jitter(rng, cornerJit);
-  const trRightX = x + w + jitter(rng, cornerJit);
-  const trRightY = y + rad + jitter(rng, cornerJit);
+  // Corner anchor points with organic variation + directional pass offset
+  const tlTopX = x + rad + ox + jitter(rng, cornerJit);
+  const tlTopY = y + oy + jitter(rng, cornerJit);
 
-  const brRightX = x + w + jitter(rng, cornerJit);
-  const brRightY = y + h - rad + jitter(rng, cornerJit);
-  const brBotX = x + w - rad + jitter(rng, cornerJit);
-  const brBotY = y + h + jitter(rng, cornerJit);
+  const trTopX = x + w - rad + ox + jitter(rng, cornerJit);
+  const trTopY = y + oy + jitter(rng, cornerJit);
+  const trRightX = x + w + ox + jitter(rng, cornerJit);
+  const trRightY = y + rad + oy + jitter(rng, cornerJit);
 
-  const blBotX = x + rad + jitter(rng, cornerJit);
-  const blBotY = y + h + jitter(rng, cornerJit);
-  const blLeftX = x + jitter(rng, cornerJit);
-  const blLeftY = y + h - rad + jitter(rng, cornerJit);
+  const brRightX = x + w + ox + jitter(rng, cornerJit);
+  const brRightY = y + h - rad + oy + jitter(rng, cornerJit);
+  const brBotX = x + w - rad + ox + jitter(rng, cornerJit);
+  const brBotY = y + h + oy + jitter(rng, cornerJit);
 
-  const tlLeftX = x + jitter(rng, cornerJit);
-  const tlLeftY = y + rad + jitter(rng, cornerJit);
+  const blBotX = x + rad + ox + jitter(rng, cornerJit);
+  const blBotY = y + h + oy + jitter(rng, cornerJit);
+  const blLeftX = x + ox + jitter(rng, cornerJit);
+  const blLeftY = y + h - rad + oy + jitter(rng, cornerJit);
+
+  const tlLeftX = x + ox + jitter(rng, cornerJit);
+  const tlLeftY = y + rad + oy + jitter(rng, cornerJit);
 
   b.moveTo(tlTopX, tlTopY);
 
   // Top edge -> Top-right corner
-  addBowedSegment(b, tlTopX, tlTopY, trTopX, trTopY, rng, r, false);
+  addBowedSegment(b, tlTopX, tlTopY, trTopX, trTopY, rng, r, false, bowBias);
   if (rad > 0.5) {
     b.quadTo(
-      x + w + jitter(rng, cornerJit * 0.8),
-      y + jitter(rng, cornerJit * 0.8),
+      x + w + ox + jitter(rng, cornerJit * 0.85),
+      y + oy + jitter(rng, cornerJit * 0.85),
       trRightX,
       trRightY
     );
   }
 
   // Right edge -> Bottom-right corner
-  addBowedSegment(b, trRightX, trRightY, brRightX, brRightY, rng, r, false);
+  addBowedSegment(b, trRightX, trRightY, brRightX, brRightY, rng, r, false, -bowBias);
   if (rad > 0.5) {
     b.quadTo(
-      x + w + jitter(rng, cornerJit * 0.8),
-      y + h + jitter(rng, cornerJit * 0.8),
+      x + w + ox + jitter(rng, cornerJit * 0.85),
+      y + h + oy + jitter(rng, cornerJit * 0.85),
       brBotX,
       brBotY
     );
   }
 
   // Bottom edge -> Bottom-left corner
-  addBowedSegment(b, brBotX, brBotY, blBotX, blBotY, rng, r, false);
+  addBowedSegment(b, brBotX, brBotY, blBotX, blBotY, rng, r, false, bowBias);
   if (rad > 0.5) {
     b.quadTo(
-      x + jitter(rng, cornerJit * 0.8),
-      y + h + jitter(rng, cornerJit * 0.8),
+      x + ox + jitter(rng, cornerJit * 0.85),
+      y + h + oy + jitter(rng, cornerJit * 0.85),
       blLeftX,
       blLeftY
     );
   }
 
   // Left edge -> Top-left corner
-  addBowedSegment(b, blLeftX, blLeftY, tlLeftX, tlLeftY, rng, r, false);
+  addBowedSegment(b, blLeftX, blLeftY, tlLeftX, tlLeftY, rng, r, false, -bowBias);
   if (rad > 0.5) {
     b.quadTo(
-      x + jitter(rng, cornerJit * 0.8),
-      y + jitter(rng, cornerJit * 0.8),
-      tlTopX + jitter(rng, cornerJit * 0.6),
-      tlTopY + jitter(rng, cornerJit * 0.6)
+      x + ox + jitter(rng, cornerJit * 0.85),
+      y + oy + jitter(rng, cornerJit * 0.85),
+      tlTopX + jitter(rng, cornerJit * 0.65),
+      tlTopY + jitter(rng, cornerJit * 0.65)
     );
   } else {
     b.lineTo(
-      tlTopX + jitter(rng, cornerJit * 0.6),
-      tlTopY + jitter(rng, cornerJit * 0.6)
+      tlTopX + jitter(rng, cornerJit * 0.65),
+      tlTopY + jitter(rng, cornerJit * 0.65)
     );
   }
 
-  // Natural marker closure overshoot along top edge
+  // Natural marker closure overshoot + crisp 3px-4px architectural corner overshoots
   if (overshoot > 0 && w - rad * 2 > overshoot * 2) {
     b.lineTo(
-      tlTopX + overshoot + jitter(rng, cornerJit * 0.4),
+      tlTopX + overshoot + jitter(rng, cornerJit * 0.45),
       tlTopY + jitter(rng, cornerJit * 0.5)
     );
+  }
+
+  // Add subtle 3px-4px hand-drawn marker corner overshoots on primary pass for card/table frames
+  if (passIndex === 0 && overshoot > 0 && w >= 48 && h >= 28 && r >= 0.55) {
+    const tick = Math.min(4.0, (3.0 + rng() * 1.0) * Math.min(1.1, r));
+    // Top-right outward horizontal nib flick
+    b.moveTo(trTopX - 1, trTopY);
+    b.lineTo(trTopX + tick, trTopY + jitter(rng, 0.5 * r));
+    // Bottom-left outward vertical nib flick
+    b.moveTo(blLeftX, blLeftY - 1);
+    b.lineTo(blLeftX + jitter(rng, 0.5 * r), blLeftY + tick);
   }
 }
 
 /**
  * Creates an organic double-stroke hand-drawn marker rounded rectangle
- * with subtle bowed edges and corner variation.
+ * with guaranteed curve bow, 2.2px-3.2px secondary pass separation, and 3px-4px corner overshoots.
  */
 export function createRoughRectPath(
   rect: RoughRectFrame,
@@ -309,10 +352,10 @@ export function createRoughRectPath(
   );
 
   return makePathFromBuilder((b) => {
-    // Primary continuous clockwise marker stroke
-    addRoughRoundedRectPass(b, rect, radius, rng, safeRough, 5);
-    // Secondary subtle sketchy over-stroke for authentic hand-drawn character
-    addRoughRoundedRectPass(b, rect, radius, rng, safeRough * 1.2, 0);
+    // Primary continuous clockwise marker stroke with crisp corner overshoots
+    addRoughRoundedRectPass(b, rect, radius, rng, safeRough, 4.0, 0);
+    // Secondary separated sketchy over-stroke (2.2px-3.2px offset) for iPhone/Android parity
+    addRoughRoundedRectPass(b, rect, radius, rng, safeRough * 1.15, 0, 1);
   });
 }
 
@@ -334,32 +377,32 @@ export function createRoughUnderlinePath(
 
   const rng = mulberry32(seed);
   const r = clampRoughness(roughness);
-  const inset = Math.min(26, rect.width * 0.09);
+  const inset = Math.min(24, rect.width * 0.08);
   const xStart = rect.x + inset;
   const xEnd = rect.x + rect.width - inset;
   const span = xEnd - xStart;
   if (span <= 2) return makeEmptySkiaPath();
 
-  const baseY = rect.y + rect.height - 4;
-  const bow1 = (1.1 + rng() * 1.4) * r * (rng() > 0.5 ? -1 : 1);
-  const bow2 = (0.9 + rng() * 1.2) * r * (bow1 > 0 ? -1 : 1);
+  const baseY = rect.y + rect.height - 5;
+  const bow1 = (1.5 + rng() * 1.4) * r * (rng() > 0.5 ? -1 : 1);
+  const bow2 = (1.3 + rng() * 1.3) * r * (bow1 > 0 ? -1 : 1);
 
   return makePathFromBuilder((b) => {
     // First confident marker sweep left -> right
-    const y1Start = baseY + jitter(rng, 0.7 * r);
-    const y1End = baseY + jitter(rng, 0.8 * r);
-    const mid1X = xStart + span * (0.45 + rng() * 0.12);
+    const y1Start = baseY + jitter(rng, 0.8 * r);
+    const y1End = baseY + jitter(rng, 0.9 * r);
+    const mid1X = xStart + span * (0.44 + rng() * 0.12);
     const mid1Y = baseY + bow1;
     b.moveTo(xStart, y1Start);
     b.quadTo(mid1X, mid1Y, xEnd, y1End);
 
-    // Second slightly shorter, lightly offset underline pass
+    // Second visibly separated (2.4px-3.2px) underline pass
     const extraInset = Math.min(14, span * 0.06);
-    const yOffset = 2.0 + rng() * 0.8;
-    const x2Start = xStart + extraInset + jitter(rng, 1.5 * r);
-    const x2End = xEnd - extraInset * 0.8 + jitter(rng, 1.5 * r);
-    const y2Start = baseY + yOffset + jitter(rng, 0.7 * r);
-    const y2End = baseY + yOffset + jitter(rng, 0.7 * r);
+    const yOffset = 2.4 + rng() * 0.8;
+    const x2Start = xStart + extraInset + jitter(rng, 1.6 * r);
+    const x2End = xEnd - extraInset * 0.75 + jitter(rng, 1.6 * r);
+    const y2Start = baseY + yOffset + jitter(rng, 0.8 * r);
+    const y2End = baseY + yOffset + jitter(rng, 0.8 * r);
     const mid2X = (x2Start + x2End) * (0.46 + rng() * 0.08);
     const mid2Y = baseY + yOffset + bow2;
     b.moveTo(x2Start, y2Start);
@@ -448,18 +491,23 @@ export function createRoughArrowPath(
   const headLen = Math.min(12, Math.max(7, dist * 0.28));
   const spread = Math.PI / 6;
 
+  const sep = Math.min(dist * 0.08, (2.2 + rng() * 0.9) * r) * (rng() > 0.5 ? 1 : -1);
+
   return makePathFromBuilder((b) => {
     // Pass 1: primary curved shaft
     b.moveTo(startX + jitter(rng, 0.8 * r), startY + jitter(rng, 0.8 * r));
     b.quadTo(ctrlX, ctrlY, endX, endY);
 
-    // Pass 2: light companion hand-drawn shaft
-    b.moveTo(startX + jitter(rng, 1.4 * r), startY + jitter(rng, 1.4 * r));
+    // Pass 2: visibly separated (2.2px-3.1px) companion hand-drawn shaft
+    b.moveTo(
+      startX + nx * sep + jitter(rng, 0.9 * r),
+      startY + ny * sep + jitter(rng, 0.9 * r)
+    );
     b.quadTo(
-      ctrlX + jitter(rng, 2.6 * r),
-      ctrlY + jitter(rng, 2.6 * r),
-      endX + jitter(rng, 1.0 * r),
-      endY + jitter(rng, 1.0 * r)
+      ctrlX + nx * sep * 1.15 + jitter(rng, 1.8 * r),
+      ctrlY + ny * sep * 1.15 + jitter(rng, 1.8 * r),
+      endX + nx * sep * 0.55 + jitter(rng, 0.9 * r),
+      endY + ny * sep * 0.55 + jitter(rng, 0.9 * r)
     );
 
     // Double-stroke sketchy arrowhead wings
@@ -501,12 +549,12 @@ export function createRoughCirclePath(
 
   const rng = mulberry32(seed);
   const r = clampRoughness(roughness);
-  const pad = 4;
 
+  // Symmetric centering directly from caller-padded rect (no hidden extra offset)
   const cx = rect.x + rect.width / 2;
   const cy = rect.y + rect.height / 2;
-  const rx = rect.width / 2 + pad;
-  const ry = rect.height / 2 + pad;
+  const rx = rect.width / 2;
+  const ry = rect.height / 2;
 
   const steps = 28;
   // ~375 degrees total sweep (with small organic variance) so ends cross naturally
@@ -575,9 +623,9 @@ export function createRoughTableGridPath(
   const cornerRadius = Math.min(10, w * 0.04, h * 0.08);
 
   return makePathFromBuilder((b) => {
-    // 1. Rough outer border (double-stroke marker frame)
-    addRoughRoundedRectPass(b, rect, cornerRadius, rng, safeRough, 4);
-    addRoughRoundedRectPass(b, rect, cornerRadius, rng, safeRough * 1.1, 0);
+    // 1. Rough outer border (double-stroke marker frame with 2.2-3.2px separation & corner overshoots)
+    addRoughRoundedRectPass(b, rect, cornerRadius, rng, safeRough, 3.8, 0);
+    addRoughRoundedRectPass(b, rect, cornerRadius, rng, safeRough * 1.15, 0, 1);
 
     // 2. Double horizontal header rule
     const clampedHeaderH =
@@ -587,8 +635,8 @@ export function createRoughTableGridPath(
 
     if (clampedHeaderH > 0) {
       const headerY = y + clampedHeaderH;
-      addRoughLine(b, x + 2, headerY - 1.1, x + w - 2, headerY - 1.1, rng, safeRough * 0.85, false);
-      addRoughLine(b, x + 2, headerY + 1.3, x + w - 2, headerY + 1.3, rng, safeRough * 0.85, false);
+      addRoughLine(b, x + 2, headerY - 1.3, x + w - 2, headerY - 1.3, rng, safeRough * 0.9, false);
+      addRoughLine(b, x + 2, headerY + 1.4, x + w - 2, headerY + 1.4, rng, safeRough * 0.9, false);
     }
 
     // 3. Internal column dividers
