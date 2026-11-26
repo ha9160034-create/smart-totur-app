@@ -1,5 +1,5 @@
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # خانات ثابتة للسبورة البيضاء حتى النموذج الرخيص ما يركب الكلام فوق بعضه
 WhiteboardSlot = Literal[
@@ -52,16 +52,34 @@ class VisualAction(BaseModel):
         description="Optional for wb_flow_card: draws an animated arrow from a previous slot to this slot."
     )
 
-    text: Optional[str] = Field(
-        default=None,
-        description="Text, LaTeX equation, or raw source code."
-    )
-
     code_lang: Optional[Literal["python", "cpp", "java", "r", "sql", "pseudocode"]] = None
     highlight_lines: Optional[List[int]] = Field(
         default=None,
-        description="1-based line numbers to highlight inside wb_code."
+        description="Optional 1-based line numbers (at most 3 lines, e.g. [2, 3]) to highlight inside wb_code."
     )
+
+    text: Optional[str] = Field(
+        default=None,
+        description="Text, LaTeX equation, or card body (for wb_heading, wb_bullet, wb_equation, wb_flow_card)."
+    )
+
+    code: Optional[str] = Field(
+        default=None,
+        description="REQUIRED for wb_code actions: 3 to 8 lines of real, runnable source code separated by newlines (never empty or placeholder)."
+    )
+
+    @model_validator(mode="after")
+    def validate_wb_code_non_empty(self) -> "VisualAction":
+        if self.type == "wb_code":
+            resolved = (self.code or self.text or "").strip()
+            if not resolved:
+                raise ValueError(
+                    "wb_code action must provide non-empty source code in `code` (or `text`)."
+                )
+            self.code = resolved
+            if not (self.text or "").strip():
+                self.text = resolved
+        return self
 
 class TeachingStep(BaseModel):
     step_id: int = Field(..., ge=1)

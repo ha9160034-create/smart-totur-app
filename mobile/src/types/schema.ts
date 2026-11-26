@@ -28,6 +28,7 @@ export interface VisualAction {
   slot?: WhiteboardSlot;
   connect_from_slot?: WhiteboardSlot;
   text?: string;
+  code?: string;
   code_lang?: "python" | "cpp" | "java" | "r" | "sql" | "pseudocode";
   highlight_lines?: number[];
 }

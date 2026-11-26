@@ -6,12 +6,15 @@ import {
   ScrollView,
   StatusBar,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from "react-native-safe-area-context";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import {
@@ -71,11 +74,15 @@ interface RecentLecturesResponse {
   supabase_configured: boolean;
 }
 
+const BOARD_MODE_CYCLE: BoardMode[] = ["auto", "whiteboard", "pdf_overlay"];
+
 const BOARD_MODE_SHORT_LABELS: Record<BoardMode, string> = {
-  auto: "Auto",
-  pdf_overlay: "PDF",
+  auto: "AUTO",
   whiteboard: "WB",
+  pdf_overlay: "PDF",
 };
+
+const PLAYBACK_SPEEDS: PlaybackSpeed[] = [1.0, 1.25, 1.5];
 
 function requestJson<T>(url: string, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -137,19 +144,14 @@ function requestJson<T>(url: string, timeoutMs: number): Promise<T> {
   });
 }
 
-const BOARD_MODES: Array<{ value: BoardMode; label: string }> = [
-  { value: "auto", label: "Auto" },
-  { value: "pdf_overlay", label: "PDF Overlay" },
-  { value: "whiteboard", label: "Whiteboard" },
-];
+function TutorWorkspace() {
+  const insets = useSafeAreaInsets();
 
-const PLAYBACK_SPEEDS: PlaybackSpeed[] = [1.0, 1.25, 1.5];
-
-export default function App() {
   const [pdfFile, setPdfFile] = useState<PickedPdf | null>(null);
   const [pageInput, setPageInput] = useState<string>("1");
   const [boardMode, setBoardMode] = useState<BoardMode>("auto");
   const [useDeepModel, setUseDeepModel] = useState<boolean>(false);
+  const [showCaptions, setShowCaptions] = useState<boolean>(true);
 
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -165,15 +167,17 @@ export default function App() {
   const [recentLectures, setRecentLectures] = useState<LectureSummary[]>([]);
   const [supabaseConfigured, setSupabaseConfigured] = useState<boolean>(true);
 
-  // Audio-Visual Sync Engine State (expo-audio)
-  const player = useAudioPlayer(null);
+  // Audio-Visual Sync Engine State (expo-audio at 50ms update cadence for smooth progressive drawing)
+  const player = useAudioPlayer(null, { updateInterval: 50 });
   const status = useAudioPlayerStatus(player);
   const [stepAudioUris, setStepAudioUris] = useState<Array<string | null>>([]);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(1.0);
   const [replayToken, setReplayToken] = useState<number>(0);
 
-  // Atomic lock: prevents stale status.didJustFinish from advancing a step more than once
+  // Atomic locks: prevent stale didJustFinish skipping & keep iOS AVPlayer auto-playing across steps
   const advancedFromStepRef = useRef<number | null>(null);
+  const shouldAutoPlayRef = useRef<boolean>(false);
   const playbackSpeedRef = useRef<PlaybackSpeed>(1.0);
   const cacheSessionRef = useRef<number>(0);
 
@@ -185,6 +189,41 @@ export default function App() {
     if (!result || result.slide_height <= 0) return 16 / 9;
     return result.slide_width / result.slide_height;
   }, [result]);
+
+  // Normalized 0..1 audio progress driving live progressive board drawing & typewriter reveal
+  const stepProgress = useMemo(() => {
+    if (!result || !currentStep) return 1;
+    if (!currentStepAudioUri) return 1;
+    // Prevent 1-frame flash at 1.0 when transitioning into a new step before AVPlayer resets didJustFinish
+    if (
+      advancedFromStepRef.current === stepIndex &&
+      isPlaying &&
+      !status.playing
+    ) {
+      return 0;
+    }
+    if (status.didJustFinish) {
+      return 1;
+    }
+    if (status.duration > 0) {
+      const ratio = status.currentTime / status.duration;
+      if (!status.playing && !isPlaying && ratio >= 0.98) {
+        return 1;
+      }
+      return Math.max(0, Math.min(1, ratio));
+    }
+    return 0;
+  }, [
+    result,
+    currentStep,
+    currentStepAudioUri,
+    stepIndex,
+    isPlaying,
+    status.currentTime,
+    status.duration,
+    status.playing,
+    status.didJustFinish,
+  ]);
 
   // Configure expo-audio session on mount so iOS plays audio even with mute switch on
   useEffect(() => {
@@ -205,24 +244,61 @@ export default function App() {
     }
 
     if (!result || !currentStep || !currentStepAudioUri) {
+      setIsPlaying(false);
       return;
     }
 
     try {
       player.replace({ uri: currentStepAudioUri });
       player.setPlaybackRate(playbackSpeedRef.current);
-      player.play();
+      if (shouldAutoPlayRef.current) {
+        setIsPlaying(true);
+        player.play();
+      } else {
+        setIsPlaying(false);
+      }
     } catch (err) {
       console.warn("Step audio playback error:", err);
+      setIsPlaying(false);
     }
   }, [result, stepIndex, currentStep, currentStepAudioUri, player]);
 
-  // Unlock auto-advance ONLY after the active step genuinely starts playing with didJustFinish cleared
+  // Ensure iOS AVPlayer reliably starts playing once the replaced step finishes loading
   useEffect(() => {
-    if (status.playing && !status.didJustFinish) {
-      advancedFromStepRef.current = null;
+    if (status.playing) {
+      setIsPlaying(true);
+      if (!status.didJustFinish) {
+        advancedFromStepRef.current = null;
+      }
+      return;
     }
-  }, [status.playing, status.didJustFinish]);
+
+    if (
+      shouldAutoPlayRef.current &&
+      currentStepAudioUri &&
+      status.isLoaded &&
+      !status.didJustFinish
+    ) {
+      try {
+        player.setPlaybackRate(playbackSpeedRef.current);
+        player.play();
+        setIsPlaying(true);
+      } catch (err) {
+        console.warn("Auto-play on isLoaded failed:", err);
+      }
+      return;
+    }
+
+    if (!shouldAutoPlayRef.current) {
+      setIsPlaying(false);
+    }
+  }, [
+    status.isLoaded,
+    status.playing,
+    status.didJustFinish,
+    currentStepAudioUri,
+    player,
+  ]);
 
   // Watch status.didJustFinish to advance strictly once per completed TeachingStep
   useEffect(() => {
@@ -234,9 +310,16 @@ export default function App() {
     advancedFromStepRef.current = stepIndex;
 
     if (stepIndex < steps.length - 1) {
+      // Keep auto-play armed across step transitions
+      shouldAutoPlayRef.current = true;
+      setIsPlaying(true);
       setStepIndex((prev) =>
         prev === stepIndex && prev < steps.length - 1 ? prev + 1 : prev
       );
+    } else {
+      // Final step finished naturally
+      shouldAutoPlayRef.current = false;
+      setIsPlaying(false);
     }
   }, [result, status.didJustFinish, stepIndex, steps.length]);
 
@@ -244,9 +327,13 @@ export default function App() {
     if (!currentStepAudioUri) return;
 
     try {
-      if (status.playing) {
+      if (isPlaying || status.playing) {
+        shouldAutoPlayRef.current = false;
+        setIsPlaying(false);
         player.pause();
       } else {
+        shouldAutoPlayRef.current = true;
+        setIsPlaying(true);
         const atEnd =
           status.didJustFinish ||
           (status.duration > 0 && status.currentTime >= status.duration - 0.15);
@@ -268,6 +355,8 @@ export default function App() {
     setReplayToken((t) => t + 1);
 
     if (currentStepAudioUri) {
+      shouldAutoPlayRef.current = true;
+      setIsPlaying(true);
       try {
         player.seekTo(0);
         player.setPlaybackRate(playbackSpeedRef.current);
@@ -280,6 +369,10 @@ export default function App() {
 
   const handleSelectStep = (nextIndex: number) => {
     if (nextIndex < 0 || nextIndex >= steps.length) return;
+    // Preserve continuous playback if user taps Next/Prev while playing
+    if (isPlaying || status.playing) {
+      shouldAutoPlayRef.current = true;
+    }
     advancedFromStepRef.current = nextIndex;
     setStepIndex(nextIndex);
   };
@@ -295,6 +388,11 @@ export default function App() {
     } catch {
       // Speed will apply when the next step loads
     }
+  };
+
+  const handleCycleBoardMode = () => {
+    const idx = BOARD_MODE_CYCLE.indexOf(boardMode);
+    setBoardMode(BOARD_MODE_CYCLE[(idx + 1) % BOARD_MODE_CYCLE.length]);
   };
 
   const handlePickPdf = async () => {
@@ -361,7 +459,9 @@ export default function App() {
       })
     );
 
+    shouldAutoPlayRef.current = true;
     advancedFromStepRef.current = 0;
+    setIsPlaying(Boolean(cachedUris[0]));
     setStepAudioUris(cachedUris);
     setResult(data);
     setStepIndex(0);
@@ -397,6 +497,8 @@ export default function App() {
     cachedPage: CachedPageSummary
   ) => {
     setRecentModalVisible(false);
+    shouldAutoPlayRef.current = false;
+    setIsPlaying(false);
     advancedFromStepRef.current = 0;
     try {
       player.pause();
@@ -440,6 +542,8 @@ export default function App() {
     }
 
     // Pause any playing audio and lock auto-advance before fetching the new slide
+    shouldAutoPlayRef.current = false;
+    setIsPlaying(false);
     advancedFromStepRef.current = 0;
     try {
       player.pause();
@@ -534,671 +638,865 @@ export default function App() {
   const canGoPrev = stepIndex > 0;
   const canGoNext = stepIndex < steps.length - 1;
   const isLastStep = steps.length > 0 && stepIndex === steps.length - 1;
+  const isPdfOverlayActive = currentStep?.mode === "pdf_overlay";
+
+  const topHudInset = insets.top + 62;
+  const bottomHudInset =
+    insets.bottom + (result && currentStep && showCaptions ? 174 : 84);
+
+  const activeDocLabel = pdfFile
+    ? pdfFile.name.replace(/\.pdf$/i, "")
+    : result?.plan.title ?? "Pick PDF";
 
   return (
-    <SafeAreaProvider>
-      <SafeAreaView style={styles.safeArea}>
-        <StatusBar barStyle="dark-content" />
+    <View style={styles.root}>
+      <StatusBar
+        barStyle={isPdfOverlayActive ? "light-content" : "dark-content"}
+      />
 
-        {/* Top Controls Bar */}
-        <View style={styles.controlsCard}>
-          <View style={styles.topRow}>
-            <Pressable style={styles.pickBtn} onPress={handlePickPdf}>
-              <Text style={styles.pickBtnText} numberOfLines={1}>
-                {pdfFile ? `PDF: ${pdfFile.name}` : "Select Lecture PDF"}
+      {/* ================================================================= */}
+      {/* LAYER 0: 100% Full-Screen Interactive Pan & Zoom Spatial Canvas   */}
+      {/* ================================================================= */}
+      <View style={styles.canvasFullScreen}>
+        {result && currentStep ? (
+          <SmartBoardCanvas
+            key={`board-${result.page_number}`}
+            steps={steps}
+            currentStepIndex={stepIndex}
+            slideImageUri={result.slide_image_data_uri}
+            slideAspectRatio={slideAspectRatio}
+            stepProgress={stepProgress}
+            isPlaying={isPlaying || status.playing}
+            replayToken={replayToken}
+            topInset={topHudInset}
+            bottomInset={bottomHudInset}
+          />
+        ) : (
+          <View style={styles.emptyPaperStage}>
+            <View style={styles.welcomeCard}>
+              <Text style={styles.welcomeBadge}>SPATIAL AI WHITEBOARD</Text>
+              <Text style={styles.welcomeTitle}>AI Smart Whiteboard Tutor</Text>
+              <Text style={styles.welcomeSub}>
+                Select a lecture PDF or open a cached lecture to explore
+                step-by-step explanations on an interactive pan & zoom paper
+                canvas.
               </Text>
-            </Pressable>
 
-            <Pressable
-              style={styles.recentBtn}
-              onPress={handleOpenRecentLectures}
+              <View style={styles.welcomeActions}>
+                <Pressable
+                  style={styles.welcomePrimaryBtn}
+                  onPress={handlePickPdf}
+                >
+                  <Text style={styles.welcomePrimaryText}>
+                    {pdfFile ? "Change Lecture PDF" : "Select Lecture PDF"}
+                  </Text>
+                </Pressable>
+
+                <Pressable
+                  style={styles.welcomeSecondaryBtn}
+                  onPress={handleOpenRecentLectures}
+                >
+                  <Text style={styles.welcomeSecondaryText}>
+                    Recent Lectures
+                  </Text>
+                </Pressable>
+              </View>
+
+              {pdfFile && (
+                <Text style={styles.welcomeSelectedNote} numberOfLines={1}>
+                  Ready: {pdfFile.name} • Page {pageInput || "1"}
+                </Text>
+              )}
+            </View>
+          </View>
+        )}
+      </View>
+
+      {/* ================================================================= */}
+      {/* LAYER 1: Top Floating Spatial HUD (box-none passes pan/zoom)      */}
+      {/* ================================================================= */}
+      <View
+        pointerEvents="box-none"
+        style={[styles.topHudRow, { top: insets.top + 8 }]}
+      >
+        {/* Top-Left Subtle Pill: PDF Title + Page Selector + Recent */}
+        <View style={styles.topLeftPill}>
+          <Pressable style={styles.docChip} onPress={handlePickPdf}>
+            <Text style={styles.docChipText} numberOfLines={1}>
+              {activeDocLabel}
+            </Text>
+          </Pressable>
+
+          {result?.cached && (
+            <View style={styles.cachedPill}>
+              <Text style={styles.cachedPillText}>Cached ⚡</Text>
+            </View>
+          )}
+
+          <View style={styles.pillDivider} />
+
+          <View style={styles.pageMiniGroup}>
+            <Text style={styles.pageMiniPrefix}>P.</Text>
+            <TextInput
+              value={pageInput}
+              onChangeText={setPageInput}
+              keyboardType="number-pad"
+              maxLength={4}
+              style={styles.pageMiniInput}
+              placeholder="1"
+              placeholderTextColor="#94A3B8"
+              returnKeyType="go"
+              onSubmitEditing={() => {
+                if (pdfFile && !loading) void handleExplain();
+              }}
+            />
+          </View>
+
+          <View style={styles.pillDivider} />
+
+          <Pressable
+            style={styles.recentMiniBtn}
+            onPress={handleOpenRecentLectures}
+          >
+            <Text style={styles.recentMiniText}>Recent</Text>
+          </Pressable>
+        </View>
+
+        {/* Top-Right Compact Circular Icons: Mode, Deep, Captions */}
+        <View style={styles.topRightIcons}>
+          <Pressable
+            style={[
+              styles.circleIconBtn,
+              boardMode !== "auto" && styles.circleIconBtnBlue,
+            ]}
+            onPress={handleCycleBoardMode}
+            accessibilityLabel="Toggle board mode"
+          >
+            <Text
+              style={[
+                styles.circleIconLabel,
+                boardMode !== "auto" && styles.circleIconLabelActive,
+              ]}
             >
-              <Text style={styles.recentBtnText}>Recent</Text>
-            </Pressable>
-
-            <View style={styles.pageBox}>
-              <Text style={styles.pageLabel}>Page</Text>
-              <TextInput
-                value={pageInput}
-                onChangeText={setPageInput}
-                keyboardType="number-pad"
-                maxLength={4}
-                style={styles.pageInput}
-                placeholder="1"
-              />
-            </View>
-          </View>
-
-          {/* Board Mode Selector + Deep Model Toggle */}
-          <View style={styles.modeRow}>
-            <View style={styles.segmentGroup}>
-              {BOARD_MODES.map((m) => {
-                const active = boardMode === m.value;
-                return (
-                  <Pressable
-                    key={m.value}
-                    onPress={() => setBoardMode(m.value)}
-                    style={[styles.segmentBtn, active && styles.segmentBtnActive]}
-                  >
-                    <Text
-                      style={[
-                        styles.segmentText,
-                        active && styles.segmentTextActive,
-                      ]}
-                    >
-                      {m.label}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-
-            <View style={styles.deepToggle}>
-              <Text style={styles.deepLabel}>Deep</Text>
-              <Switch
-                value={useDeepModel}
-                onValueChange={setUseDeepModel}
-                trackColor={{ false: "#CBD5E1", true: "#93C5FD" }}
-                thumbColor={useDeepModel ? "#2563EB" : "#F8FAFC"}
-              />
-            </View>
-          </View>
+              {BOARD_MODE_SHORT_LABELS[boardMode]}
+            </Text>
+          </Pressable>
 
           <Pressable
             style={[
-              styles.explainBtn,
-              (!pdfFile || loading) && styles.explainBtnDisabled,
+              styles.circleIconBtn,
+              useDeepModel && styles.circleIconBtnDeep,
             ]}
-            onPress={handleExplain}
-            disabled={!pdfFile || loading}
+            onPress={() => setUseDeepModel((v) => !v)}
+            accessibilityLabel="Toggle deep reasoning mode"
           >
-            {loading ? (
-              <View style={styles.loadingRow}>
-                <ActivityIndicator size="small" color="#FFFFFF" />
-                <Text style={styles.explainBtnText}>
-                  Analyzing & voicing slide...
-                </Text>
-              </View>
-            ) : (
-              <Text style={styles.explainBtnText}>Explain Page</Text>
-            )}
+            <Text
+              style={[
+                styles.circleIconSymbol,
+                useDeepModel && styles.circleIconLabelActive,
+              ]}
+            >
+              ✦
+            </Text>
           </Pressable>
 
-          {error && (
-            <View style={styles.errorBanner}>
-              <Text style={styles.errorText}>{error}</Text>
-            </View>
-          )}
-        </View>
-
-        {/* Main 60fps SmartBoardCanvas Viewport */}
-        <View style={styles.canvasWrapper}>
-          {result && currentStep ? (
-            <>
-              <View style={styles.planMetaBar}>
-                <Text style={styles.planTitle} numberOfLines={1}>
-                  {result.plan.title}
-                </Text>
-                <View style={styles.metaBadgesRow}>
-                  {result.cached && (
-                    <View style={styles.cachedBadge}>
-                      <Text style={styles.cachedBadgeText}>Cached ⚡</Text>
-                    </View>
-                  )}
-                  <Text style={styles.modeBadge}>
-                    {currentStep.mode === "pdf_overlay"
-                      ? "PDF OVERLAY"
-                      : "WHITEBOARD"}{" "}
-                    • {stepIndex + 1}/{steps.length}
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.canvasStage}>
-                <SmartBoardCanvas
-                  key={`board-${result.page_number}-${replayToken}`}
-                  steps={steps}
-                  currentStepIndex={stepIndex}
-                  slideImageUri={result.slide_image_data_uri}
-                  slideAspectRatio={slideAspectRatio}
-                />
-              </View>
-            </>
-          ) : (
-            <View style={styles.placeholderStage}>
-              <Text style={styles.placeholderTitle}>
-                AI Smart Whiteboard Tutor
-              </Text>
-              <Text style={styles.placeholderSub}>
-                Pick a PDF lecture, enter a page number, and tap "Explain Page"
-                for a thorough 5–8 step explanation with synchronized Iraqi
-                voice & Skia whiteboard animations.
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {/* Bottom Speech Transcript + Synchronized Audio & Step Controls */}
-        {result && currentStep && (
-          <View style={styles.footerCard}>
-            <ScrollView
-              style={styles.speechScroll}
-              showsVerticalScrollIndicator={false}
+          <Pressable
+            style={[
+              styles.circleIconBtn,
+              showCaptions && styles.circleIconBtnDark,
+            ]}
+            onPress={() => setShowCaptions((v) => !v)}
+            accessibilityLabel="Toggle captions"
+          >
+            <Text
+              style={[
+                styles.circleIconLabel,
+                showCaptions && styles.circleIconLabelActive,
+              ]}
             >
-              <Text style={styles.speechAr}>{currentStep.speech_ar}</Text>
+              CC
+            </Text>
+          </Pressable>
+        </View>
+      </View>
 
-              {currentStep.en_terms.length > 0 && (
-                <Text style={styles.enTermsText}>
-                  EN Terms: {currentStep.en_terms.join(" • ")}
+      {/* Dismissible Floating Error Toast */}
+      {error && (
+        <Pressable
+          style={[styles.floatingErrorToast, { top: insets.top + 56 }]}
+          onPress={() => setError(null)}
+        >
+          <Text style={styles.floatingErrorText} numberOfLines={3}>
+            {error}
+          </Text>
+          <Text style={styles.floatingErrorDismiss}>✕</Text>
+        </Pressable>
+      )}
+
+      {/* ================================================================= */}
+      {/* LAYER 2: Collapsible Compact Captions Strip (Above Bottom Dock)   */}
+      {/* ================================================================= */}
+      {result && currentStep && showCaptions && (
+        <View
+          style={[styles.captionStripCard, { bottom: insets.bottom + 72 }]}
+        >
+          <ScrollView
+            style={styles.captionScroll}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.captionSpeechAr}>{currentStep.speech_ar}</Text>
+
+            {isLastStep && !!result.plan.quiz_question_ar && (
+              <View style={styles.captionQuizRow}>
+                <Text style={styles.captionQuizText}>
+                  سؤال تطبيقي: {result.plan.quiz_question_ar}
                 </Text>
-              )}
+              </View>
+            )}
+          </ScrollView>
+        </View>
+      )}
 
-              {isLastStep && !!result.plan.quiz_question_ar && (
-                <View style={styles.quizBox}>
-                  <Text style={styles.quizLabel}>سؤال تطبيقي:</Text>
-                  <Text style={styles.quizText}>
-                    {result.plan.quiz_question_ar}
-                  </Text>
-                </View>
-              )}
-            </ScrollView>
+      {/* ================================================================= */}
+      {/* LAYER 3: Bottom Floating Dark Pill Bar (Playback + Upload/Explain)*/}
+      {/* ================================================================= */}
+      <View
+        pointerEvents="box-none"
+        style={[styles.bottomDockWrap, { bottom: insets.bottom + 10 }]}
+      >
+        <View style={styles.bottomDarkPill}>
+          {loading ? (
+            <View style={styles.dockLoadingRow}>
+              <ActivityIndicator size="small" color="#F8FAFC" />
+              <Text style={styles.dockLoadingText}>
+                Analyzing & voicing page {pageInput || "1"}...
+              </Text>
+            </View>
+          ) : result && currentStep ? (
+            <>
+              <Pressable
+                style={[styles.dockIconBtn, !canGoPrev && styles.dockDisabled]}
+                onPress={() => canGoPrev && handleSelectStep(stepIndex - 1)}
+                disabled={!canGoPrev}
+              >
+                <Text style={styles.dockIconText}>‹</Text>
+              </Pressable>
 
-            {/* Audio Sync Transport Controls: Play/Pause, Replay, Speed */}
-            <View style={styles.audioBar}>
               <Pressable
                 style={[
-                  styles.audioBtn,
-                  styles.audioPlayBtn,
-                  !currentStepAudioUri && styles.navBtnDisabled,
+                  styles.dockPlayBtn,
+                  !currentStepAudioUri && styles.dockDisabled,
                 ]}
                 onPress={handleTogglePlayPause}
                 disabled={!currentStepAudioUri}
               >
-                <Text style={styles.audioPlayBtnText}>
-                  {status.playing ? "⏸ Pause" : "▶ Play"}
+                <Text style={styles.dockPlayText}>
+                  {isPlaying || status.playing ? "⏸" : "▶"}
                 </Text>
               </Pressable>
 
-              <Pressable style={styles.audioBtn} onPress={handleReplayStep}>
-                <Text style={styles.audioBtnText}>↺ Replay Step</Text>
+              <Pressable style={styles.dockIconBtn} onPress={handleReplayStep}>
+                <Text style={styles.dockReplayText}>↺</Text>
               </Pressable>
 
-              <Pressable
-                style={[styles.audioBtn, styles.speedBtn]}
-                onPress={handleCycleSpeed}
-              >
-                <Text style={styles.speedBtnText}>
-                  {playbackSpeed.toFixed(playbackSpeed === 1.25 ? 2 : 1)}x
-                </Text>
-              </Pressable>
-            </View>
-
-            {/* Step Navigation Controls: Previous / Next */}
-            <View style={styles.navRow}>
-              <Pressable
-                style={[styles.navBtn, !canGoPrev && styles.navBtnDisabled]}
-                onPress={() => canGoPrev && handleSelectStep(stepIndex - 1)}
-                disabled={!canGoPrev}
-              >
-                <Text style={styles.navBtnText}>السابق</Text>
-              </Pressable>
-
-              <Text style={styles.stepCounter}>
-                Step {currentStep.step_id} / {steps.length}
+              <Text style={styles.dockStepText}>
+                {stepIndex + 1}/{steps.length}
               </Text>
 
               <Pressable
-                style={[
-                  styles.navBtn,
-                  styles.navBtnPrimary,
-                  !canGoNext && styles.navBtnDisabled,
-                ]}
+                style={[styles.dockIconBtn, !canGoNext && styles.dockDisabled]}
                 onPress={() => canGoNext && handleSelectStep(stepIndex + 1)}
                 disabled={!canGoNext}
               >
-                <Text style={[styles.navBtnText, styles.navBtnPrimaryText]}>
-                  التالي
+                <Text style={styles.dockIconText}>›</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.dockSpeedBtn}
+                onPress={handleCycleSpeed}
+              >
+                <Text style={styles.dockSpeedText}>
+                  {playbackSpeed.toFixed(playbackSpeed === 1.25 ? 2 : 1)}x
                 </Text>
               </Pressable>
-            </View>
-          </View>
-        )}
 
-        {/* Recent Lectures Slide-Up Modal Drawer */}
-        <Modal
-          visible={recentModalVisible}
-          animationType="slide"
-          transparent
-          onRequestClose={() => setRecentModalVisible(false)}
-        >
-          <View style={styles.modalBackdrop}>
-            <View style={styles.modalSheet}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Recent Lectures</Text>
-                <View style={styles.modalHeaderActions}>
-                  <Pressable
-                    style={styles.modalActionBtn}
-                    onPress={() => void fetchRecentLectures()}
-                    disabled={recentLoading}
-                  >
-                    <Text style={styles.modalActionText}>↻ Refresh</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.modalActionBtn, styles.modalCloseBtn]}
-                    onPress={() => setRecentModalVisible(false)}
-                  >
-                    <Text style={styles.modalCloseText}>Close</Text>
-                  </Pressable>
-                </View>
-              </View>
+              <Pressable
+                style={styles.dockPrimaryTrigger}
+                onPress={pdfFile ? handleExplain : handlePickPdf}
+              >
+                <Text style={styles.dockPrimaryTriggerText}>
+                  {pdfFile ? "Explain" : "+ PDF"}
+                </Text>
+              </Pressable>
+            </>
+          ) : (
+            <>
+              <Pressable
+                style={styles.dockAskTrigger}
+                onPress={handlePickPdf}
+              >
+                <Text style={styles.dockAskText} numberOfLines={1}>
+                  {pdfFile
+                    ? `PDF: ${pdfFile.name}`
+                    : "Pick a lecture PDF to begin..."}
+                </Text>
+              </Pressable>
 
-              {recentLoading ? (
-                <View style={styles.modalCenter}>
-                  <ActivityIndicator size="small" color="#2563EB" />
-                  <Text style={styles.modalHint}>
-                    Loading saved lectures...
-                  </Text>
-                </View>
-              ) : recentError ? (
-                <View style={styles.errorBanner}>
-                  <Text style={styles.errorText}>{recentError}</Text>
-                </View>
-              ) : !supabaseConfigured ? (
-                <View style={styles.modalCenter}>
-                  <Text style={styles.modalHint}>
-                    Supabase persistence is not configured on the backend yet.
-                    Add SUPABASE_URL and SUPABASE_KEY to backend/.env.
-                  </Text>
-                </View>
-              ) : recentLectures.length === 0 ? (
-                <View style={styles.modalCenter}>
-                  <Text style={styles.modalHint}>
-                    No cached lectures yet. Upload a PDF and explain a page to
-                    save it here for instant replay.
-                  </Text>
-                </View>
-              ) : (
-                <ScrollView
-                  style={styles.modalList}
-                  contentContainerStyle={styles.modalListContent}
-                  showsVerticalScrollIndicator={false}
+              <Pressable
+                style={[
+                  styles.dockPrimaryTrigger,
+                  !pdfFile && styles.dockDisabled,
+                ]}
+                onPress={handleExplain}
+                disabled={!pdfFile}
+              >
+                <Text style={styles.dockPrimaryTriggerText}>Explain Page</Text>
+              </Pressable>
+            </>
+          )}
+        </View>
+      </View>
+
+      {/* ================================================================= */}
+      {/* Recent Lectures Slide-Up Modal Drawer (Stage 5 Supabase Cache)    */}
+      {/* ================================================================= */}
+      <Modal
+        visible={recentModalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setRecentModalVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalSheet}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Recent Lectures</Text>
+              <View style={styles.modalHeaderActions}>
+                <Pressable
+                  style={styles.modalActionBtn}
+                  onPress={() => void fetchRecentLectures()}
+                  disabled={recentLoading}
                 >
-                  {recentLectures.map((lecture) => (
-                    <View key={lecture.id} style={styles.lectureCard}>
-                      <View style={styles.lectureCardHeader}>
-                        <Text style={styles.lectureTitle} numberOfLines={2}>
-                          {lecture.title}
-                        </Text>
-                        <Text style={styles.lectureMeta}>
-                          {lecture.total_pages} pages
-                        </Text>
-                      </View>
-
-                      {lecture.cached_pages.length > 0 ? (
-                        <View style={styles.cachedChipsWrap}>
-                          {lecture.cached_pages.map((cp, idx) => (
-                            <Pressable
-                              key={`${lecture.id}-${cp.page_number}-${cp.board_mode}-${String(cp.use_deep_model)}-${idx}`}
-                              style={styles.cachedChip}
-                              onPress={() =>
-                                void handleSelectCachedPage(lecture, cp)
-                              }
-                            >
-                              <Text style={styles.cachedChipText}>
-                                P.{cp.page_number} •{" "}
-                                {BOARD_MODE_SHORT_LABELS[cp.board_mode]}
-                                {cp.use_deep_model ? " • Deep" : ""} ⚡
-                              </Text>
-                            </Pressable>
-                          ))}
-                        </View>
-                      ) : (
-                        <Text style={styles.noCachedPagesText}>
-                          Indexed for RAG — no explained pages cached yet.
-                        </Text>
-                      )}
-                    </View>
-                  ))}
-                </ScrollView>
-              )}
+                  <Text style={styles.modalActionText}>↻ Refresh</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.modalActionBtn, styles.modalCloseBtn]}
+                  onPress={() => setRecentModalVisible(false)}
+                >
+                  <Text style={styles.modalCloseText}>Close</Text>
+                </Pressable>
+              </View>
             </View>
+
+            {recentLoading ? (
+              <View style={styles.modalCenter}>
+                <ActivityIndicator size="small" color="#2563EB" />
+                <Text style={styles.modalHint}>Loading saved lectures...</Text>
+              </View>
+            ) : recentError ? (
+              <View style={styles.modalErrorBanner}>
+                <Text style={styles.modalErrorText}>{recentError}</Text>
+              </View>
+            ) : !supabaseConfigured ? (
+              <View style={styles.modalCenter}>
+                <Text style={styles.modalHint}>
+                  Supabase persistence is not configured on the backend yet. Add
+                  SUPABASE_URL and SUPABASE_KEY to backend/.env.
+                </Text>
+              </View>
+            ) : recentLectures.length === 0 ? (
+              <View style={styles.modalCenter}>
+                <Text style={styles.modalHint}>
+                  No cached lectures yet. Upload a PDF and explain a page to
+                  save it here for instant replay.
+                </Text>
+              </View>
+            ) : (
+              <ScrollView
+                style={styles.modalList}
+                contentContainerStyle={styles.modalListContent}
+                showsVerticalScrollIndicator={false}
+              >
+                {recentLectures.map((lecture) => (
+                  <View key={lecture.id} style={styles.lectureCard}>
+                    <View style={styles.lectureCardHeader}>
+                      <Text style={styles.lectureTitle} numberOfLines={2}>
+                        {lecture.title}
+                      </Text>
+                      <Text style={styles.lectureMeta}>
+                        {lecture.total_pages} pages
+                      </Text>
+                    </View>
+
+                    {lecture.cached_pages.length > 0 ? (
+                      <View style={styles.cachedChipsWrap}>
+                        {lecture.cached_pages.map((cp, idx) => (
+                          <Pressable
+                            key={`${lecture.id}-${cp.page_number}-${cp.board_mode}-${String(cp.use_deep_model)}-${idx}`}
+                            style={styles.cachedChip}
+                            onPress={() =>
+                              void handleSelectCachedPage(lecture, cp)
+                            }
+                          >
+                            <Text style={styles.cachedChipText}>
+                              P.{cp.page_number} •{" "}
+                              {BOARD_MODE_SHORT_LABELS[cp.board_mode]}
+                              {cp.use_deep_model ? " • Deep" : ""} ⚡
+                            </Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    ) : (
+                      <Text style={styles.noCachedPagesText}>
+                        Indexed for RAG — no explained pages cached yet.
+                      </Text>
+                    )}
+                  </View>
+                ))}
+              </ScrollView>
+            )}
           </View>
-        </Modal>
-      </SafeAreaView>
-    </SafeAreaProvider>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <GestureHandlerRootView style={styles.gestureRoot}>
+      <SafeAreaProvider>
+        <TutorWorkspace />
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
+  gestureRoot: {
     flex: 1,
-    backgroundColor: "#F1F5F9",
   },
-  controlsCard: {
+  root: {
+    flex: 1,
+    backgroundColor: "#FAF8F5",
+  },
+  canvasFullScreen: {
+    flex: 1,
+  },
+  emptyPaperStage: {
+    flex: 1,
+    backgroundColor: "#FAF8F5",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 24,
+  },
+  welcomeCard: {
+    width: "100%",
+    maxWidth: 380,
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#E2E8F0",
-    gap: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "#E7E2D9",
+    padding: 22,
+    alignItems: "center",
+    gap: 10,
+    shadowColor: "#1E293B",
+    shadowOpacity: 0.06,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 3,
   },
-  topRow: {
+  welcomeBadge: {
+    fontSize: 10.5,
+    fontWeight: "800",
+    letterSpacing: 1.1,
+    color: "#0F766E",
+    backgroundColor: "#F0FDFA",
+    borderWidth: 1,
+    borderColor: "#CCFBF1",
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 999,
+  },
+  welcomeTitle: {
+    fontSize: 19,
+    fontWeight: "800",
+    color: "#0F172A",
+    textAlign: "center",
+  },
+  welcomeSub: {
+    fontSize: 13.5,
+    lineHeight: 20,
+    color: "#64748B",
+    textAlign: "center",
+  },
+  welcomeActions: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 6,
+    width: "100%",
+  },
+  welcomePrimaryBtn: {
+    flex: 1,
+    backgroundColor: "#18181B",
+    borderRadius: 12,
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  welcomePrimaryText: {
+    color: "#FAF8F5",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  welcomeSecondaryBtn: {
+    flex: 1,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 12,
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  welcomeSecondaryText: {
+    color: "#1E293B",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  welcomeSelectedNote: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#0F766E",
+  },
+
+  // Top Floating HUD
+  topHudRow: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    zIndex: 30,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     gap: 8,
   },
-  pickBtn: {
+  topLeftPill: {
     flex: 1,
-    backgroundColor: "#EFF6FF",
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.94)",
     borderWidth: 1,
-    borderColor: "#BFDBFE",
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    borderColor: "#E7E2D9",
+    borderRadius: 999,
+    paddingLeft: 10,
+    paddingRight: 6,
+    paddingVertical: 5,
+    gap: 6,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
   },
-  pickBtnText: {
-    color: "#1D4ED8",
-    fontSize: 13,
-    fontWeight: "600",
+  docChip: {
+    flex: 1,
+    minWidth: 50,
   },
-  recentBtn: {
-    backgroundColor: "#F0FDF4",
-    borderWidth: 1,
-    borderColor: "#BBF7D0",
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-  },
-  recentBtnText: {
-    color: "#15803D",
+  docChipText: {
     fontSize: 12.5,
     fontWeight: "700",
-  },
-  pageBox: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    backgroundColor: "#F8FAFC",
-    borderWidth: 1,
-    borderColor: "#CBD5E1",
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  pageLabel: {
-    fontSize: 12,
-    color: "#475569",
-    fontWeight: "600",
-  },
-  pageInput: {
-    width: 42,
-    textAlign: "center",
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#0F172A",
-    paddingVertical: 4,
-  },
-  modeRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
-  },
-  segmentGroup: {
-    flex: 1,
-    flexDirection: "row",
-    backgroundColor: "#F1F5F9",
-    borderRadius: 8,
-    padding: 3,
-  },
-  segmentBtn: {
-    flex: 1,
-    paddingVertical: 6,
-    borderRadius: 6,
-    alignItems: "center",
-  },
-  segmentBtnActive: {
-    backgroundColor: "#FFFFFF",
-  },
-  segmentText: {
-    fontSize: 12,
-    fontWeight: "600",
-    color: "#64748B",
-  },
-  segmentTextActive: {
     color: "#0F172A",
   },
-  deepToggle: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-  },
-  deepLabel: {
-    fontSize: 12,
-    fontWeight: "600",
-    color: "#334155",
-  },
-  explainBtn: {
-    backgroundColor: "#2563EB",
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: "center",
-  },
-  explainBtnDisabled: {
-    backgroundColor: "#94A3B8",
-  },
-  loadingRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  explainBtnText: {
-    color: "#FFFFFF",
-    fontSize: 14,
-    fontWeight: "700",
-  },
-  errorBanner: {
-    backgroundColor: "#FEF2F2",
-    borderWidth: 1,
-    borderColor: "#FECACA",
-    borderRadius: 8,
-    padding: 8,
-  },
-  errorText: {
-    color: "#B91C1C",
-    fontSize: 12,
-    fontWeight: "500",
-  },
-  canvasWrapper: {
-    flex: 1,
-    margin: 10,
-    borderRadius: 12,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 1,
-    borderColor: "#CBD5E1",
-    overflow: "hidden",
-  },
-  planMetaBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: "#F8FAFC",
-    borderBottomWidth: 1,
-    borderBottomColor: "#E2E8F0",
-    gap: 8,
-  },
-  planTitle: {
-    flex: 1,
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#0F172A",
-  },
-  metaBadgesRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-  },
-  cachedBadge: {
+  cachedPill: {
     backgroundColor: "#FEF3C7",
     borderWidth: 1,
     borderColor: "#FDE68A",
     borderRadius: 999,
-    paddingHorizontal: 7,
+    paddingHorizontal: 6,
     paddingVertical: 2,
   },
-  cachedBadgeText: {
-    fontSize: 10.5,
-    fontWeight: "700",
+  cachedPillText: {
+    fontSize: 10,
+    fontWeight: "800",
     color: "#B45309",
   },
-  modeBadge: {
-    fontSize: 11,
-    fontWeight: "700",
-    color: "#2563EB",
+  pillDivider: {
+    width: 1,
+    height: 16,
+    backgroundColor: "#E2E8F0",
   },
-  canvasStage: {
-    flex: 1,
-  },
-  placeholderStage: {
-    flex: 1,
+  pageMiniGroup: {
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    padding: 24,
-    gap: 8,
   },
-  placeholderTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#1E293B",
-  },
-  placeholderSub: {
-    fontSize: 13,
-    color: "#64748B",
-    textAlign: "center",
-    lineHeight: 20,
-  },
-  footerCard: {
-    backgroundColor: "#FFFFFF",
-    borderTopWidth: 1,
-    borderTopColor: "#E2E8F0",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    gap: 8,
-  },
-  speechScroll: {
-    maxHeight: 115,
-  },
-  speechAr: {
-    fontSize: 15,
-    lineHeight: 23,
-    color: "#0F172A",
-    fontWeight: "600",
-    textAlign: "right",
-    writingDirection: "rtl",
-  },
-  enTermsText: {
-    marginTop: 6,
+  pageMiniPrefix: {
     fontSize: 11.5,
-    color: "#475569",
-    fontWeight: "500",
+    fontWeight: "700",
+    color: "#64748B",
   },
-  quizBox: {
-    marginTop: 8,
-    padding: 8,
-    borderRadius: 8,
+  pageMiniInput: {
+    minWidth: 26,
+    maxWidth: 38,
+    textAlign: "center",
+    fontSize: 12.5,
+    fontWeight: "800",
+    color: "#0F172A",
+    paddingVertical: 2,
+    paddingHorizontal: 2,
+  },
+  recentMiniBtn: {
     backgroundColor: "#F0FDF4",
     borderWidth: 1,
     borderColor: "#BBF7D0",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
   },
-  quizLabel: {
-    fontSize: 12,
+  recentMiniText: {
+    fontSize: 11,
     fontWeight: "700",
-    color: "#166534",
-    textAlign: "right",
+    color: "#15803D",
   },
-  quizText: {
-    fontSize: 13.5,
-    color: "#14532D",
-    textAlign: "right",
-    writingDirection: "rtl",
-    marginTop: 2,
-  },
-  audioBar: {
+  topRightIcons: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
+    gap: 6,
   },
-  audioBtn: {
-    flex: 1,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 8,
-    backgroundColor: "#F1F5F9",
+  circleIconBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "rgba(255, 255, 255, 0.94)",
     borderWidth: 1,
-    borderColor: "#CBD5E1",
+    borderColor: "#E7E2D9",
     alignItems: "center",
     justifyContent: "center",
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
   },
-  audioPlayBtn: {
-    backgroundColor: "#0F766E",
-    borderColor: "#0F766E",
+  circleIconBtnBlue: {
+    backgroundColor: "#2563EB",
+    borderColor: "#1D4ED8",
   },
-  audioPlayBtnText: {
+  circleIconBtnDeep: {
+    backgroundColor: "#4F46E5",
+    borderColor: "#4338CA",
+  },
+  circleIconBtnDark: {
+    backgroundColor: "#18181B",
+    borderColor: "#27272A",
+  },
+  circleIconLabel: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#334155",
+  },
+  circleIconSymbol: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#334155",
+  },
+  circleIconLabelActive: {
     color: "#FFFFFF",
-    fontSize: 13,
-    fontWeight: "700",
   },
-  audioBtnText: {
-    color: "#0F172A",
-    fontSize: 12.5,
-    fontWeight: "600",
-  },
-  speedBtn: {
-    flex: 0,
-    minWidth: 62,
-    backgroundColor: "#EFF6FF",
-    borderColor: "#BFDBFE",
-  },
-  speedBtnText: {
-    color: "#1D4ED8",
-    fontSize: 12.5,
-    fontWeight: "700",
-  },
-  navRow: {
+
+  // Floating Error Toast
+  floatingErrorToast: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    zIndex: 35,
+    backgroundColor: "#FEF2F2",
+    borderWidth: 1,
+    borderColor: "#FCA5A5",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 10,
+    gap: 8,
+    shadowColor: "#991B1B",
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 5,
   },
-  navBtn: {
-    paddingHorizontal: 18,
-    paddingVertical: 10,
-    borderRadius: 8,
-    backgroundColor: "#E2E8F0",
-    minWidth: 96,
+  floatingErrorText: {
+    flex: 1,
+    color: "#B91C1C",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  floatingErrorDismiss: {
+    color: "#991B1B",
+    fontSize: 13,
+    fontWeight: "800",
+    paddingHorizontal: 4,
+  },
+
+  // Collapsible Compact Captions Strip
+  captionStripCard: {
+    position: "absolute",
+    left: 14,
+    right: 14,
+    zIndex: 25,
+    backgroundColor: "rgba(255, 255, 255, 0.94)",
+    borderWidth: 1,
+    borderColor: "#E7E2D9",
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    maxHeight: 92,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  captionScroll: {
+    maxHeight: 74,
+  },
+  captionSpeechAr: {
+    fontSize: 13.5,
+    lineHeight: 20,
+    color: "#0F172A",
+    fontWeight: "600",
+    textAlign: "right",
+    writingDirection: "rtl",
+  },
+  captionQuizRow: {
+    marginTop: 5,
+    paddingTop: 5,
+    borderTopWidth: 1,
+    borderTopColor: "#DCFCE7",
+  },
+  captionQuizText: {
+    fontSize: 12.5,
+    color: "#166534",
+    fontWeight: "700",
+    textAlign: "right",
+    writingDirection: "rtl",
+  },
+
+  // Bottom Floating Dark Pill Bar
+  bottomDockWrap: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    zIndex: 30,
     alignItems: "center",
   },
-  navBtnPrimary: {
-    backgroundColor: "#2563EB",
+  bottomDarkPill: {
+    width: "100%",
+    maxWidth: 460,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "rgba(24, 24, 27, 0.94)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.12)",
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    gap: 5,
+    shadowColor: "#000000",
+    shadowOpacity: 0.24,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
   },
-  navBtnDisabled: {
-    opacity: 0.45,
+  dockLoadingRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    paddingVertical: 6,
   },
-  navBtnText: {
+  dockLoadingText: {
+    color: "#F8FAFC",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  dockIconBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
+  },
+  dockIconText: {
+    color: "#F8FAFC",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: -2,
+  },
+  dockReplayText: {
+    color: "#E2E8F0",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  dockPlayBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "#0F766E",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dockPlayText: {
+    color: "#FFFFFF",
     fontSize: 14,
     fontWeight: "700",
-    color: "#0F172A",
   },
-  navBtnPrimaryText: {
-    color: "#FFFFFF",
-  },
-  stepCounter: {
-    fontSize: 12.5,
+  dockStepText: {
+    color: "#E2E8F0",
+    fontSize: 12,
     fontWeight: "700",
-    color: "#475569",
+    minWidth: 32,
+    textAlign: "center",
   },
+  dockSpeedBtn: {
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+  },
+  dockSpeedText: {
+    color: "#93C5FD",
+    fontSize: 11.5,
+    fontWeight: "800",
+  },
+  dockAskTrigger: {
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  dockAskText: {
+    color: "#CBD5E1",
+    fontSize: 13,
+    fontWeight: "500",
+  },
+  dockPrimaryTrigger: {
+    backgroundColor: "#2563EB",
+    borderRadius: 999,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+  },
+  dockPrimaryTriggerText: {
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  dockDisabled: {
+    opacity: 0.35,
+  },
+
+  // Recent Lectures Modal Drawer
   modalBackdrop: {
     flex: 1,
     backgroundColor: "rgba(15, 23, 42, 0.45)",
@@ -1266,6 +1564,18 @@ const styles = StyleSheet.create({
     color: "#64748B",
     textAlign: "center",
     lineHeight: 20,
+  },
+  modalErrorBanner: {
+    backgroundColor: "#FEF2F2",
+    borderWidth: 1,
+    borderColor: "#FECACA",
+    borderRadius: 8,
+    padding: 8,
+  },
+  modalErrorText: {
+    color: "#B91C1C",
+    fontSize: 12,
+    fontWeight: "500",
   },
   modalList: {
     maxHeight: 440,

@@ -1,9 +1,9 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Image,
   LayoutChangeEvent,
   Platform,
-  ScrollView,
+  Pressable,
   StyleSheet,
   Text,
   View,
@@ -14,12 +14,14 @@ import {
   RoundedRect,
   Skia,
 } from "@shopify/react-native-skia";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   Easing,
-  FadeIn,
   SharedValue,
+  useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
+  withSpring,
   withTiming,
 } from "react-native-reanimated";
 import type {
@@ -59,53 +61,240 @@ export interface SmartBoardCanvasProps {
    * Receives the exact aspect-ratio-preserved content frame so the Skia overlay aligns 1:1.
    */
   renderPdfLayer?: (contentRect: RectFrame) => React.ReactNode;
+  /** Normalized 0.0 -> 1.0 audio playback progress driving progressive strokes & typewriter reveal */
+  stepProgress?: number;
+  /** True while step audio is actively playing (displays live pen/cursor at typing tip) */
+  isPlaying?: boolean;
+  /** Incremented on Replay Step to re-trigger progressive animation without remounting canvas */
+  replayToken?: number;
+  /** Safe top padding so whiteboard cards begin cleanly below the floating HUD pill */
+  topInset?: number;
+  /** Safe bottom padding so cards & Reset View button stay clear of the floating dark dock */
+  bottomInset?: number;
 }
 
 // ---------------------------------------------------------------------------
-// Color System (Strict Match to VisualAction["color"])
+// Warm Paper Palette & Color Tokens
 // ---------------------------------------------------------------------------
+const PAPER_BG = "#FAF8F5";
+const PAPER_GRID_COLOR = "rgba(148, 138, 122, 0.17)";
+const MIN_SCALE = 0.6;
+const MAX_SCALE = 3.0;
+
 interface ColorToken {
   stroke: string;
   fill: string;
   highlight: string;
   text: string;
+  badgeBg: string;
 }
 
 const COLOR_MAP: Record<VisualAction["color"], ColorToken> = {
   blue: {
     stroke: "#2563EB",
-    fill: "#EFF6FF",
+    fill: "#F0F6FF",
     highlight: "rgba(37, 99, 235, 0.24)",
     text: "#1E3A8A",
+    badgeBg: "#DBEAFE",
   },
   red: {
     stroke: "#DC2626",
     fill: "#FEF2F2",
     highlight: "rgba(220, 38, 38, 0.24)",
     text: "#991B1B",
+    badgeBg: "#FEE2E2",
   },
   green: {
     stroke: "#16A34A",
     fill: "#F0FDF4",
     highlight: "rgba(22, 163, 74, 0.24)",
     text: "#166534",
+    badgeBg: "#DCFCE7",
   },
   yellow: {
     stroke: "#CA8A04",
     fill: "#FEFCE8",
     highlight: "rgba(250, 204, 21, 0.42)",
     text: "#854D0E",
+    badgeBg: "#FEF9C3",
   },
   black: {
-    stroke: "#0F172A",
-    fill: "#F8FAFC",
+    stroke: "#1E293B",
+    fill: "#FFFFFF",
     highlight: "rgba(15, 23, 42, 0.16)",
     text: "#0F172A",
+    badgeBg: "#E2E8F0",
   },
 };
 
 function getColorToken(color?: VisualAction["color"]): ColorToken {
   return (color && COLOR_MAP[color]) || COLOR_MAP.blue;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+// ---------------------------------------------------------------------------
+// Text Normalization & Lightweight Multi-Language Syntax Highlighter
+// ---------------------------------------------------------------------------
+function normalizeBlockText(raw?: string | null): string {
+  if (!raw) return "";
+  return raw
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "    ")
+    .replace(/^\s*\n+/, "")
+    .replace(/\n+\s*$/, "");
+}
+
+const CODE_KEYWORDS = new Set([
+  "def",
+  "class",
+  "return",
+  "try",
+  "except",
+  "finally",
+  "raise",
+  "if",
+  "elif",
+  "else",
+  "for",
+  "while",
+  "in",
+  "not",
+  "and",
+  "or",
+  "is",
+  "import",
+  "from",
+  "as",
+  "with",
+  "pass",
+  "break",
+  "continue",
+  "lambda",
+  "yield",
+  "async",
+  "await",
+  "True",
+  "False",
+  "None",
+  "int",
+  "float",
+  "str",
+  "bool",
+  "void",
+  "double",
+  "char",
+  "public",
+  "private",
+  "static",
+  "new",
+  "catch",
+  "throw",
+  "const",
+  "let",
+  "var",
+  "function",
+  "SELECT",
+  "FROM",
+  "WHERE",
+  "JOIN",
+  "INSERT",
+  "INTO",
+  "VALUES",
+  "UPDATE",
+  "SET",
+  "ORDER",
+  "BY",
+  "LIMIT",
+]);
+
+const CODE_BUILTINS = new Set([
+  "print",
+  "len",
+  "range",
+  "input",
+  "open",
+  "list",
+  "dict",
+  "set",
+  "tuple",
+  "type",
+  "isinstance",
+  "Exception",
+  "ValueError",
+  "TypeError",
+  "ZeroDivisionError",
+  "KeyError",
+  "IndexError",
+  "FileNotFoundError",
+  "RuntimeError",
+]);
+
+interface CodeToken {
+  text: string;
+  color: string;
+  italic?: boolean;
+}
+
+function tokenizeCodeLine(line: string): CodeToken[] {
+  if (!line) return [{ text: " ", color: "#F8FAFC" }];
+
+  let codePart = line;
+  let commentPart = "";
+  const commentMatch = line.match(/(^|\s)(#.*|\/\/.*|--.*)$/);
+  if (commentMatch && commentMatch.index !== undefined) {
+    const idx = commentMatch.index + commentMatch[1].length;
+    codePart = line.slice(0, idx);
+    commentPart = line.slice(idx);
+  }
+
+  const tokens: CodeToken[] = [];
+  const regex =
+    /('(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(codePart)) !== null) {
+    if (match.index > lastIndex) {
+      tokens.push({
+        text: codePart.slice(lastIndex, match.index),
+        color: "#CBD5E1",
+      });
+    }
+    const word = match[0];
+    if (
+      (word.startsWith("'") && word.endsWith("'")) ||
+      (word.startsWith('"') && word.endsWith('"'))
+    ) {
+      tokens.push({ text: word, color: "#86EFAC" });
+    } else if (/^\d/.test(word)) {
+      tokens.push({ text: word, color: "#FCD34D" });
+    } else if (CODE_KEYWORDS.has(word)) {
+      tokens.push({ text: word, color: "#C084FC" });
+    } else if (CODE_BUILTINS.has(word)) {
+      tokens.push({ text: word, color: "#38BDF8" });
+    } else {
+      const nextChar = codePart[match.index + word.length];
+      tokens.push({
+        text: word,
+        color: nextChar === "(" ? "#60A5FA" : "#F8FAFC",
+      });
+    }
+    lastIndex = match.index + word.length;
+  }
+
+  if (lastIndex < codePart.length) {
+    tokens.push({ text: codePart.slice(lastIndex), color: "#CBD5E1" });
+  }
+  if (commentPart) {
+    tokens.push({ text: commentPart, color: "#64748B", italic: true });
+  }
+
+  return tokens.length > 0 ? tokens : [{ text: " ", color: "#F8FAFC" }];
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +321,6 @@ function makePathFromBuilder(
     return builder.build();
   }
 
-  // Fallback for older mutable SkPath versions
   const legacyPath = Skia.Path.Make() as unknown as {
     moveTo?: (x: number, y: number) => unknown;
     lineTo?: (x: number, y: number) => unknown;
@@ -152,28 +340,70 @@ function makePathFromBuilder(
   return legacyPath as ReturnType<typeof Skia.Path.Make>;
 }
 
+/** Build a continuous clockwise rounded-rectangle stroke path for progressive border drawing */
+function buildRoundedRectStrokePath(rect: RectFrame, radius: number) {
+  const { x, y, width: w, height: h } = rect;
+  if (w <= 0 || h <= 0) return makeEmptyPath();
+  const r = Math.min(radius, w / 2, h / 2);
+
+  return makePathFromBuilder((b) => {
+    b.moveTo(x + r, y);
+    b.lineTo(x + w - r, y);
+    b.quadTo(x + w, y, x + w, y + r);
+    b.lineTo(x + w, y + h - r);
+    b.quadTo(x + w, y + h, x + w - r, y + h);
+    b.lineTo(x + r, y + h);
+    b.quadTo(x, y + h, x, y + h - r);
+    b.lineTo(x, y + r);
+    b.quadTo(x, y, x + r, y);
+  });
+}
+
+function buildHeadingUnderlinePath(rect: RectFrame) {
+  const { x, y, width: w, height: h } = rect;
+  if (w <= 0 || h <= 0) return makeEmptyPath();
+  const inset = Math.min(28, w * 0.14);
+  const lineY = y + h - 5;
+  return makePathFromBuilder((b) => {
+    b.moveTo(x + inset, lineY);
+    b.lineTo(x + w - inset, lineY);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Pure Geometry Math: Aspect-Ratio Contain & [0-1000] BBox Mapping
 // ---------------------------------------------------------------------------
 function computeContainRect(
   containerW: number,
   containerH: number,
-  contentAspect: number
+  contentAspect: number,
+  topInset: number,
+  bottomInset: number
 ): RectFrame {
-  if (containerW <= 0 || containerH <= 0 || contentAspect <= 0) {
+  const usableW = Math.max(0, containerW - 16);
+  const usableH = Math.max(0, containerH - topInset - bottomInset);
+  if (usableW <= 0 || usableH <= 0 || contentAspect <= 0) {
     return { x: 0, y: 0, width: 0, height: 0 };
   }
-  const containerAspect = containerW / containerH;
+  const containerAspect = usableW / usableH;
   if (contentAspect > containerAspect) {
-    // Letterboxed top & bottom
-    const width = containerW;
-    const height = containerW / contentAspect;
-    return { x: 0, y: (containerH - height) / 2, width, height };
+    const width = usableW;
+    const height = usableW / contentAspect;
+    return {
+      x: (containerW - width) / 2,
+      y: topInset + (usableH - height) / 2,
+      width,
+      height,
+    };
   }
-  // Pillarboxed left & right
-  const height = containerH;
-  const width = containerH * contentAspect;
-  return { x: (containerW - width) / 2, y: 0, width, height };
+  const height = usableH;
+  const width = usableH * contentAspect;
+  return {
+    x: (containerW - width) / 2,
+    y: topInset,
+    width,
+    height,
+  };
 }
 
 function mapBboxToScreenRect(bbox: BoundingBox, contentRect: RectFrame): RectFrame {
@@ -191,68 +421,290 @@ function mapBboxToScreenRect(bbox: BoundingBox, contentRect: RectFrame): RectFra
 }
 
 // ---------------------------------------------------------------------------
-// Pure Geometry Math: 6 Non-Overlapping Whiteboard Slots + Auto Arrows
+// Cumulative Multi-Band Infinite Whiteboard Builder
 // ---------------------------------------------------------------------------
 interface ResolvedAction {
   key: string;
   action: VisualAction;
+  stepIdx: number;
   isCurrentStep: boolean;
 }
 
-function computeWhiteboardSlots(
-  canvasW: number,
-  canvasH: number,
-  activeSlots: Set<WhiteboardSlot>
-): Record<WhiteboardSlot, RectFrame> {
-  const pad = 12;
-  const rowGap = 10;
-  const colGap = 24; // Dedicated channel for left_col <-> right_col Skia arrows
+interface WhiteboardBlock {
+  blockId: string;
+  bandIndex: number;
+  slot: WhiteboardSlot;
+  createdAtStepIdx: number;
+  lastUpdatedStepIdx: number;
+  items: ResolvedAction[];
+  connectFromBlockId?: string;
+}
 
-  const innerW = Math.max(0, canvasW - pad * 2);
-  const innerH = Math.max(0, canvasH - pad * 2);
+interface CumulativeBoardLayout {
+  blockRects: Map<string, RectFrame>;
+  boardWidth: number;
+  boardHeight: number;
+}
 
-  const hasHeader = activeSlots.has("header");
-  const hasMainTop = activeSlots.has("main_top");
-  const hasCols = activeSlots.has("left_col") || activeSlots.has("right_col");
-  const hasBottom = activeSlots.has("bottom_summary");
+function resolveWhiteboardBlocks(
+  steps: TeachingStep[],
+  currentStepIndex: number
+): WhiteboardBlock[] {
+  const safeSteps = Array.isArray(steps) ? steps : [];
+  let blocks: WhiteboardBlock[] = [];
+  let currentBand = 0;
+  let bandSlots = new Map<WhiteboardSlot, WhiteboardBlock>();
+  let latestBySlot = new Map<WhiteboardSlot, WhiteboardBlock>();
 
-  const headerH = hasHeader ? Math.max(44, Math.min(60, innerH * 0.11)) : 0;
-  const bodyTop = pad + (hasHeader ? headerH + rowGap : 0);
-  const bodyH = Math.max(0, pad + innerH - bodyTop);
+  const resetBoard = () => {
+    blocks = [];
+    currentBand = 0;
+    bandSlots = new Map();
+    latestBySlot = new Map();
+  };
 
-  // Dynamically allocate vertical weights only to active rows (0% dead whitespace)
-  const activeRows =
-    (hasMainTop ? 1 : 0) + (hasCols ? 1 : 0) + (hasBottom ? 1 : 0);
-  const totalGaps = Math.max(0, activeRows - 1) * rowGap;
-  const usableBodyH = Math.max(0, bodyH - totalGaps);
+  for (let i = 0; i <= currentStepIndex; i++) {
+    const step = safeSteps[i];
+    if (!step) continue;
 
-  const wMain = hasMainTop ? 0.26 : 0;
-  const wCols = hasCols ? 0.44 : 0;
-  const wBottom = hasBottom ? 0.34 : 0;
-  const weightSum = wMain + wCols + wBottom || 1;
+    if (step.mode !== "whiteboard") {
+      resetBoard();
+      continue;
+    }
 
-  const mainTopH = hasMainTop ? (wMain / weightSum) * usableBodyH : 0;
-  const colsH = hasCols ? (wCols / weightSum) * usableBodyH : 0;
-  const bottomH = hasBottom ? (wBottom / weightSum) * usableBodyH : 0;
+    const isCurrent = i === currentStepIndex;
+    const actions = Array.isArray(step.actions) ? step.actions : [];
 
-  let cursorY = bodyTop;
-  const mainTopY = cursorY;
-  if (hasMainTop) cursorY += mainTopH + rowGap;
+    for (let j = 0; j < actions.length; j++) {
+      const action = actions[j];
+      if (!action) continue;
+      if (action.type === "clear_board") {
+        resetBoard();
+        continue;
+      }
+      if (!action.slot) continue;
 
-  const colsY = cursorY;
-  if (hasCols) cursorY += colsH + rowGap;
+      const resolvedItem: ResolvedAction = {
+        key: `s${step.step_id}-i${i}-a${j}-${action.type}-${action.slot}`,
+        action,
+        stepIdx: i,
+        isCurrentStep: isCurrent,
+      };
 
-  const bottomY = cursorY;
+      const existingInBand = bandSlots.get(action.slot);
+
+      // Stack bullets cleanly inside the same slot if the current band's slot already holds bullets
+      if (
+        action.type === "wb_bullet" &&
+        existingInBand &&
+        existingInBand.items[0]?.action.type === "wb_bullet"
+      ) {
+        existingInBand.items.push(resolvedItem);
+        existingInBand.lastUpdatedStepIdx = i;
+        continue;
+      }
+
+      // If this slot is already occupied in the current band, open a new band below
+      // instead of overwriting earlier steps' cards on the infinite canvas
+      if (existingInBand) {
+        currentBand += 1;
+        bandSlots = new Map();
+      }
+
+      const connectFromBlock = action.connect_from_slot
+        ? latestBySlot.get(action.connect_from_slot)
+        : undefined;
+
+      const newBlock: WhiteboardBlock = {
+        blockId: `b${currentBand}-${action.slot}-s${step.step_id}-a${j}`,
+        bandIndex: currentBand,
+        slot: action.slot,
+        createdAtStepIdx: i,
+        lastUpdatedStepIdx: i,
+        items: [resolvedItem],
+        connectFromBlockId: connectFromBlock?.blockId,
+      };
+
+      blocks.push(newBlock);
+      bandSlots.set(action.slot, newBlock);
+      latestBySlot.set(action.slot, newBlock);
+    }
+  }
+
+  return blocks;
+}
+
+function estimateWrappedLines(text: string, charsPerLine: number): number {
+  const safeChars = Math.max(12, Math.floor(charsPerLine));
+  const rawLines = text.split("\n");
+  let total = 0;
+  for (const line of rawLines) {
+    total += Math.max(1, Math.ceil(line.length / safeChars));
+  }
+  return Math.max(1, total);
+}
+
+function estimateSlotHeight(
+  items: ResolvedAction[] | undefined,
+  slotWidth: number
+): number {
+  if (!items || items.length === 0 || slotWidth <= 0) return 0;
+  const primary = items[0].action;
+  const innerW = Math.max(100, slotWidth - 24);
+
+  if (primary.type === "wb_heading") {
+    const clean = normalizeBlockText(primary.text);
+    const lines = estimateWrappedLines(clean, innerW / 10.5);
+    return Math.max(56, 28 + lines * 24);
+  }
+
+  if (primary.type === "wb_code") {
+    const rawCode = primary.code || primary.text || "";
+    const clean = normalizeBlockText(rawCode);
+    const codeInnerW = Math.max(120, slotWidth - 52);
+    const wrappedLines = estimateWrappedLines(clean || " ", codeInnerW / 7.4);
+    // 32px macOS-style header + 24px vertical padding + 21px per wrapped code line
+    return Math.max(118, 32 + 24 + wrappedLines * 21);
+  }
+
+  if (primary.type === "wb_equation") {
+    const clean = normalizeBlockText(primary.text);
+    const lines = estimateWrappedLines(clean, innerW / 9.5);
+    return Math.max(76, 30 + lines * 26);
+  }
+
+  if (primary.type === "wb_flow_card") {
+    const clean = normalizeBlockText(primary.text);
+    const lines = estimateWrappedLines(clean, innerW / 8.2);
+    return Math.max(92, 32 + lines * 22);
+  }
+
+  // Stacked wb_bullet items
+  let totalH = 26;
+  for (const item of items) {
+    const clean = normalizeBlockText(item.action.text);
+    const lines = estimateWrappedLines(clean, (innerW - 18) / 8.0);
+    totalH += lines * 21 + 8;
+  }
+  return Math.max(90, totalH);
+}
+
+function computeCumulativeWhiteboardLayout(
+  viewportW: number,
+  viewportH: number,
+  blocks: WhiteboardBlock[],
+  topInset: number,
+  bottomInset: number
+): CumulativeBoardLayout {
+  const padX = 16;
+  const rowGap = 18;
+  const bandGap = 24;
+  const colGap = 28; // Clean channel for horizontal connector arrows
+
+  const boardWidth = Math.max(viewportW, 340);
+  const innerW = Math.max(0, boardWidth - padX * 2);
   const halfW = Math.max(0, (innerW - colGap) / 2);
 
-  return {
-    header: { x: pad, y: pad, width: innerW, height: headerH },
-    main_top: { x: pad, y: mainTopY, width: innerW, height: mainTopH },
-    left_col: { x: pad, y: colsY, width: halfW, height: colsH },
-    right_col: { x: pad + halfW + colGap, y: colsY, width: halfW, height: colsH },
-    bottom_summary: { x: pad, y: bottomY, width: innerW, height: bottomH },
-    full_canvas: { x: pad, y: bodyTop, width: innerW, height: bodyH },
-  };
+  const blockRects = new Map<string, RectFrame>();
+  const bandsMap = new Map<number, Map<WhiteboardSlot, WhiteboardBlock>>();
+  for (const block of blocks) {
+    let slotMap = bandsMap.get(block.bandIndex);
+    if (!slotMap) {
+      slotMap = new Map();
+      bandsMap.set(block.bandIndex, slotMap);
+    }
+    slotMap.set(block.slot, block);
+  }
+
+  const sortedBands = Array.from(bandsMap.keys()).sort((a, b) => a - b);
+  let cursorY = topInset + 10;
+
+  for (let bIdx = 0; bIdx < sortedBands.length; bIdx++) {
+    const slotMap = bandsMap.get(sortedBands[bIdx])!;
+    const headerBlock = slotMap.get("header");
+    const mainTopBlock = slotMap.get("main_top");
+    const leftBlock = slotMap.get("left_col");
+    const rightBlock = slotMap.get("right_col");
+    const bottomBlock = slotMap.get("bottom_summary");
+    const fullBlock = slotMap.get("full_canvas");
+
+    if (headerBlock) {
+      const h = estimateSlotHeight(headerBlock.items, innerW);
+      blockRects.set(headerBlock.blockId, {
+        x: padX,
+        y: cursorY,
+        width: innerW,
+        height: h,
+      });
+      cursorY += h + rowGap;
+    }
+
+    if (mainTopBlock) {
+      const h = estimateSlotHeight(mainTopBlock.items, innerW);
+      blockRects.set(mainTopBlock.blockId, {
+        x: padX,
+        y: cursorY,
+        width: innerW,
+        height: h,
+      });
+      cursorY += h + rowGap;
+    }
+
+    if (leftBlock || rightBlock) {
+      const leftH = leftBlock ? estimateSlotHeight(leftBlock.items, halfW) : 0;
+      const rightH = rightBlock
+        ? estimateSlotHeight(rightBlock.items, halfW)
+        : 0;
+      const colsH = Math.max(leftH, rightH);
+
+      if (leftBlock) {
+        blockRects.set(leftBlock.blockId, {
+          x: padX,
+          y: cursorY,
+          width: halfW,
+          height: colsH,
+        });
+      }
+      if (rightBlock) {
+        blockRects.set(rightBlock.blockId, {
+          x: padX + halfW + colGap,
+          y: cursorY,
+          width: halfW,
+          height: colsH,
+        });
+      }
+      cursorY += colsH + rowGap;
+    }
+
+    if (bottomBlock) {
+      const h = estimateSlotHeight(bottomBlock.items, innerW);
+      blockRects.set(bottomBlock.blockId, {
+        x: padX,
+        y: cursorY,
+        width: innerW,
+        height: h,
+      });
+      cursorY += h + rowGap;
+    }
+
+    if (fullBlock) {
+      const h = estimateSlotHeight(fullBlock.items, innerW);
+      blockRects.set(fullBlock.blockId, {
+        x: padX,
+        y: cursorY,
+        width: innerW,
+        height: h,
+      });
+      cursorY += h + rowGap;
+    }
+
+    if (bIdx < sortedBands.length - 1) {
+      cursorY += bandGap - rowGap;
+    }
+  }
+
+  const boardHeight = Math.max(viewportH, cursorY + bottomInset + 36);
+  return { blockRects, boardWidth, boardHeight };
 }
 
 function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
@@ -272,9 +724,8 @@ function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
   let startY = fromCy;
   let endX = toCx;
   let endY = toCy;
-  const margin = 4;
+  const margin = 5;
 
-  // Choose clean edge-to-edge anchor points so arrows never cross card text
   if (Math.abs(dx) >= Math.abs(dy)) {
     if (dx > 0) {
       startX = from.x + from.width + margin;
@@ -293,14 +744,12 @@ function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
     }
   }
 
-  // Slight curve for diagonal connectors; straight crisp line for aligned slots
   const midX = (startX + endX) / 2;
   const midY = (startY + endY) / 2;
   const isDiagonal = Math.abs(startX - endX) > 12 && Math.abs(startY - endY) > 12;
   const ctrlX = midX;
   const ctrlY = isDiagonal ? startY : midY;
 
-  // Arrowhead aligned with incoming tangent vector
   const angle = Math.atan2(endY - ctrlY, endX - ctrlX);
   const headLen = 10;
   const spread = Math.PI / 6;
@@ -323,56 +772,7 @@ function buildConnectorArrowPath(from: RectFrame, to: RectFrame) {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic Step-State Replay (Handles clear_board & Progressive Building)
-// ---------------------------------------------------------------------------
-function resolveWhiteboardActions(
-  steps: TeachingStep[],
-  currentStepIndex: number
-): ResolvedAction[] {
-  const safeSteps = Array.isArray(steps) ? steps : [];
-  let accumulated: ResolvedAction[] = [];
-
-  for (let i = 0; i <= currentStepIndex; i++) {
-    const step = safeSteps[i];
-    if (!step) continue;
-
-    if (step.mode !== "whiteboard") {
-      // Leaving whiteboard resets accumulated canvas state
-      accumulated = [];
-      continue;
-    }
-
-    const isCurrent = i === currentStepIndex;
-    const actions = Array.isArray(step.actions) ? step.actions : [];
-    for (let j = 0; j < actions.length; j++) {
-      const action = actions[j];
-      if (!action) continue;
-      if (action.type === "clear_board") {
-        accumulated = [];
-        continue;
-      }
-      if (!action.slot) continue;
-
-      // Keep multiple bullets stacked inside the same slot; replace non-bullet slot items cleanly
-      if (action.type !== "wb_bullet") {
-        accumulated = accumulated.filter(
-          (item) => item.action.slot !== action.slot
-        );
-      }
-
-      accumulated.push({
-        key: `s${step.step_id}-a${j}-${action.type}-${action.slot}`,
-        action,
-        isCurrentStep: isCurrent,
-      });
-    }
-  }
-
-  return accumulated;
-}
-
-// ---------------------------------------------------------------------------
-// Animated Skia Primitives (60fps UI Thread via Reanimated SharedValues)
+// Animated Skia Primitives (60fps UI Thread Synchronized to stepProgress)
 // ---------------------------------------------------------------------------
 const AnimatedHighlightRect: React.FC<{
   rect: RectFrame;
@@ -432,6 +832,83 @@ const AnimatedCircleAnnotation: React.FC<{
   );
 };
 
+const AnimatedCardFrame: React.FC<{
+  rect: RectFrame;
+  radius: number;
+  fillColor: string;
+  strokeColor: string;
+  strokeWidth: number;
+  isHeading: boolean;
+  animate: boolean;
+  borderProgress: SharedValue<number>;
+}> = ({
+  rect,
+  radius,
+  fillColor,
+  strokeColor,
+  strokeWidth,
+  isHeading,
+  animate,
+  borderProgress,
+}) => {
+  const borderPath = useMemo(
+    () => buildRoundedRectStrokePath(rect, radius),
+    [rect, radius]
+  );
+  const underlinePath = useMemo(
+    () => (isHeading ? buildHeadingUnderlinePath(rect) : makeEmptyPath()),
+    [rect, isHeading]
+  );
+
+  const fillOpacity = useDerivedValue(() =>
+    animate ? Math.min(1, borderProgress.value * 1.15) : 1
+  );
+
+  return (
+    <>
+      <RoundedRect
+        x={rect.x}
+        y={rect.y + 3}
+        width={rect.width}
+        height={rect.height}
+        r={radius}
+        color="rgba(15, 23, 42, 0.06)"
+        opacity={fillOpacity}
+      />
+      <RoundedRect
+        x={rect.x}
+        y={rect.y}
+        width={rect.width}
+        height={rect.height}
+        r={radius}
+        color={fillColor}
+        opacity={fillOpacity}
+      />
+      <Path
+        path={borderPath}
+        style="stroke"
+        strokeWidth={strokeWidth}
+        strokeCap="round"
+        strokeJoin="round"
+        color={strokeColor}
+        start={0}
+        end={animate ? borderProgress : 1}
+      />
+      {isHeading && (
+        <Path
+          path={underlinePath}
+          style="stroke"
+          strokeWidth={2.5}
+          strokeCap="round"
+          color={strokeColor}
+          start={0}
+          end={animate ? borderProgress : 1}
+        />
+      )}
+    </>
+  );
+};
+
 const AnimatedArrowPath: React.FC<{
   from: RectFrame;
   to: RectFrame;
@@ -455,68 +932,161 @@ const AnimatedArrowPath: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
-// Slot Content Renderers (Wrapped Text, Code Highlighting, Equations, Cards)
+// Progressive RN Typewriter & Live Syntax-Highlighted Code Block
 // ---------------------------------------------------------------------------
-const CodeBlockView: React.FC<{ action: VisualAction }> = ({ action }) => {
-  const lines = (action.text ?? "").split("\n");
+const CodeBlockView: React.FC<{
+  action: VisualAction;
+  revealRatio: number;
+  showCursor: boolean;
+}> = ({ action, revealRatio, showCursor }) => {
+  const rawCode = action.code || action.text || "";
+  const normalized = normalizeBlockText(rawCode);
+  const fullLines = normalized ? normalized.split("\n") : ["# (no code provided)"];
   const highlighted = new Set(action.highlight_lines ?? []);
   const token = getColorToken(action.color);
+
+  const totalChars = useMemo(
+    () => fullLines.reduce((sum, l) => sum + Math.max(1, l.length), 0),
+    [fullLines]
+  );
+
+  const visibleBudget =
+    revealRatio >= 0.995
+      ? totalChars
+      : Math.floor(totalChars * clamp01(revealRatio));
+
+  // Slice characters sequentially across lines so code types out live from line 1 downward
+  let remaining = visibleBudget;
+  const visibleRows: Array<{
+    lineNum: number;
+    text: string;
+    isTypingTip: boolean;
+  }> = [];
+
+  for (let idx = 0; idx < fullLines.length; idx++) {
+    const line = fullLines[idx];
+    const lineCost = Math.max(1, line.length);
+    if (remaining <= 0 && revealRatio < 0.995) {
+      break;
+    }
+    if (remaining >= lineCost || revealRatio >= 0.995) {
+      remaining -= lineCost;
+      const isLastVisible =
+        showCursor &&
+        revealRatio < 0.995 &&
+        (remaining <= 0 || idx === fullLines.length - 1);
+      visibleRows.push({
+        lineNum: idx + 1,
+        text: line,
+        isTypingTip: isLastVisible,
+      });
+    } else {
+      visibleRows.push({
+        lineNum: idx + 1,
+        text: line.slice(0, remaining),
+        isTypingTip: showCursor,
+      });
+      remaining = 0;
+      break;
+    }
+  }
 
   return (
     <View style={styles.codeContainer}>
       <View style={styles.codeHeader}>
+        <View style={styles.codeDotsRow}>
+          <View style={[styles.codeDot, { backgroundColor: "#F87171" }]} />
+          <View style={[styles.codeDot, { backgroundColor: "#FBBF24" }]} />
+          <View style={[styles.codeDot, { backgroundColor: "#34D399" }]} />
+        </View>
         <Text style={styles.codeLangBadge}>
           {(action.code_lang ?? "code").toUpperCase()}
         </Text>
+        <Text style={styles.codeLineCount}>
+          {fullLines.length} {fullLines.length === 1 ? "line" : "lines"}
+        </Text>
       </View>
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        nestedScrollEnabled
-        contentContainerStyle={styles.codeBody}
-      >
-        {lines.map((line, idx) => {
-          const lineNum = idx + 1;
-          const isHighlighted = highlighted.has(lineNum);
+
+      <View style={styles.codeBody}>
+        {visibleRows.map((row) => {
+          const isHighlighted = highlighted.has(row.lineNum);
+          const spans = tokenizeCodeLine(row.text);
           return (
             <View
-              key={lineNum}
+              key={row.lineNum}
               style={[
                 styles.codeLineRow,
                 isHighlighted && {
-                  backgroundColor: "rgba(59, 130, 246, 0.25)",
+                  backgroundColor: "rgba(59, 130, 246, 0.24)",
                   borderLeftWidth: 3,
                   borderLeftColor: token.stroke,
                 },
               ]}
             >
-              <Text style={styles.codeLineNumber}>{lineNum}</Text>
-              <Text style={styles.codeLineText}>{line || " "}</Text>
+              <Text style={styles.codeLineNumber}>{row.lineNum}</Text>
+              <Text style={styles.codeLineText}>
+                {spans.map((span, sIdx) => (
+                  <Text
+                    key={sIdx}
+                    style={{
+                      color: span.color,
+                      fontStyle: span.italic ? "italic" : "normal",
+                    }}
+                  >
+                    {span.text}
+                  </Text>
+                ))}
+                {row.isTypingTip && (
+                  <Text style={styles.codePenCursor}>▍</Text>
+                )}
+              </Text>
             </View>
           );
         })}
-      </ScrollView>
+      </View>
     </View>
   );
 };
 
-const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
+const SlotContentView: React.FC<{
+  items: ResolvedAction[];
+  textProgress: number;
+  isPlaying: boolean;
+}> = ({ items, textProgress, isPlaying }) => {
   if (!items || items.length === 0) return null;
-  const primary = items[0].action;
+  const primaryItem = items[0];
+  const primary = primaryItem.action;
+  const primaryRatio = primaryItem.isCurrentStep ? textProgress : 1;
+  const primaryShowCursor =
+    primaryItem.isCurrentStep &&
+    isPlaying &&
+    textProgress > 0 &&
+    textProgress < 0.995;
 
   if (primary.type === "wb_code") {
-    return <CodeBlockView action={primary} />;
+    return (
+      <CodeBlockView
+        action={primary}
+        revealRatio={primaryRatio}
+        showCursor={primaryShowCursor}
+      />
+    );
   }
 
   if (primary.type === "wb_heading") {
     const token = getColorToken(primary.color);
+    const full = normalizeBlockText(primary.text);
+    const visible =
+      primaryRatio >= 0.995
+        ? full
+        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
     return (
       <View style={styles.headingBox}>
-        <Text
-          numberOfLines={2}
-          adjustsFontSizeToFit
-          style={[styles.headingText, { color: token.text }]}
-        >
-          {primary.text ?? ""}
+        <Text style={[styles.headingText, { color: token.text }]}>
+          {visible}
+          {primaryShowCursor && (
+            <Text style={{ color: token.stroke }}>▍</Text>
+          )}
         </Text>
       </View>
     );
@@ -524,60 +1094,102 @@ const SlotContentView: React.FC<{ items: ResolvedAction[] }> = ({ items }) => {
 
   if (primary.type === "wb_equation") {
     const token = getColorToken(primary.color);
+    const full = normalizeBlockText(primary.text);
+    const visible =
+      primaryRatio >= 0.995
+        ? full
+        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
     return (
-      <ScrollView
-        contentContainerStyle={styles.equationBox}
-        showsVerticalScrollIndicator={false}
-        nestedScrollEnabled
-      >
+      <View style={styles.equationBox}>
         <Text style={[styles.equationText, { color: token.text }]}>
-          {primary.text ?? ""}
+          {visible}
+          {primaryShowCursor && (
+            <Text style={{ color: token.stroke }}>▍</Text>
+          )}
         </Text>
-      </ScrollView>
+      </View>
     );
   }
 
   if (primary.type === "wb_flow_card") {
     const token = getColorToken(primary.color);
+    const full = normalizeBlockText(primary.text);
+    const visible =
+      primaryRatio >= 0.995
+        ? full
+        : full.slice(0, Math.round(full.length * clamp01(primaryRatio)));
     return (
-      <ScrollView
-        contentContainerStyle={styles.flowCardBox}
-        showsVerticalScrollIndicator={false}
-        nestedScrollEnabled
-      >
+      <View style={styles.flowCardBox}>
         <Text style={[styles.flowCardText, { color: token.text }]}>
-          {primary.text ?? ""}
+          {visible}
+          {primaryShowCursor && (
+            <Text style={{ color: token.stroke }}>▍</Text>
+          )}
         </Text>
-      </ScrollView>
+      </View>
     );
   }
 
-  // Stacked wb_bullet items inside a single slot
+  // Stacked wb_bullet items: completed prior bullets render at 100%,
+  // current step's bullets reveal sequentially across textProgress
+  const currentStepBullets = items.filter((it) => it.isCurrentStep);
+  const currentTotalChars = currentStepBullets.reduce(
+    (sum, it) => sum + Math.max(1, normalizeBlockText(it.action.text).length),
+    0
+  );
+  let bulletBudget =
+    textProgress >= 0.995
+      ? currentTotalChars
+      : Math.floor(currentTotalChars * clamp01(textProgress));
+
   return (
-    <ScrollView
-      contentContainerStyle={styles.bulletList}
-      showsVerticalScrollIndicator={false}
-      nestedScrollEnabled
-    >
+    <View style={styles.bulletList}>
       {items.map((item) => {
         const token = getColorToken(item.action.color);
+        const full = normalizeBlockText(item.action.text);
+
+        if (!item.isCurrentStep || textProgress >= 0.995) {
+          return (
+            <View key={item.key} style={styles.bulletRow}>
+              <View
+                style={[styles.bulletDot, { backgroundColor: token.stroke }]}
+              />
+              <Text style={[styles.bulletText, { color: token.text }]}>
+                {full}
+              </Text>
+            </View>
+          );
+        }
+
+        if (bulletBudget <= 0) {
+          return null;
+        }
+
+        const take = Math.min(full.length, bulletBudget);
+        bulletBudget -= Math.max(1, take);
+        const isTypingThisBullet =
+          isPlaying && bulletBudget <= 0 && textProgress < 0.995;
+
         return (
           <View key={item.key} style={styles.bulletRow}>
             <View
               style={[styles.bulletDot, { backgroundColor: token.stroke }]}
             />
             <Text style={[styles.bulletText, { color: token.text }]}>
-              {item.action.text ?? ""}
+              {full.slice(0, take)}
+              {isTypingThisBullet && (
+                <Text style={{ color: token.stroke }}>▍</Text>
+              )}
             </Text>
           </View>
         );
       })}
-    </ScrollView>
+    </View>
   );
 };
 
 // ---------------------------------------------------------------------------
-// Main Component: SmartBoardCanvas (60fps PDF Overlay + Smart Whiteboard)
+// Main Component: SmartBoardCanvas (Live Progressive Infinite Paper Canvas)
 // ---------------------------------------------------------------------------
 export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   steps,
@@ -585,11 +1197,62 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   slideImageUri,
   slideAspectRatio = 16 / 9,
   renderPdfLayer,
+  stepProgress = 1,
+  isPlaying = false,
+  replayToken = 0,
+  topInset = 76,
+  bottomInset = 112,
 }) => {
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [detectedAspect, setDetectedAspect] = useState<number>(slideAspectRatio);
 
-  // Sync external aspect ratio prop if it changes across slides
+  // 60fps UI-thread Pan & Pinch-to-Zoom Shared Values + Manual Override Flag
+  const scale = useSharedValue(1);
+  const savedScale = useSharedValue(1);
+  const translateX = useSharedValue(0);
+  const translateY = useSharedValue(0);
+  const savedX = useSharedValue(0);
+  const savedY = useSharedValue(0);
+  const userHasManuallyPanned = useSharedValue(false);
+
+  const resetViewport = useCallback(() => {
+    userHasManuallyPanned.value = false;
+    scale.value = withSpring(1, { damping: 18, stiffness: 180 });
+    savedScale.value = 1;
+    translateX.value = withSpring(0, { damping: 18, stiffness: 180 });
+    translateY.value = withSpring(0, { damping: 18, stiffness: 180 });
+    savedX.value = 0;
+    savedY.value = 0;
+  }, [
+    userHasManuallyPanned,
+    scale,
+    savedScale,
+    translateX,
+    translateY,
+    savedX,
+    savedY,
+  ]);
+
+  // Reset viewport & manual override when switching to a brand-new slide
+  useEffect(() => {
+    userHasManuallyPanned.value = false;
+    scale.value = 1;
+    savedScale.value = 1;
+    translateX.value = 0;
+    translateY.value = 0;
+    savedX.value = 0;
+    savedY.value = 0;
+  }, [
+    slideImageUri,
+    userHasManuallyPanned,
+    scale,
+    savedScale,
+    translateX,
+    translateY,
+    savedX,
+    savedY,
+  ]);
+
   useEffect(() => {
     setDetectedAspect(slideAspectRatio > 0 ? slideAspectRatio : 16 / 9);
   }, [slideAspectRatio]);
@@ -598,15 +1261,125 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   const safeIndex = Math.max(0, Math.min(currentStepIndex, safeSteps.length - 1));
   const currentStep = safeSteps[safeIndex];
 
-  // Reanimated shared value driving 60fps Skia path drawing for the active step
-  const stepProgress = useSharedValue(0);
+  // Smooth 60fps Reanimated progress value synced to 50ms audio stepProgress (0 -> 1)
+  const clampedProgress = clamp01(stepProgress);
+  const activeProgressSV = useSharedValue(clampedProgress);
+
   useEffect(() => {
-    stepProgress.value = 0;
-    stepProgress.value = withTiming(1, {
-      duration: 520,
-      easing: Easing.out(Easing.cubic),
-    });
-  }, [safeIndex, currentStep?.step_id, stepProgress]);
+    // Snap cleanly to 0 on step switch or replay so borders/arrows never sweep backward
+    activeProgressSV.value = 0;
+  }, [safeIndex, currentStep?.step_id, replayToken, activeProgressSV]);
+
+  useEffect(() => {
+    if (clampedProgress <= 0.01) {
+      activeProgressSV.value = 0;
+    } else {
+      activeProgressSV.value = withTiming(clampedProgress, {
+        duration: 65,
+        easing: Easing.linear,
+      });
+    }
+  }, [clampedProgress, activeProgressSV]);
+
+  // Choreography phase curves on the UI thread:
+  // - Card borders & heading underlines: 0% -> 35%
+  // - Connector arrows: 75% -> 100%
+  // - PDF overlay highlights/circles: 0% -> 45%
+  const borderProgressSV = useDerivedValue(() =>
+    Math.max(0, Math.min(1, activeProgressSV.value / 0.35))
+  );
+  const arrowProgressSV = useDerivedValue(() =>
+    Math.max(0, Math.min(1, (activeProgressSV.value - 0.75) / 0.25))
+  );
+  const pdfProgressSV = useDerivedValue(() =>
+    Math.max(0, Math.min(1, activeProgressSV.value / 0.45))
+  );
+
+  // Live RN text & code typewriter curve: 15% -> 92% of stepProgress
+  const textProgress = clamp01((clampedProgress - 0.15) / 0.77);
+
+  // Simultaneous Pan + Pinch + Double-Tap Reset gestures (60fps UI thread)
+  const composedGesture = useMemo(() => {
+    const panGesture = Gesture.Pan()
+      .minDistance(4)
+      .onStart(() => {
+        userHasManuallyPanned.value = true;
+        savedX.value = translateX.value;
+        savedY.value = translateY.value;
+      })
+      .onUpdate((e) => {
+        translateX.value = savedX.value + e.translationX;
+        translateY.value = savedY.value + e.translationY;
+      })
+      .onEnd(() => {
+        savedX.value = translateX.value;
+        savedY.value = translateY.value;
+      });
+
+    const pinchGesture = Gesture.Pinch()
+      .onStart(() => {
+        userHasManuallyPanned.value = true;
+        savedScale.value = scale.value;
+      })
+      .onUpdate((e) => {
+        const nextScale = Math.min(
+          MAX_SCALE,
+          Math.max(MIN_SCALE, savedScale.value * e.scale)
+        );
+        scale.value = nextScale;
+      })
+      .onEnd(() => {
+        savedScale.value = scale.value;
+      });
+
+    const doubleTapGesture = Gesture.Tap()
+      .numberOfTaps(2)
+      .onEnd(() => {
+        userHasManuallyPanned.value = false;
+        scale.value = withSpring(1, { damping: 18, stiffness: 180 });
+        savedScale.value = 1;
+        translateX.value = withSpring(0, { damping: 18, stiffness: 180 });
+        translateY.value = withSpring(0, { damping: 18, stiffness: 180 });
+        savedX.value = 0;
+        savedY.value = 0;
+      });
+
+    return Gesture.Simultaneous(
+      Gesture.Simultaneous(panGesture, pinchGesture),
+      doubleTapGesture
+    );
+  }, [
+    userHasManuallyPanned,
+    scale,
+    savedScale,
+    translateX,
+    translateY,
+    savedX,
+    savedY,
+  ]);
+
+  const viewportTransformStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: translateX.value },
+      { translateY: translateY.value },
+      { scale: scale.value },
+    ],
+  }));
+
+  // Floating "Reset View" button smoothly appears whenever zoomed/panned away from center
+  const resetButtonAnimStyle = useAnimatedStyle(() => {
+    const isMoved =
+      Math.abs(scale.value - 1) > 0.04 ||
+      Math.abs(translateX.value) > 14 ||
+      Math.abs(translateY.value) > 14;
+    return {
+      opacity: withTiming(isMoved ? 1 : 0, { duration: 180 }),
+      transform: [
+        { translateY: withTiming(isMoved ? 0 : 80, { duration: 200 }) },
+        { scale: withTiming(isMoved ? 1 : 0.88, { duration: 180 }) },
+      ],
+    };
+  });
 
   const handleLayout = (e: LayoutChangeEvent) => {
     const { width, height } = e.nativeEvent.layout;
@@ -621,61 +1394,117 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
       computeContainRect(
         canvasSize.width,
         canvasSize.height,
-        detectedAspect
+        detectedAspect,
+        topInset,
+        bottomInset
       ),
-    [canvasSize.width, canvasSize.height, detectedAspect]
+    [canvasSize.width, canvasSize.height, detectedAspect, topInset, bottomInset]
   );
 
-  // Compute accumulated whiteboard actions & slot geometry
-  const wbActions = useMemo(
-    () => resolveWhiteboardActions(safeSteps, safeIndex),
+  // Compute cumulative multi-band whiteboard blocks & dynamic rects
+  const wbBlocks = useMemo(
+    () => resolveWhiteboardBlocks(safeSteps, safeIndex),
     [safeSteps, safeIndex]
   );
 
-  const groupedBySlot = useMemo(() => {
-    const map = new Map<WhiteboardSlot, ResolvedAction[]>();
-    for (const item of wbActions) {
-      const slot = item.action.slot;
-      if (!slot) continue;
-      const existing = map.get(slot) ?? [];
-      existing.push(item);
-      map.set(slot, existing);
-    }
-    return map;
-  }, [wbActions]);
-
-  const activeSlotSet = useMemo(
-    () => new Set<WhiteboardSlot>(groupedBySlot.keys()),
-    [groupedBySlot]
-  );
-
-  const slotRects = useMemo(
+  const cumulativeLayout = useMemo(
     () =>
-      computeWhiteboardSlots(
+      computeCumulativeWhiteboardLayout(
         canvasSize.width,
         canvasSize.height,
-        activeSlotSet
+        wbBlocks,
+        topInset,
+        bottomInset
       ),
-    [canvasSize.width, canvasSize.height, activeSlotSet]
+    [canvasSize.width, canvasSize.height, wbBlocks, topInset, bottomInset]
   );
 
-  // Single-draw-call subtle engineering grid path for 60fps whiteboard background
+  // Gesture-Safe Auto-Pan Camera Follow: smoothly centers on active blocks below viewport
+  useEffect(() => {
+    if (
+      !currentStep ||
+      currentStep.mode !== "whiteboard" ||
+      canvasSize.height <= 0
+    ) {
+      return;
+    }
+    if (userHasManuallyPanned.value) return;
+
+    const activeRects: RectFrame[] = [];
+    for (const block of wbBlocks) {
+      if (block.lastUpdatedStepIdx === safeIndex) {
+        const rect = cumulativeLayout.blockRects.get(block.blockId);
+        if (rect && rect.height > 0) {
+          activeRects.push(rect);
+        }
+      }
+    }
+    if (activeRects.length === 0) return;
+
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const r of activeRects) {
+      minY = Math.min(minY, r.y);
+      maxY = Math.max(maxY, r.y + r.height);
+    }
+
+    const visibleTop = topInset + 8;
+    const visibleBottom = canvasSize.height - bottomInset - 12;
+    const visibleCenterY = (visibleTop + visibleBottom) / 2;
+
+    let targetY = translateY.value;
+    if (maxY + translateY.value > visibleBottom) {
+      const activeCenterY = (minY + maxY) / 2;
+      targetY = Math.min(0, visibleCenterY - activeCenterY);
+    } else if (minY + translateY.value < visibleTop) {
+      targetY = Math.min(0, visibleTop - minY);
+    } else if (minY <= visibleTop + 24 && maxY <= visibleBottom) {
+      targetY = 0;
+    }
+
+    if (Math.abs(targetY - translateY.value) > 4) {
+      translateY.value = withTiming(targetY, {
+        duration: 460,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedY.value = targetY;
+    }
+  }, [
+    safeIndex,
+    currentStep,
+    wbBlocks,
+    cumulativeLayout.blockRects,
+    canvasSize.height,
+    topInset,
+    bottomInset,
+    userHasManuallyPanned,
+    translateY,
+    savedY,
+  ]);
+
+  // Single-draw-call subtle warm paper grid covering an expanded infinite area
+  const gridOverscan = 480;
   const gridPath = useMemo(() => {
-    if (canvasSize.width <= 0 || canvasSize.height <= 0) {
+    if (cumulativeLayout.boardWidth <= 0 || cumulativeLayout.boardHeight <= 0) {
       return makeEmptyPath();
     }
     const spacing = 28;
+    const minX = -gridOverscan;
+    const maxX = cumulativeLayout.boardWidth + gridOverscan;
+    const minY = -gridOverscan;
+    const maxY = cumulativeLayout.boardHeight + gridOverscan;
+
     return makePathFromBuilder((builder) => {
-      for (let x = spacing; x < canvasSize.width; x += spacing) {
-        builder.moveTo(x, 0);
-        builder.lineTo(x, canvasSize.height);
+      for (let x = minX; x <= maxX; x += spacing) {
+        builder.moveTo(x, minY);
+        builder.lineTo(x, maxY);
       }
-      for (let y = spacing; y < canvasSize.height; y += spacing) {
-        builder.moveTo(0, y);
-        builder.lineTo(canvasSize.width, y);
+      for (let y = minY; y <= maxY; y += spacing) {
+        builder.moveTo(minX, y);
+        builder.lineTo(maxX, y);
       }
     });
-  }, [canvasSize.width, canvasSize.height]);
+  }, [cumulativeLayout.boardWidth, cumulativeLayout.boardHeight]);
 
   if (!currentStep) {
     return (
@@ -686,7 +1515,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
   }
 
   // =========================================================================
-  // MODE 1: PDF OVERLAY (Aspect-Ratio Locked Slide + 60fps Transparent Skia)
+  // MODE 1: PDF OVERLAY (Interactive Pan & Zoom Slide + Progressive Skia)
   // =========================================================================
   if (currentStep.mode === "pdf_overlay") {
     const pdfActions = (currentStep.actions ?? []).filter(
@@ -698,189 +1527,269 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
 
     return (
       <View style={styles.pdfRoot} onLayout={handleLayout}>
-        {/* Layer 1: Underlying PDF slide locked strictly to contentRect */}
-        {canvasSize.width > 0 &&
-          (renderPdfLayer ? (
-            <View
-              style={[
-                styles.absoluteRect,
-                {
-                  left: contentRect.x,
-                  top: contentRect.y,
-                  width: contentRect.width,
-                  height: contentRect.height,
-                },
-              ]}
-            >
-              {renderPdfLayer(contentRect)}
-            </View>
-          ) : slideImageUri ? (
-            <Image
-              source={{ uri: slideImageUri }}
-              resizeMode="contain"
-              style={StyleSheet.absoluteFill}
-              onLoad={(event) => {
-                const source = event?.nativeEvent?.source;
-                if (source && source.width > 0 && source.height > 0) {
-                  setDetectedAspect(source.width / source.height);
-                }
-              }}
-            />
-          ) : (
-            <View
-              style={[
-                styles.pdfPlaceholder,
-                {
-                  left: contentRect.x,
-                  top: contentRect.y,
-                  width: contentRect.width,
-                  height: contentRect.height,
-                },
-              ]}
-            >
-              <Text style={styles.pdfPlaceholderText}>
-                PDF Slide Canvas ({Math.round(contentRect.width)}×
-                {Math.round(contentRect.height)})
-              </Text>
-            </View>
-          ))}
-
-        {/* Layer 2: Transparent 60fps Skia Vector Overlay mapped via [0-1000] bbox */}
-        {canvasSize.width > 0 && (
-          <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
-            {pdfActions.map((action, idx) => {
-              const screenRect = mapBboxToScreenRect(action.bbox!, contentRect);
-              const token = getColorToken(action.color);
-              const key = `pdf-${currentStep.step_id}-${idx}-${action.type}`;
-
-              if (action.type === "pdf_highlight") {
-                return (
-                  <AnimatedHighlightRect
-                    key={key}
-                    rect={screenRect}
-                    color={token.highlight}
-                    progress={stepProgress}
-                  />
-                );
-              }
-              return (
-                <AnimatedCircleAnnotation
-                  key={key}
-                  rect={screenRect}
-                  strokeColor={token.stroke}
-                  progress={stepProgress}
+        <GestureDetector gesture={composedGesture}>
+          <Animated.View style={[styles.gestureStage, viewportTransformStyle]}>
+            {/* Layer 1: Underlying PDF slide locked strictly to contentRect */}
+            {canvasSize.width > 0 &&
+              (renderPdfLayer ? (
+                <View
+                  style={[
+                    styles.absoluteRect,
+                    {
+                      left: contentRect.x,
+                      top: contentRect.y,
+                      width: contentRect.width,
+                      height: contentRect.height,
+                    },
+                  ]}
+                >
+                  {renderPdfLayer(contentRect)}
+                </View>
+              ) : slideImageUri ? (
+                <Image
+                  source={{ uri: slideImageUri }}
+                  resizeMode="contain"
+                  style={[
+                    styles.absoluteRect,
+                    {
+                      left: contentRect.x,
+                      top: contentRect.y,
+                      width: contentRect.width,
+                      height: contentRect.height,
+                    },
+                  ]}
+                  onLoad={(event) => {
+                    const source = event?.nativeEvent?.source;
+                    if (source && source.width > 0 && source.height > 0) {
+                      setDetectedAspect(source.width / source.height);
+                    }
+                  }}
                 />
-              );
-            })}
-          </Canvas>
-        )}
+              ) : (
+                <View
+                  style={[
+                    styles.pdfPlaceholder,
+                    {
+                      left: contentRect.x,
+                      top: contentRect.y,
+                      width: contentRect.width,
+                      height: contentRect.height,
+                    },
+                  ]}
+                >
+                  <Text style={styles.pdfPlaceholderText}>
+                    PDF Slide Canvas ({Math.round(contentRect.width)}×
+                    {Math.round(contentRect.height)})
+                  </Text>
+                </View>
+              ))}
+
+            {/* Layer 2: Transparent 60fps Skia Vector Overlay mapped via [0-1000] bbox */}
+            {canvasSize.width > 0 && (
+              <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
+                {pdfActions.map((action, idx) => {
+                  const screenRect = mapBboxToScreenRect(
+                    action.bbox!,
+                    contentRect
+                  );
+                  const token = getColorToken(action.color);
+                  const key = `pdf-${currentStep.step_id}-${idx}-${action.type}`;
+
+                  if (action.type === "pdf_highlight") {
+                    return (
+                      <AnimatedHighlightRect
+                        key={key}
+                        rect={screenRect}
+                        color={token.highlight}
+                        progress={pdfProgressSV}
+                      />
+                    );
+                  }
+                  return (
+                    <AnimatedCircleAnnotation
+                      key={key}
+                      rect={screenRect}
+                      strokeColor={token.stroke}
+                      progress={pdfProgressSV}
+                    />
+                  );
+                })}
+              </Canvas>
+            )}
+          </Animated.View>
+        </GestureDetector>
+
+        {/* Floating Reset View Button */}
+        <Animated.View
+          style={[
+            styles.resetBtnWrap,
+            { bottom: bottomInset + 14 },
+            resetButtonAnimStyle,
+          ]}
+        >
+          <Pressable style={styles.resetBtn} onPress={resetViewport}>
+            <Text style={styles.resetBtnText}>⌖ Reset View</Text>
+          </Pressable>
+        </Animated.View>
       </View>
     );
   }
 
   // =========================================================================
-  // MODE 2: SMART WHITEBOARD (6 Disjoint Slots + Skia Cards & Auto Arrows)
+  // MODE 2: LIVE PROGRESSIVE INFINITE WHITEBOARD (#FAF8F5 Paper + Auto-Pan)
   // =========================================================================
-  const arrowActions = wbActions.filter(
-    (item) =>
-      item.action.type === "wb_flow_card" &&
-      item.action.slot &&
-      item.action.connect_from_slot &&
-      activeSlotSet.has(item.action.connect_from_slot)
+  const { blockRects, boardWidth, boardHeight } = cumulativeLayout;
+  const arrowBlocks = wbBlocks.filter(
+    (block) =>
+      block.items[0]?.action.type === "wb_flow_card" &&
+      block.connectFromBlockId &&
+      blockRects.has(block.connectFromBlockId)
   );
 
   return (
     <View style={styles.whiteboardRoot} onLayout={handleLayout}>
-      {/* Layer 1: 60fps Skia Vector Layer (Dot Grid, Card Frames, Auto Arrows) */}
-      {canvasSize.width > 0 && (
-        <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
-          {/* Single-Draw-Call Academic Grid */}
-          <Path
-            path={gridPath}
-            style="stroke"
-            strokeWidth={0.75}
-            color="rgba(148, 163, 184, 0.22)"
-          />
-
-          {/* Slot Card Vector Surfaces */}
-          {Array.from(groupedBySlot.entries()).map(([slot, items]) => {
-            const rect = slotRects[slot];
-            if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-            const primary = items[0]?.action;
-            if (!primary) return null;
-            const token = getColorToken(primary.color);
-            const isCode = primary.type === "wb_code";
-            const radius = primary.type === "wb_heading" ? 10 : 14;
-
-            return (
-              <React.Fragment key={`frame-${slot}`}>
-                <RoundedRect
-                  x={rect.x}
-                  y={rect.y}
-                  width={rect.width}
-                  height={rect.height}
-                  r={radius}
-                  color={isCode ? "#0F172A" : token.fill}
-                />
-                <RoundedRect
-                  x={rect.x}
-                  y={rect.y}
-                  width={rect.width}
-                  height={rect.height}
-                  r={radius}
+      <GestureDetector gesture={composedGesture}>
+        <Animated.View style={[styles.gestureStage, viewportTransformStyle]}>
+          <View
+            style={{
+              width: boardWidth,
+              height: boardHeight,
+            }}
+          >
+            {/* Layer 1: 60fps Skia Vector Layer (Grid, Progressive Card Frames, Arrows) */}
+            {canvasSize.width > 0 && (
+              <Canvas
+                style={{
+                  position: "absolute",
+                  left: -gridOverscan,
+                  top: -gridOverscan,
+                  width: boardWidth + gridOverscan * 2,
+                  height: boardHeight + gridOverscan * 2,
+                }}
+                pointerEvents="none"
+              >
+                {/* Expanded Infinite Paper Grid */}
+                <Path
+                  path={gridPath}
                   style="stroke"
-                  strokeWidth={primary.type === "wb_flow_card" ? 2 : 1.5}
-                  color={isCode ? "#334155" : token.stroke}
+                  strokeWidth={0.8}
+                  color={PAPER_GRID_COLOR}
+                  transform={[
+                    { translateX: gridOverscan },
+                    { translateY: gridOverscan },
+                  ]}
                 />
-              </React.Fragment>
-            );
-          })}
 
-          {/* Cause-and-Effect Connector Arrows (connect_from_slot -> slot) */}
-          {arrowActions.map((item) => {
-            const fromRect = slotRects[item.action.connect_from_slot!];
-            const toRect = slotRects[item.action.slot!];
-            if (!fromRect || !toRect) return null;
-            const token = getColorToken(item.action.color);
-            return (
-              <AnimatedArrowPath
-                key={`arrow-${item.key}`}
-                from={fromRect}
-                to={toRect}
-                strokeColor={token.stroke}
-                animate={item.isCurrentStep}
-                progress={stepProgress}
-              />
-            );
-          })}
-        </Canvas>
-      )}
+                {/* Progressive Card Frames & Heading Underlines (0% -> 35% of stepProgress) */}
+                {wbBlocks.map((block) => {
+                  const rect = blockRects.get(block.blockId);
+                  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+                  const primary = block.items[0]?.action;
+                  if (!primary) return null;
+                  const token = getColorToken(primary.color);
+                  const isCode = primary.type === "wb_code";
+                  const isHeading = primary.type === "wb_heading";
+                  const radius = isHeading ? 12 : 16;
+                  const isNewCard = block.createdAtStepIdx === safeIndex;
 
-      {/* Layer 2: Mathematically Locked Slot Content (Zero Overlap, Crisp Text) */}
-      {canvasSize.width > 0 &&
-        Array.from(groupedBySlot.entries()).map(([slot, items]) => {
-          const rect = slotRects[slot];
-          if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-          const isNew = items.some((i) => i.isCurrentStep);
+                  const shiftedRect: RectFrame = {
+                    x: rect.x + gridOverscan,
+                    y: rect.y + gridOverscan,
+                    width: rect.width,
+                    height: rect.height,
+                  };
 
-          return (
-            <Animated.View
-              key={`slot-${slot}-${items.map((i) => i.key).join("|")}`}
-              entering={isNew ? FadeIn.duration(260) : undefined}
-              style={[
-                styles.slotContainer,
-                {
-                  left: rect.x,
-                  top: rect.y,
-                  width: rect.width,
-                  height: rect.height,
-                },
-              ]}
-            >
-              <SlotContentView items={items} />
-            </Animated.View>
-          );
-        })}
+                  return (
+                    <AnimatedCardFrame
+                      key={`frame-${block.blockId}`}
+                      rect={shiftedRect}
+                      radius={radius}
+                      fillColor={isCode ? "#0F172A" : token.fill}
+                      strokeColor={isCode ? "#334155" : token.stroke}
+                      strokeWidth={primary.type === "wb_flow_card" ? 2 : 1.5}
+                      isHeading={isHeading}
+                      animate={isNewCard}
+                      borderProgress={borderProgressSV}
+                    />
+                  );
+                })}
+
+                {/* Cause-and-Effect Connector Arrows (75% -> 100% of stepProgress) */}
+                {arrowBlocks.map((block) => {
+                  const fromRect = blockRects.get(block.connectFromBlockId!);
+                  const toRect = blockRects.get(block.blockId);
+                  if (!fromRect || !toRect) return null;
+                  const primary = block.items[0].action;
+                  const token = getColorToken(primary.color);
+                  const shiftedFrom: RectFrame = {
+                    ...fromRect,
+                    x: fromRect.x + gridOverscan,
+                    y: fromRect.y + gridOverscan,
+                  };
+                  const shiftedTo: RectFrame = {
+                    ...toRect,
+                    x: toRect.x + gridOverscan,
+                    y: toRect.y + gridOverscan,
+                  };
+                  return (
+                    <AnimatedArrowPath
+                      key={`arrow-${block.blockId}`}
+                      from={shiftedFrom}
+                      to={shiftedTo}
+                      strokeColor={token.stroke}
+                      animate={block.createdAtStepIdx === safeIndex}
+                      progress={arrowProgressSV}
+                    />
+                  );
+                })}
+              </Canvas>
+            )}
+
+            {/* Layer 2: Live Typewriter RN Text & Syntax-Highlighted Code Overlays (15% -> 92%) */}
+            {canvasSize.width > 0 &&
+              wbBlocks.map((block) => {
+                const rect = blockRects.get(block.blockId);
+                if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+                const isCode = block.items[0]?.action.type === "wb_code";
+
+                return (
+                  <View
+                    key={`block-${block.blockId}`}
+                    style={[
+                      styles.slotContainer,
+                      isCode && styles.codeSlotContainer,
+                      {
+                        left: rect.x,
+                        top: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                      },
+                    ]}
+                  >
+                    <SlotContentView
+                      items={block.items}
+                      textProgress={textProgress}
+                      isPlaying={isPlaying}
+                    />
+                  </View>
+                );
+              })}
+          </View>
+        </Animated.View>
+      </GestureDetector>
+
+      {/* Floating Reset View Button */}
+      <Animated.View
+        style={[
+          styles.resetBtnWrap,
+          { bottom: bottomInset + 14 },
+          resetButtonAnimStyle,
+        ]}
+      >
+        <Pressable style={styles.resetBtn} onPress={resetViewport}>
+          <Text style={styles.resetBtnText}>⌖ Reset View</Text>
+        </Pressable>
+      </Animated.View>
     </View>
   );
 };
@@ -893,7 +1802,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#F8FAFC",
+    backgroundColor: PAPER_BG,
   },
   emptyText: {
     color: "#64748B",
@@ -901,8 +1810,16 @@ const styles = StyleSheet.create({
   },
   pdfRoot: {
     flex: 1,
-    backgroundColor: "#0F172A",
+    backgroundColor: "#141417",
     overflow: "hidden",
+  },
+  whiteboardRoot: {
+    flex: 1,
+    backgroundColor: PAPER_BG,
+    overflow: "hidden",
+  },
+  gestureStage: {
+    flex: 1,
   },
   absoluteRect: {
     position: "absolute",
@@ -911,7 +1828,7 @@ const styles = StyleSheet.create({
   pdfPlaceholder: {
     position: "absolute",
     backgroundColor: "#FFFFFF",
-    borderRadius: 8,
+    borderRadius: 10,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -919,111 +1836,159 @@ const styles = StyleSheet.create({
     color: "#94A3B8",
     fontSize: 13,
   },
-  whiteboardRoot: {
-    flex: 1,
-    backgroundColor: "#FFFFFF",
-    overflow: "hidden",
-  },
   slotContainer: {
     position: "absolute",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    justifyContent: "center",
+  },
+  codeSlotContainer: {
+    paddingHorizontal: 0,
+    paddingVertical: 0,
+    justifyContent: "flex-start",
     overflow: "hidden",
-    padding: 10,
+    borderRadius: 16,
   },
   headingBox: {
-    flex: 1,
     justifyContent: "center",
     alignItems: "center",
   },
   headingText: {
-    fontSize: 17,
+    fontSize: 17.5,
     fontWeight: "700",
     textAlign: "center",
+    lineHeight: 24,
   },
   flowCardBox: {
-    flexGrow: 1,
     justifyContent: "center",
     alignItems: "center",
-    paddingHorizontal: 4,
   },
   flowCardText: {
-    fontSize: 14,
+    fontSize: 14.5,
     fontWeight: "600",
     textAlign: "center",
-    lineHeight: 20,
+    lineHeight: 21,
   },
   equationBox: {
-    flexGrow: 1,
     justifyContent: "center",
     alignItems: "center",
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
   },
   equationText: {
-    fontSize: 16,
+    fontSize: 16.5,
     fontWeight: "600",
     fontFamily: Platform.OS === "ios" ? "Georgia" : "serif",
     textAlign: "center",
+    lineHeight: 24,
   },
   bulletList: {
-    gap: 6,
-    paddingVertical: 2,
+    gap: 8,
   },
   bulletRow: {
     flexDirection: "row",
     alignItems: "flex-start",
-    gap: 8,
+    gap: 9,
   },
   bulletDot: {
     width: 7,
     height: 7,
     borderRadius: 4,
-    marginTop: 6,
+    marginTop: 7,
   },
   bulletText: {
     flex: 1,
-    fontSize: 13.5,
-    lineHeight: 19,
+    fontSize: 14,
+    lineHeight: 20,
     fontWeight: "500",
   },
   codeContainer: {
     flex: 1,
-    margin: -10,
+    backgroundColor: "#0F172A",
+    borderRadius: 16,
+    overflow: "hidden",
   },
   codeHeader: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
     backgroundColor: "#1E293B",
-    borderTopLeftRadius: 12,
-    borderTopRightRadius: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#334155",
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+  },
+  codeDotsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+  },
+  codeDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
   },
   codeLangBadge: {
     color: "#93C5FD",
-    fontSize: 10,
+    fontSize: 10.5,
     fontWeight: "700",
-    letterSpacing: 0.8,
+    letterSpacing: 1,
+  },
+  codeLineCount: {
+    color: "#94A3B8",
+    fontSize: 10,
+    fontWeight: "600",
   },
   codeBody: {
-    paddingVertical: 6,
+    paddingVertical: 10,
+    gap: 2,
   },
   codeLineRow: {
     flexDirection: "row",
-    paddingHorizontal: 8,
+    paddingHorizontal: 10,
     paddingVertical: 2,
     alignItems: "flex-start",
   },
   codeLineNumber: {
-    width: 22,
+    width: 24,
     color: "#64748B",
-    fontSize: 11,
+    fontSize: 11.5,
+    lineHeight: 19,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
   codeLineText: {
     flex: 1,
+    flexShrink: 1,
     color: "#F8FAFC",
-    fontSize: 11.5,
-    lineHeight: 16,
+    fontSize: 12,
+    lineHeight: 19,
     fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  codePenCursor: {
+    color: "#38BDF8",
+    fontWeight: "800",
+  },
+  resetBtnWrap: {
+    position: "absolute",
+    right: 16,
+    zIndex: 20,
+  },
+  resetBtn: {
+    backgroundColor: "rgba(24, 24, 27, 0.88)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.14)",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    shadowColor: "#000",
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  resetBtnText: {
+    color: "#FAF8F5",
+    fontSize: 12,
+    fontWeight: "700",
   },
 });
 

@@ -3,12 +3,14 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 
 import edge_tts
 import fitz  # PyMuPDF
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,9 +49,25 @@ MAX_PDF_SIZE_MB: int = max(1, int(os.getenv("MAX_PDF_SIZE_MB", "25")))
 MAX_PDF_SIZE_BYTES: int = MAX_PDF_SIZE_MB * 1024 * 1024
 MAX_RENDER_DIM_PX: int = max(1024, int(os.getenv("MAX_RENDER_DIM_PX", "2048")))
 
-# Strictly locked Iraqi Arabic neural voice (edge-tts, 100% in-memory; never ar-EG-* or ar-SA-*)
-TTS_VOICE: str = "ar-IQ-BasselNeural"
-TTS_TIMEOUT_SEC: float = max(5.0, float(os.getenv("TTS_TIMEOUT_SEC", "15.0")))
+# Bilingual TTS Configuration:
+# Primary (optional): Google Cloud TTS Chirp 3 HD — disabled by default unless GOOGLE_TTS_API_KEY is explicitly set separately from GEMINI_API_KEY
+# Default Free Engine: Bilingual edge-tts stitching Arabic ("ar-AE-HamdanNeural", +8%) + English ("en-US-AndrewNeural", +5%)
+GOOGLE_TTS_API_KEY: str = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+GOOGLE_TTS_ENABLED: bool = (
+    os.getenv("GOOGLE_TTS_ENABLED", "true" if GOOGLE_TTS_API_KEY else "false")
+    .strip()
+    .lower()
+    not in ("0", "false", "no")
+) and bool(GOOGLE_TTS_API_KEY)
+GOOGLE_TTS_ENDPOINT: str = "https://texttospeech.googleapis.com/v1/text:synthesize"
+GOOGLE_TTS_VOICE: str = "ar-XA-Chirp3-HD-Charon"
+GOOGLE_TTS_LANGUAGE: str = "ar-XA"
+EDGE_TTS_VOICE: str = os.getenv("EDGE_TTS_VOICE", "ar-AE-HamdanNeural").strip() or "ar-AE-HamdanNeural"
+EDGE_TTS_RATE: str = os.getenv("EDGE_TTS_RATE", "+8%").strip() or "+8%"
+EDGE_TTS_EN_VOICE: str = os.getenv("EDGE_TTS_EN_VOICE", "en-US-AndrewNeural").strip() or "en-US-AndrewNeural"
+EDGE_TTS_EN_RATE: str = os.getenv("EDGE_TTS_EN_RATE", "+5%").strip() or "+5%"
+TTS_VOICE: str = EDGE_TTS_VOICE
+TTS_TIMEOUT_SEC: float = max(5.0, float(os.getenv("TTS_TIMEOUT_SEC", "20.0")))
 
 _raw_cors = os.getenv("CORS_ORIGINS", "*").strip()
 CORS_ORIGINS: list[str] = (
@@ -59,23 +77,27 @@ CORS_ORIGINS: list[str] = (
 )
 
 _genai_client: Optional[genai.Client] = None
+_http_client: Optional[httpx.AsyncClient] = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Initialize shared google-genai and Supabase clients for the FastAPI lifecycle."""
-    global _genai_client
+    """Initialize shared google-genai, httpx, and Supabase clients for the FastAPI lifecycle."""
+    global _genai_client, _http_client
     db.init_supabase()
+    _http_client = httpx.AsyncClient(timeout=TTS_TIMEOUT_SEC)
     if GEMINI_API_KEY:
         _genai_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info(
-            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | embed=%s(%dd) | dpi=%d | tts_voice=%s | supabase=%s",
+            "Gemini client initialized | fast=%s | deep=%s | fallback=%s | embed=%s(%dd) | dpi=%d | tts_primary=%s(enabled=%s) | tts_fallback=%s | supabase=%s",
             FAST_TUTOR_MODEL,
             DEEP_TUTOR_MODEL,
             FALLBACK_TUTOR_MODEL,
             EMBEDDING_MODEL,
             EMBEDDING_DIM,
             PDF_RENDER_DPI,
+            GOOGLE_TTS_VOICE,
+            GOOGLE_TTS_ENABLED and bool(GOOGLE_TTS_API_KEY),
             TTS_VOICE,
             db.is_configured(),
         )
@@ -83,6 +105,9 @@ async def lifespan(_app: FastAPI):
         logger.warning("GEMINI_API_KEY is not set; /api/explain will fail until configured.")
     yield
     _genai_client = None
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
     db.close_supabase()
 
 
@@ -276,6 +301,11 @@ def _sanitize_plan(plan: LecturePlan, board_mode: BoardMode) -> LecturePlan:
                         action.bbox.xmin, action.bbox.xmax = action.bbox.xmax, action.bbox.xmin
             elif action.type in wb_action_types or action.type == "clear_board":
                 action.bbox = None
+                if action.type == "wb_code":
+                    resolved_code = (action.code or action.text or "").strip()
+                    if resolved_code:
+                        action.code = resolved_code
+                        action.text = resolved_code
 
     return plan
 
@@ -517,23 +547,202 @@ def _build_response_from_cache(
     )
 
 
-async def _synthesize_step_audio_b64(text: str) -> Optional[str]:
-    """Generate MP3 speech purely in memory via edge-tts strictly using ar-IQ-BasselNeural."""
+async def _synthesize_google_chirp_b64(text: str) -> Optional[str]:
+    """Synthesize crisp Arabic-English MP3 via Google Cloud TTS Chirp 3 HD REST API."""
+    if not GOOGLE_TTS_ENABLED or not GOOGLE_TTS_API_KEY:
+        return None
+
+    payload = {
+        "input": {"text": text},
+        "voice": {
+            "languageCode": GOOGLE_TTS_LANGUAGE,
+            "name": GOOGLE_TTS_VOICE,
+        },
+        "audioConfig": {
+            "audioEncoding": "MP3",
+        },
+    }
+
+    try:
+        if _http_client is not None:
+            resp = await _http_client.post(
+                GOOGLE_TTS_ENDPOINT,
+                params={"key": GOOGLE_TTS_API_KEY},
+                json=payload,
+            )
+        else:
+            async with httpx.AsyncClient(timeout=TTS_TIMEOUT_SEC) as client:
+                resp = await client.post(
+                    GOOGLE_TTS_ENDPOINT,
+                    params={"key": GOOGLE_TTS_API_KEY},
+                    json=payload,
+                )
+
+        if resp.status_code != 200:
+            logger.warning(
+                "Google Cloud TTS Chirp 3 HD returned HTTP %d (falling back to edge-tts %s): %s",
+                resp.status_code,
+                TTS_VOICE,
+                resp.text[:200],
+            )
+            return None
+
+        data = resp.json()
+        audio_b64 = data.get("audioContent")
+        if isinstance(audio_b64, str) and audio_b64.strip():
+            return audio_b64.strip()
+        return None
+    except Exception as exc:
+        logger.warning(
+            "Google Cloud TTS Chirp 3 HD request failed (falling back to edge-tts %s): %s",
+            TTS_VOICE,
+            exc,
+        )
+        return None
+
+
+_ARABIC_HARAKAT_RE = re.compile(r"[\u064B-\u065F\u0670\u0640]")
+_RAW_CODE_PUNCT_RE = re.compile(r'"""|\'\'\'|[#{}\[\];`]')
+_EN_PHRASE_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_/\-+.]*(?:\s+[A-Za-z0-9][A-Za-z0-9_/\-+.]*)*"
+)
+_SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0600-\u06FF]")
+
+
+def _clean_speech_for_tts(text: str) -> str:
+    """
+    Normalize speech_ar for crisp Arabic-English TTS synthesis:
+    - Strip Arabic harakat/diacritics and tatweel.
+    - Expand awkward Python tokens (__init__, elif, str, int) into natural spoken words.
+    - Remove raw code punctuation (#, \"\"\", {}, [], ;, backticks).
+    """
     cleaned = (text or "").strip()
     if not cleaned:
+        return ""
+
+    # 1. Strip Arabic harakat ([\u064B-\u065F\u0670]) and tatweel (\u0640)
+    cleaned = _ARABIC_HARAKAT_RE.sub("", cleaned)
+
+    # 2. Normalize common Python code tokens into natural spoken English
+    cleaned = re.sub(r"__init__", "init", cleaned)
+    cleaned = re.sub(r"\belif\b", "else if", cleaned)
+    cleaned = re.sub(r"\bstr\b", "string", cleaned)
+    cleaned = re.sub(r"\bint\b", "integer", cleaned)
+
+    # 3. Strip raw code punctuation that causes robotic pauses or spoken symbol names
+    cleaned = _RAW_CODE_PUNCT_RE.sub(" ", cleaned)
+
+    # 4. Collapse redundant whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _split_bilingual_segments(text: str) -> list[tuple[Literal["ar", "en"], str]]:
+    """
+    Split a bilingual sentence into sequential Arabic and English runs so multi-word English
+    technical phrases (e.g. 'Iteration Control Structure', 'for loop', 'Exception Handling')
+    are spoken by a native English neural voice inside the Arabic narration.
+    """
+    segments: list[tuple[Literal["ar", "en"], str]] = []
+    pos = 0
+    for match in _EN_PHRASE_RE.finditer(text):
+        start, end = match.span()
+        if start > pos:
+            ar_part = text[pos:start].strip()
+            if ar_part and _SPEAKABLE_RE.search(ar_part):
+                segments.append(("ar", ar_part))
+        en_part = match.group(0).strip(".,:;!?() ")
+        if en_part and _SPEAKABLE_RE.search(en_part):
+            segments.append(("en", en_part))
+        pos = end
+
+    if pos < len(text):
+        tail = text[pos:].strip()
+        if tail and _SPEAKABLE_RE.search(tail):
+            segments.append(("ar", tail))
+
+    return segments
+
+
+def _strip_id3v2(mp3_bytes: bytes) -> bytes:
+    """Strip any leading ID3v2 header so concatenated MPEG-2 CBR frames play seamlessly on iOS."""
+    if len(mp3_bytes) >= 10 and mp3_bytes[:3] == b"ID3":
+        tag_size = (
+            ((mp3_bytes[6] & 0x7F) << 21)
+            | ((mp3_bytes[7] & 0x7F) << 14)
+            | ((mp3_bytes[8] & 0x7F) << 7)
+            | (mp3_bytes[9] & 0x7F)
+        )
+        offset = 10 + tag_size
+        if offset < len(mp3_bytes):
+            return mp3_bytes[offset:]
+    return mp3_bytes
+
+
+async def _synthesize_edge_segment_bytes(lang: Literal["ar", "en"], segment_text: str) -> bytes:
+    """Synthesize a single Arabic or English segment into raw headerless CBR MP3 bytes."""
+    voice = EDGE_TTS_EN_VOICE if lang == "en" else EDGE_TTS_VOICE
+    rate = EDGE_TTS_EN_RATE if lang == "en" else EDGE_TTS_RATE
+    communicate = edge_tts.Communicate(segment_text, voice, rate=rate)
+    chunks: list[bytes] = []
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio" and chunk.get("data"):
+            chunks.append(chunk["data"])
+    return _strip_id3v2(b"".join(chunks)) if chunks else b""
+
+
+async def _synthesize_edge_tts_b64(text: str) -> Optional[str]:
+    """
+    Free bilingual MP3 synthesis via edge-tts:
+    Synthesizes Arabic runs (ar-AE-HamdanNeural, +8%) and English runs (en-US-AndrewNeural, +5%)
+    concurrently and concatenates raw 24kHz/48kbps mono CBR MP3 frames with zero external deps.
+    """
+    segments = _split_bilingual_segments(text)
+    if not segments:
         return None
+
     try:
-        communicate = edge_tts.Communicate(text=cleaned, voice=TTS_VOICE)
-        audio_chunks: list[bytes] = []
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio" and chunk.get("data"):
-                audio_chunks.append(chunk["data"])
-        if not audio_chunks:
-            return None
-        return base64.b64encode(b"".join(audio_chunks)).decode("ascii")
+        tasks = [
+            _synthesize_edge_segment_bytes(lang, seg_text)
+            for lang, seg_text in segments
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        stitched_parts: list[bytes] = []
+        for (lang, seg_text), res in zip(segments, results):
+            if isinstance(res, bytes) and res:
+                stitched_parts.append(res)
+            elif isinstance(res, Exception):
+                logger.warning(
+                    "Bilingual edge-tts segment failed (lang=%s, text=%r): %s",
+                    lang,
+                    seg_text[:40],
+                    res,
+                )
+
+        if stitched_parts:
+            return base64.b64encode(b"".join(stitched_parts)).decode("ascii")
+
+        # Fallback to single-voice synthesis if segmented stitching produced no audio
+        single_bytes = await _synthesize_edge_segment_bytes("ar", text)
+        return base64.b64encode(single_bytes).decode("ascii") if single_bytes else None
     except Exception as exc:
-        logger.warning("edge-tts synthesis failed (voice=%s): %s", TTS_VOICE, exc)
+        logger.warning("edge-tts synthesis failed (ar=%s, en=%s): %s", EDGE_TTS_VOICE, EDGE_TTS_EN_VOICE, exc)
         return None
+
+
+async def _synthesize_step_audio_b64(text: str) -> Optional[str]:
+    """Generate MP3 speech: optional Google Cloud TTS Chirp 3 HD if explicitly configured, else bilingual edge-tts."""
+    cleaned = _clean_speech_for_tts(text)
+    if not cleaned:
+        return None
+
+    if GOOGLE_TTS_ENABLED and GOOGLE_TTS_API_KEY:
+        chirp_b64 = await _synthesize_google_chirp_b64(cleaned)
+        if chirp_b64:
+            return chirp_b64
+
+    return await _synthesize_edge_tts_b64(cleaned)
 
 
 async def _synthesize_plan_audio(plan: LecturePlan) -> list[StepAudioPayload]:
@@ -573,7 +782,13 @@ async def health_check() -> dict[str, object]:
         "fallback_model": FALLBACK_TUTOR_MODEL,
         "embedding_model": EMBEDDING_MODEL,
         "pdf_render_dpi": PDF_RENDER_DPI,
-        "tts_voice": TTS_VOICE,
+        "google_tts_enabled": GOOGLE_TTS_ENABLED,
+        "tts_primary": GOOGLE_TTS_VOICE if GOOGLE_TTS_ENABLED else EDGE_TTS_VOICE,
+        "tts_en_voice": EDGE_TTS_EN_VOICE,
+        "tts_fallback": EDGE_TTS_VOICE,
+        "edge_tts_rate": EDGE_TTS_RATE,
+        "edge_tts_en_rate": EDGE_TTS_EN_RATE,
+        "tts_voice": GOOGLE_TTS_VOICE if GOOGLE_TTS_ENABLED else f"{EDGE_TTS_VOICE}+{EDGE_TTS_EN_VOICE}",
     }
 
 
@@ -761,8 +976,9 @@ async def explain_slide(
         f"Explain slide page {page_number} of {total_pages} from this lecture PDF thoroughly. "
         f"Do NOT summarize briefly: break down every concept, diagram component, equation, or code line into "
         f"5 to 8 detailed steps, with each step's speech_ar strictly 20 to 40 words in clear, natural Iraqi academic Arabic "
-        f"(لهجة عراقية بيضاء مفهومة) with light Arabic diacritics (تشكيل خفيف) on ambiguous words, avoiding heavy slang spellings "
-        f"and keeping all scientific terms in English. Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
+        f"(لهجة عراقية بيضاء مفهومة) WITHOUT Arabic harakat or raw code symbols (#, {{}}, [], ;) inside speech_ar, using natural punctuation and clean spacing around "
+        f"English technical terms. For EVERY wb_code action, you MUST populate the `code` field with 3 to 8 lines of real runnable code separated by real newlines (never empty). "
+        f"Follow board_mode='{board_mode}' strictly and return a valid LecturePlan JSON."
     )
 
     logger.info(
@@ -774,10 +990,11 @@ async def explain_slide(
         len(image_bytes) / 1024.0,
     )
 
-    # 4. Call official google-genai SDK asynchronously across fallback chain with backoff
-    response = None
+    # 4. Call official google-genai SDK asynchronously across fallback chain with backoff + validation retry
+    plan: Optional[LecturePlan] = None
     used_model: Optional[str] = None
     last_api_error: Optional[genai_errors.APIError] = None
+    last_validation_error: Optional[Exception] = None
     last_error_code: Optional[int] = None
     last_failed_model: str = model_chain[0] if model_chain else FAST_TUTOR_MODEL
     max_attempts_per_model = 2
@@ -788,6 +1005,8 @@ async def explain_slide(
             "system_instruction": system_prompt,
             "response_mime_type": "application/json",
             "response_schema": LecturePlan,
+            "temperature": 0.3,
+            "max_output_tokens": 8192,
         }
         if candidate_model == "gemini-3.5-flash-lite":
             config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
@@ -808,7 +1027,38 @@ async def explain_slide(
                     ],
                     config=gen_config,
                 )
+
+                # Parse & validate inside the retry/fallback loop so malformed JSON or
+                # empty wb_code triggers automatic retry / fallback instead of an immediate 502.
+                if isinstance(response.parsed, LecturePlan):
+                    plan = response.parsed
+                elif response.text:
+                    plan = LecturePlan.model_validate_json(response.text)
+                else:
+                    raise ValueError("Model returned an empty response payload.")
+
                 used_model = candidate_model
+                break
+            except (ValidationError, ValueError) as exc:
+                last_validation_error = exc
+                last_failed_model = candidate_model
+                logger.warning(
+                    "Structured output failed LecturePlan validation on model=%s (attempt %d/%d): %s",
+                    candidate_model,
+                    attempt,
+                    max_attempts_per_model,
+                    str(exc)[:300],
+                )
+                if attempt < max_attempts_per_model:
+                    await asyncio.sleep(0.5)
+                    continue
+                if has_next_model:
+                    logger.warning(
+                        "Model '%s' failed schema validation after %d attempts; falling back to '%s'.",
+                        candidate_model,
+                        max_attempts_per_model,
+                        model_chain[model_idx + 1],
+                    )
                 break
             except genai_errors.APIError as exc:
                 code = getattr(exc, "code", None)
@@ -887,10 +1137,22 @@ async def explain_slide(
                     detail="Unexpected error communicating with the AI model.",
                 ) from exc
 
-        if response is not None:
+        if plan is not None:
             break
 
-    if response is None:
+    if plan is None:
+        if last_validation_error is not None and last_api_error is None:
+            logger.error(
+                "All models failed LecturePlan schema validation (%s) | last_model=%s | error=%s",
+                " -> ".join(model_chain),
+                last_failed_model,
+                last_validation_error,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="AI response failed LecturePlan schema validation across all configured models.",
+            ) from last_validation_error
+
         logger.error(
             "All models in fallback chain failed (%s) | last_model=%s | last_code=%s | error=%s",
             " -> ".join(model_chain),
@@ -917,21 +1179,6 @@ async def explain_slide(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Upstream Gemini API error (status={last_error_code}).",
         ) from last_api_error
-
-    # 5. Parse & validate strict LecturePlan contract
-    try:
-        if isinstance(response.parsed, LecturePlan):
-            plan = response.parsed
-        elif response.text:
-            plan = LecturePlan.model_validate_json(response.text)
-        else:
-            raise ValueError("Model returned an empty response payload.")
-    except (ValidationError, ValueError) as exc:
-        logger.error("Structured output failed LecturePlan validation: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="AI response failed LecturePlan schema validation.",
-        ) from exc
 
     sanitized_plan = _sanitize_plan(plan, board_mode)
     encoded_b64 = base64.b64encode(image_bytes).decode("ascii")
