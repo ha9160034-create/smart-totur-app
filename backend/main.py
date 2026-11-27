@@ -838,16 +838,20 @@ def _clean_speech_for_tts(text: str) -> str:
     # 1. Strip Arabic harakat ([\u064B-\u065F\u0670]) and tatweel (\u0640)
     cleaned = _ARABIC_HARAKAT_RE.sub("", cleaned)
 
-    # 2. Normalize common Python code tokens into natural spoken English
+    # 2. Normalize English possessives (e.g. "Newton's" -> "Newtons", "Ohm's" -> "Ohms")
+    # so the bilingual segment splitter never detaches "'s" as an isolated letter.
+    cleaned = re.sub(r"\b([A-Za-z]{2,})['’]s\b", r"\1s", cleaned)
+
+    # 3. Normalize common Python code tokens into natural spoken English
     cleaned = re.sub(r"__init__", "init", cleaned)
     cleaned = re.sub(r"\belif\b", "else if", cleaned)
     cleaned = re.sub(r"\bstr\b", "string", cleaned)
     cleaned = re.sub(r"\bint\b", "integer", cleaned)
 
-    # 3. Strip raw code punctuation that causes robotic pauses or spoken symbol names
+    # 4. Strip raw code punctuation that causes robotic pauses or spoken symbol names
     cleaned = _RAW_CODE_PUNCT_RE.sub(" ", cleaned)
 
-    # 4. Collapse redundant whitespace
+    # 5. Collapse redundant whitespace
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
