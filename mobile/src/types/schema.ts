@@ -18,6 +18,14 @@ export type DiagramNodeKind = "container" | "box" | "pill" | "decision";
 
 export type DiagramTint = "blue" | "teal" | "amber" | "rose" | "slate";
 
+export type DiagramStencil =
+  | "force_block"
+  | "circuit"
+  | "cell"
+  | "atom"
+  | "wave"
+  | "tree_node";
+
 export interface DiagramNode {
   id: string;
   label: string;
@@ -29,6 +37,7 @@ export interface DiagramNode {
   w: number; // 40-1000
   h: number; // 40-1000
   tint?: DiagramTint | null;
+  stencil?: DiagramStencil | null;
 }
 
 export interface DiagramEdge {
@@ -36,6 +45,27 @@ export interface DiagramEdge {
   to_id: string;
   label?: string | null;
   dashed?: boolean;
+}
+
+export type PlotExprType =
+  | "linear"
+  | "quadratic"
+  | "exponential"
+  | "sine"
+  | "points";
+
+export interface PlotCurve {
+  expr_type: PlotExprType;
+  params: number[];
+  color?: string | null;
+  label?: string | null;
+}
+
+export interface PlotMarker {
+  x: number;
+  y: number;
+  label?: string | null;
+  dashed_guides?: boolean;
 }
 
 export interface WordTiming {
@@ -58,12 +88,15 @@ export interface VisualAction {
     | "pdf_circle"
     | "wb_heading"
     | "wb_bullet"
+    | "wb_text"
+    | "wb_highlight"
     | "wb_equation"
     | "wb_code"
     | "wb_flow_card"
     | "wb_table"
     | "wb_note"
-    | "wb_diagram";
+    | "wb_diagram"
+    | "wb_plot";
   color: "blue" | "red" | "green" | "yellow" | "black";
   bbox?: BoundingBox;
   slot?: WhiteboardSlot;
@@ -79,6 +112,13 @@ export interface VisualAction {
   diagram_aspect?: number | null;
   nodes?: DiagramNode[] | null;
   edges?: DiagramEdge[] | null;
+  highlight?: boolean | null;
+  x_label?: string | null;
+  y_label?: string | null;
+  x_range?: number[] | null;
+  y_range?: number[] | null;
+  curves?: PlotCurve[] | null;
+  markers?: PlotMarker[] | null;
 }
 
 export interface TeachingStep {

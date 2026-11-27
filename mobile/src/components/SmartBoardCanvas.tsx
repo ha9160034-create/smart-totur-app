@@ -12,6 +12,8 @@ import {
 } from "react-native";
 import {
   Canvas,
+  Circle,
+  Group,
   Path,
   RoundedRect,
   Skia,
@@ -31,7 +33,10 @@ import type {
   BoundingBox,
   DiagramEdge,
   DiagramNode,
+  DiagramStencil,
   DiagramTint,
+  PlotCurve,
+  PlotMarker,
   SketchIcon,
   TeachingStep,
   VisualAction,
@@ -39,15 +44,22 @@ import type {
   WordTiming,
 } from "../types/schema";
 import {
+  PenTrailPoint,
   computeSmartDiagramArrowGeometry,
+  createDiagramStencilPaths,
   createDiamondFillPath,
+  createPlotAxesWithTrail,
+  createPlotCurveWithTrail,
   createRoughArrowPath,
   createRoughCirclePath,
   createRoughDashedRectPath,
   createRoughDiamondPath,
+  createRoughHighlighterPath,
   createRoughRectPath,
+  createRoughRectWithTrail,
   createRoughTableGridPath,
   createRoughUnderlinePath,
+  createRoughUnderlineWithTrail,
   createSketchIconPath,
   createSmartDiagramArrowPath,
   hashSeed,
@@ -354,14 +366,105 @@ function clamp01(value: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Text Normalization & WordBoundary Token Matching (Arabic + English)
+// Math Sanitization, Text Normalization & WordBoundary Token Matching
 // ---------------------------------------------------------------------------
-function normalizeBlockText(raw?: string | null): string {
+const MATH_CONTROL_REPAIRS: ReadonlyArray<[RegExp, string]> = [
+  [/\times\b/g, "×"],
+  [/\theta\b/g, "θ"],
+  [/\tau\b/g, "τ"],
+  [/\to\b/g, "→"],
+  [/\x08eta\b/g, "β"],
+  [/\x0crac\{([^{}]+)\}\{([^{}]+)\}/g, "($1)/($2)"],
+  [/\x0crac\b/g, "/"],
+  [/\x07pprox\b/g, "≈"],
+  [/\x07lpha\b/g, "α"],
+  [/\rightarrow\b/g, "→"],
+];
+
+const MATH_LATEX_REPAIRS: ReadonlyArray<[RegExp, string]> = [
+  [/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1)/($2)"],
+  [/\\sqrt\{([^{}]+)\}/g, "√($1)"],
+  [/\\sqrt\b/g, "√"],
+  [/\\vec\{([^{}]+)\}/g, "$1\u20D7"],
+  [/\\vec\b/g, "→"],
+  [/\\times\b/g, "×"],
+  [/\\cdot\b/g, "·"],
+  [/\\div\b/g, "÷"],
+  [/\\pm\b/g, "±"],
+  [/\\neq\b/g, "≠"],
+  [/\\leq\b/g, "≤"],
+  [/\\geq\b/g, "≥"],
+  [/\\approx\b/g, "≈"],
+  [/\\infty\b/g, "∞"],
+  [/\\sum\b/g, "∑"],
+  [/\\int\b/g, "∫"],
+  [/\\partial\b/g, "∂"],
+  [/\\Delta\b/g, "Δ"],
+  [/\\delta\b/g, "δ"],
+  [/\\theta\b/g, "θ"],
+  [/\\alpha\b/g, "α"],
+  [/\\beta\b/g, "β"],
+  [/\\gamma\b/g, "γ"],
+  [/\\lambda\b/g, "λ"],
+  [/\\mu\b/g, "μ"],
+  [/\\pi\b/g, "π"],
+  [/\\sigma\b/g, "σ"],
+  [/\\omega\b/g, "ω"],
+  [/\\Omega\b/g, "Ω"],
+  [/\\rightarrow\b/g, "→"],
+  [/\\leftrightarrow\b/g, "↔"],
+  [/\\to\b/g, "→"],
+];
+
+const BARE_EQ_MATH_REPAIRS: ReadonlyArray<[RegExp, string]> = [
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+times\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b(?!\s+[A-Za-z]{2,})/g, "$1 × $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+div\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ÷ $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+pm\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ± $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+neq\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ≠ $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+leq\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ≤ $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+geq\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ≥ $2"],
+  [/(\b(?:[A-Za-z]|\d+(?:\.\d+)?|\)))\s+approx\s+((?:[A-Za-z]|\d+(?:\.\d+)?|\())\b/g, "$1 ≈ $2"],
+];
+
+/**
+ * Client-side defense-in-depth math symbol sanitizer.
+ * Converts raw LaTeX tokens, JSON control-escape corruptions (e.g. \t+imes),
+ * and backslash-stripped equation tokens ("F = m times a") into clean Unicode math.
+ */
+function sanitizeMathText(raw?: string | null): string {
+  if (!raw) return "";
+  let out = raw;
+  for (const [pattern, replacement] of MATH_CONTROL_REPAIRS) {
+    out = out.replace(pattern, replacement);
+  }
+  for (const [pattern, replacement] of MATH_LATEX_REPAIRS) {
+    out = out.replace(pattern, replacement);
+  }
+  for (const [pattern, replacement] of BARE_EQ_MATH_REPAIRS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
+/** Preserves literal code characters & tab indents strictly for wb_code blocks */
+function normalizeCodeText(raw?: string | null): string {
   if (!raw) return "";
   return raw
     .replace(/\\r\\n/g, "\n")
     .replace(/\\n/g, "\n")
     .replace(/\\t/g, "    ")
+    .replace(/^\s*\n+/, "")
+    .replace(/\n+\s*$/, "");
+}
+
+function normalizeBlockText(raw?: string | null): string {
+  if (!raw) return "";
+  const repaired = sanitizeMathText(raw);
+  return repaired
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    // Only expand literal \t when NOT followed by an ASCII letter (protects \times, \theta, \to)
+    .replace(/\\t(?![A-Za-z])/g, "    ")
     .replace(/^\s*\n+/, "")
     .replace(/\n+\s*$/, "");
 }
@@ -943,7 +1046,8 @@ interface CumulativeBoardLayout {
 
 function resolveWhiteboardBlocks(
   steps: TeachingStep[],
-  currentStepIndex: number
+  currentStepIndex: number,
+  isTablet = false
 ): WhiteboardBlock[] {
   const safeSteps = Array.isArray(steps) ? steps : [];
   let blocks: WhiteboardBlock[] = [];
@@ -973,15 +1077,23 @@ function resolveWhiteboardBlocks(
 
       const rawSlot: WhiteboardSlot | undefined =
         action.slot ??
-        (action.type === "wb_table" || action.type === "wb_diagram"
+        (action.type === "wb_heading"
+          ? "header"
+          : action.type === "wb_table" ||
+            action.type === "wb_diagram" ||
+            action.type === "wb_plot" ||
+            action.type === "wb_text" ||
+            action.type === "wb_highlight"
           ? "main_top"
           : action.type === "wb_note"
           ? "bottom_summary"
           : undefined);
       if (!rawSlot) continue;
 
-      // Always promote wb_heading, wb_table, and wb_diagram to full contentWidth so
-      // headings, tables, and diagrams never crush inside narrow left_col / right_col columns
+      // Always promote wb_heading and wb_table to full contentWidth.
+      // On tablets (>= 600px), allow wb_diagram and wb_plot to sit cleanly inside
+      // left_col / right_col for 2D side-by-side spatial clusters (e.g. graph left, derivation right);
+      // on narrow phones, promote them to full width so nothing ever feels cramped.
       let targetSlot: WhiteboardSlot = rawSlot;
       if (
         action.type === "wb_heading" &&
@@ -989,7 +1101,13 @@ function resolveWhiteboardBlocks(
       ) {
         targetSlot = "header";
       } else if (
-        (action.type === "wb_table" || action.type === "wb_diagram") &&
+        action.type === "wb_table" &&
+        (rawSlot === "left_col" || rawSlot === "right_col")
+      ) {
+        targetSlot = bandSlots.has("main_top") ? "full_canvas" : "main_top";
+      } else if (
+        !isTablet &&
+        (action.type === "wb_diagram" || action.type === "wb_plot") &&
         (rawSlot === "left_col" || rawSlot === "right_col")
       ) {
         targetSlot = bandSlots.has("main_top") ? "full_canvas" : "main_top";
@@ -1615,6 +1733,347 @@ function computeDiagramMetrics(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic Coordinate Graph Plotter Metrics (wb_plot — Shared 1:1)
+// ---------------------------------------------------------------------------
+const PLOT_TITLE_HEIGHT = 28;
+const PLOT_LEGEND_HEIGHT = 24;
+
+/**
+ * Formats axis tick numbers cleanly: integers without ".0", decimals capped
+ * at 1 decimal place, and eliminates "-0" noise on narrow phone viewports.
+ */
+function formatTickNumber(val: number): string {
+  if (!Number.isFinite(val)) return "0";
+  const clean = Math.abs(val) < 1e-9 ? 0 : val;
+  if (Math.abs(clean - Math.round(clean)) < 1e-6) {
+    return String(Math.round(clean));
+  }
+  return Number(clean.toFixed(1)).toString();
+}
+
+interface ResolvedPlotCurve {
+  curve: PlotCurve;
+  strokeColor: string;
+  segments: PenTrailPoint[][];
+  label: string;
+}
+
+interface ResolvedPlotMarker {
+  marker: PlotMarker;
+  screenX: number;
+  screenY: number;
+  label: string;
+  badgeX: number;
+  badgeY: number;
+  badgeW: number;
+  badgeH: number;
+}
+
+interface PlotTickMark {
+  value: number;
+  label: string;
+  screenPos: number;
+}
+
+interface PlotLayoutMetrics {
+  title: string;
+  hasTitle: boolean;
+  canvasWidth: number;
+  canvasHeight: number;
+  plotRect: RectFrame;
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+  originX: number;
+  originY: number;
+  xLabel: string;
+  yLabel: string;
+  xTicks: PlotTickMark[];
+  yTicks: PlotTickMark[];
+  curves: ResolvedPlotCurve[];
+  markers: ResolvedPlotMarker[];
+  hasLegend: boolean;
+  totalSlotHeight: number;
+}
+
+function buildNiceTicks(minVal: number, maxVal: number, count = 4): number[] {
+  const span = maxVal - minVal;
+  if (!Number.isFinite(span) || span <= 1e-9) return [minVal];
+  const rawStep = span / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const norm = rawStep / mag;
+  const niceNorm = norm <= 1.2 ? 1 : norm <= 2.5 ? 2 : norm <= 5.5 ? 5 : 10;
+  const step = niceNorm * mag;
+  const first = Math.ceil((minVal - 1e-9) / step) * step;
+  const ticks: number[] = [];
+  for (let v = first; v <= maxVal + 1e-9 && ticks.length < 8; v += step) {
+    ticks.push(Math.abs(v) < 1e-9 ? 0 : v);
+  }
+  return ticks;
+}
+
+function evaluatePlotCurveSegments(
+  curve: PlotCurve,
+  xMin: number,
+  xMax: number,
+  yMin: number,
+  yMax: number,
+  plotRect: RectFrame
+): PenTrailPoint[][] {
+  const mapX = (xv: number) =>
+    plotRect.x + ((xv - xMin) / Math.max(1e-9, xMax - xMin)) * plotRect.width;
+  const mapY = (yv: number) =>
+    plotRect.y +
+    plotRect.height -
+    ((yv - yMin) / Math.max(1e-9, yMax - yMin)) * plotRect.height;
+
+  const p = Array.isArray(curve.params)
+    ? curve.params.filter((v) => Number.isFinite(v))
+    : [];
+  const ySpan = yMax - yMin;
+  const yLo = yMin - ySpan * 0.08;
+  const yHi = yMax + ySpan * 0.08;
+
+  if (curve.expr_type === "points") {
+    const pts: PenTrailPoint[] = [];
+    for (let i = 0; i + 1 < p.length; i += 2) {
+      const xv = p[i];
+      const yv = p[i + 1];
+      if (xv >= xMin - 1e-6 && xv <= xMax + 1e-6 && yv >= yLo && yv <= yHi) {
+        pts.push({
+          x: Math.max(plotRect.x, Math.min(plotRect.x + plotRect.width, mapX(xv))),
+          y: Math.max(plotRect.y, Math.min(plotRect.y + plotRect.height, mapY(yv))),
+        });
+      }
+    }
+    return pts.length >= 2 ? [pts] : [];
+  }
+
+  const samples = 48;
+  const segments: PenTrailPoint[][] = [];
+  let current: PenTrailPoint[] = [];
+
+  for (let i = 0; i <= samples; i++) {
+    const xv = xMin + (i / samples) * (xMax - xMin);
+    let yv = 0;
+    if (curve.expr_type === "linear") {
+      const m = p[0] ?? 1;
+      const b = p[1] ?? 0;
+      yv = m * xv + b;
+    } else if (curve.expr_type === "quadratic") {
+      const a = p[0] ?? 1;
+      const b = p[1] ?? 0;
+      const c = p[2] ?? 0;
+      yv = a * xv * xv + b * xv + c;
+    } else if (curve.expr_type === "exponential") {
+      const a = p[0] ?? 1;
+      const b = p[1] ?? 0.5;
+      const c = p[2] ?? 0;
+      const expArg = Math.max(-25, Math.min(25, b * xv));
+      yv = a * Math.exp(expArg) + c;
+    } else if (curve.expr_type === "sine") {
+      const amp = p[0] ?? 1;
+      const freq = p[1] ?? 1;
+      const phase = p[2] ?? 0;
+      const offset = p[3] ?? 0;
+      yv = amp * Math.sin(freq * xv + phase) + offset;
+    }
+
+    if (Number.isFinite(yv) && yv >= yLo && yv <= yHi) {
+      const clampedY = Math.max(yMin, Math.min(yMax, yv));
+      current.push({ x: mapX(xv), y: mapY(clampedY) });
+    } else if (current.length >= 2) {
+      segments.push(current);
+      current = [];
+    } else {
+      current = [];
+    }
+  }
+
+  if (current.length >= 2) {
+    segments.push(current);
+  }
+  return segments;
+}
+
+function computePlotMetrics(
+  action: VisualAction,
+  availableWidth: number
+): PlotLayoutMetrics {
+  const title = normalizeBlockText(action.text);
+  const hasTitle = title.length > 0;
+  const canvasWidth = Math.max(240, Math.floor(availableWidth));
+  const canvasHeight = Math.max(
+    210,
+    Math.min(290, Math.round(canvasWidth * 0.56))
+  );
+
+  // Generous internal margins so tick labels & axis names stay strictly inside bounds
+  const padLeft = 44;
+  const padRight = 24;
+  const padTop = 26;
+  const padBottom = 34;
+  const plotRect: RectFrame = {
+    x: padLeft,
+    y: padTop,
+    width: Math.max(120, canvasWidth - padLeft - padRight),
+    height: Math.max(110, canvasHeight - padTop - padBottom),
+  };
+
+  let xMin = -5;
+  let xMax = 5;
+  if (
+    Array.isArray(action.x_range) &&
+    action.x_range.length >= 2 &&
+    Number.isFinite(action.x_range[0]) &&
+    Number.isFinite(action.x_range[1]) &&
+    action.x_range[0] !== action.x_range[1]
+  ) {
+    xMin = Math.min(action.x_range[0], action.x_range[1]);
+    xMax = Math.max(action.x_range[0], action.x_range[1]);
+  }
+
+  let yMin = -5;
+  let yMax = 5;
+  if (
+    Array.isArray(action.y_range) &&
+    action.y_range.length >= 2 &&
+    Number.isFinite(action.y_range[0]) &&
+    Number.isFinite(action.y_range[1]) &&
+    action.y_range[0] !== action.y_range[1]
+  ) {
+    yMin = Math.min(action.y_range[0], action.y_range[1]);
+    yMax = Math.max(action.y_range[0], action.y_range[1]);
+  }
+
+  const mapX = (xv: number) =>
+    plotRect.x + ((xv - xMin) / Math.max(1e-9, xMax - xMin)) * plotRect.width;
+  const mapY = (yv: number) =>
+    plotRect.y +
+    plotRect.height -
+    ((yv - yMin) / Math.max(1e-9, yMax - yMin)) * plotRect.height;
+
+  const originX =
+    xMin <= 0 && xMax >= 0
+      ? mapX(0)
+      : xMin > 0
+      ? plotRect.x
+      : plotRect.x + plotRect.width;
+  const originY =
+    yMin <= 0 && yMax >= 0
+      ? mapY(0)
+      : yMin > 0
+      ? plotRect.y + plotRect.height
+      : plotRect.y;
+
+  const xTicks: PlotTickMark[] = buildNiceTicks(xMin, xMax, 4).map((val) => ({
+    value: val,
+    label: formatTickNumber(val),
+    screenPos: mapX(val),
+  }));
+  const yTicks: PlotTickMark[] = buildNiceTicks(yMin, yMax, 4).map((val) => ({
+    value: val,
+    label: formatTickNumber(val),
+    screenPos: mapY(val),
+  }));
+
+  const rawCurves = Array.isArray(action.curves) ? action.curves.slice(0, 4) : [];
+  const defaultCurveColors: VisualAction["color"][] = [
+    "blue",
+    "red",
+    "green",
+    "black",
+  ];
+  const curves: ResolvedPlotCurve[] = rawCurves.map((curve, idx) => {
+    const fallbackColor = defaultCurveColors[idx % defaultCurveColors.length];
+    const colorKey: VisualAction["color"] =
+      curve.color === "blue" ||
+      curve.color === "red" ||
+      curve.color === "green" ||
+      curve.color === "yellow" ||
+      curve.color === "black"
+        ? curve.color
+        : fallbackColor;
+    const token = getColorToken(colorKey);
+    return {
+      curve,
+      strokeColor: token.stroke,
+      segments: evaluatePlotCurveSegments(curve, xMin, xMax, yMin, yMax, plotRect),
+      label: normalizeBlockText(curve.label),
+    };
+  });
+
+  const rawMarkers = Array.isArray(action.markers)
+    ? action.markers.slice(0, 6)
+    : [];
+  const markers: ResolvedPlotMarker[] = rawMarkers
+    .filter((m) => m && Number.isFinite(m.x) && Number.isFinite(m.y))
+    .map((marker) => {
+      const sx = Math.max(
+        plotRect.x,
+        Math.min(plotRect.x + plotRect.width, mapX(marker.x))
+      );
+      const sy = Math.max(
+        plotRect.y,
+        Math.min(plotRect.y + plotRect.height, mapY(marker.y))
+      );
+      const cleanLabel = normalizeBlockText(marker.label);
+      const badgeW = Math.min(
+        Math.max(46, cleanLabel.length * 7.2 + 14),
+        Math.max(72, canvasWidth * 0.44)
+      );
+      const badgeH = 20;
+      // Strictly clamp marker badges inside the plot card bounds (Safeguard #2)
+      const desiredX = sx + 8 + badgeW <= canvasWidth - 6 ? sx + 8 : sx - badgeW - 8;
+      const badgeX = Math.max(6, Math.min(canvasWidth - badgeW - 6, desiredX));
+      const desiredY = sy - badgeH - 6 >= 6 ? sy - badgeH - 6 : sy + 8;
+      const badgeY = Math.max(6, Math.min(canvasHeight - badgeH - 6, desiredY));
+      return {
+        marker,
+        screenX: sx,
+        screenY: sy,
+        label: cleanLabel,
+        badgeX,
+        badgeY,
+        badgeW,
+        badgeH,
+      };
+    });
+
+  const xLabel = normalizeBlockText(action.x_label) || "x";
+  const yLabel = normalizeBlockText(action.y_label) || "y";
+  const hasLegend = curves.some((c) => c.label.length > 0);
+  const totalSlotHeight =
+    (hasTitle ? PLOT_TITLE_HEIGHT : 0) +
+    canvasHeight +
+    (hasLegend ? PLOT_LEGEND_HEIGHT : 0) +
+    8;
+
+  return {
+    title,
+    hasTitle,
+    canvasWidth,
+    canvasHeight,
+    plotRect,
+    xMin,
+    xMax,
+    yMin,
+    yMax,
+    originX,
+    originY,
+    xLabel,
+    yLabel,
+    xTicks,
+    yTicks,
+    curves,
+    markers,
+    hasLegend,
+    totalSlotHeight,
+  };
+}
+
 function estimateSlotHeight(
   items: ResolvedAction[] | undefined,
   slotWidth: number,
@@ -1622,6 +2081,10 @@ function estimateSlotHeight(
 ): number {
   if (!items || items.length === 0 || slotWidth <= 0) return 0;
   const primary = items[0].action;
+
+  if (primary.type === "wb_plot") {
+    return computePlotMetrics(primary, slotWidth).totalSlotHeight;
+  }
 
   if (primary.type === "wb_diagram") {
     return computeDiagramMetrics(primary, slotWidth).totalSlotHeight;
@@ -1647,16 +2110,16 @@ function estimateSlotHeight(
     const iconReserve = primary.icon ? 44 : 0;
     const charsPerLine = Math.max(
       10,
-      Math.floor((slotWidth - 32 - iconReserve) / (10.2 * HANDWRITTEN_WIDTH_FACTOR))
+      Math.floor((slotWidth - 28 - iconReserve) / (10.2 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Generous vertical padding + +8px safe buffer above the rough Skia underline
-    return Math.max(80, 56 + lines * 28);
+    // Boxless open-paper heading + measured rough underline canvas (16px)
+    return Math.max(66, 38 + lines * 27);
   }
 
   if (primary.type === "wb_code") {
     const rawCode = primary.code || primary.text || "";
-    const clean = normalizeBlockText(rawCode);
+    const clean = normalizeCodeText(rawCode);
     const gutterAndPad = isCompactColumn ? 34 : 50;
     const codeInnerW = Math.max(108, slotWidth - gutterAndPad);
     const charWidth = isCompactColumn ? 6.8 : 7.4;
@@ -1666,14 +2129,24 @@ function estimateSlotHeight(
     return Math.max(132, 32 + 42 + wrappedLines * rowHeight);
   }
 
-  if (primary.type === "wb_equation") {
+  if (primary.type === "wb_equation" || primary.type === "wb_highlight") {
     const clean = normalizeBlockText(primary.text);
     const charsPerLine = Math.max(
       10,
       Math.floor((slotWidth - 28) / (9.5 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(96, 60 + lines * 27);
+    return Math.max(66, 34 + lines * 27);
+  }
+
+  if (primary.type === "wb_text") {
+    const clean = normalizeBlockText(primary.text);
+    const charsPerLine = Math.max(
+      10,
+      Math.floor((slotWidth - 24) / (8.4 * HANDWRITTEN_WIDTH_FACTOR))
+    );
+    const lines = estimateWrappedLines(clean, charsPerLine);
+    return Math.max(54, 24 + lines * 24);
   }
 
   if (primary.type === "wb_flow_card") {
@@ -1684,21 +2157,21 @@ function estimateSlotHeight(
       Math.floor((slotWidth - 28 - iconReserve) / (8.5 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    return Math.max(118, 68 + lines * 25);
+    return Math.max(114, 64 + lines * 25);
   }
 
-  // Stacked wb_bullet items calibrated for ~1.12x handwritten glyph widths + +8px safe bottom buffer
+  // Boxless stacked wb_bullet items directly on open paper
   const bulletCharsPerLine = Math.max(
     10,
-    Math.floor((slotWidth - 46) / (8.5 * HANDWRITTEN_WIDTH_FACTOR))
+    Math.floor((slotWidth - 36) / (8.5 * HANDWRITTEN_WIDTH_FACTOR))
   );
-  let totalH = 60;
+  let totalH = 26;
   for (const item of items) {
     const clean = normalizeBlockText(item.action.text);
     const lines = estimateWrappedLines(clean, bulletCharsPerLine);
-    totalH += lines * 24 + 12;
+    totalH += lines * 24 + 10;
   }
-  return Math.max(118, totalH);
+  return Math.max(64, totalH);
 }
 
 function computeCumulativeWhiteboardLayout(
@@ -1709,16 +2182,17 @@ function computeCumulativeWhiteboardLayout(
   bottomInset: number,
   isTablet: boolean
 ): CumulativeBoardLayout {
-  const rowGap = isTablet ? 20 : 18;
-  const bandGap = isTablet ? 28 : 24;
-  const colGap = isTablet ? 32 : 28; // Clean channel for horizontal connector arrows
+  const rowGap = isTablet ? 20 : 16;
+  const bandGap = isTablet ? 26 : 22;
+  const colGap = isTablet ? 32 : 24;
 
   const boardWidth = Math.max(viewportW, 340);
   const innerW = Math.max(0, boardWidth - 32);
-  // Constrain active whiteboard content to 860px on tablets while keeping full-bleed paper grid
-  const contentWidth = Math.min(innerW, 860);
+  // Wide 2D spatial canvas on tablets (up to 980px for graph + derivation side-by-side)
+  const contentWidth = Math.min(innerW, isTablet ? 980 : 860);
   const padX = Math.max(16, (boardWidth - contentWidth) / 2);
   const halfW = Math.max(0, (contentWidth - colGap) / 2);
+  const effectiveBottomInset = Math.max(140, bottomInset);
 
   const blockRects = new Map<string, RectFrame>();
   const bandsMap = new Map<number, Map<WhiteboardSlot, WhiteboardBlock>>();
@@ -1820,7 +2294,7 @@ function computeCumulativeWhiteboardLayout(
     }
   }
 
-  const boardHeight = Math.max(viewportH, cursorY + bottomInset + 36);
+  const boardHeight = Math.max(viewportH, cursorY + effectiveBottomInset + 36);
   return { blockRects, boardWidth, boardHeight };
 }
 
@@ -1943,6 +2417,87 @@ const AnimatedCircleAnnotation: React.FC<{
   }
 );
 
+// ---------------------------------------------------------------------------
+// 60fps Worklet-Safe Live Moving Pen-Nib Indicator (Pre-Sampled Trail Points)
+// ---------------------------------------------------------------------------
+const AnimatedPenNib: React.FC<{
+  trail: ReadonlyArray<PenTrailPoint>;
+  progress: SharedValue<number>;
+  active: boolean;
+  color?: string;
+}> = React.memo(({ trail, progress, active, color = "#2563EB" }) => {
+  const tipX = useDerivedValue(() => {
+    const n = trail.length;
+    if (!active || n === 0) return -100;
+    if (n === 1) return trail[0].x;
+    const p = Math.max(0, Math.min(1, progress.value));
+    const idxFloat = p * (n - 1);
+    const i0 = Math.floor(idxFloat);
+    const i1 = Math.min(n - 1, i0 + 1);
+    const frac = idxFloat - i0;
+    return trail[i0].x + (trail[i1].x - trail[i0].x) * frac;
+  }, [trail, active]);
+
+  const tipY = useDerivedValue(() => {
+    const n = trail.length;
+    if (!active || n === 0) return -100;
+    if (n === 1) return trail[0].y;
+    const p = Math.max(0, Math.min(1, progress.value));
+    const idxFloat = p * (n - 1);
+    const i0 = Math.floor(idxFloat);
+    const i1 = Math.min(n - 1, i0 + 1);
+    const frac = idxFloat - i0;
+    return trail[i0].y + (trail[i1].y - trail[i0].y) * frac;
+  }, [trail, active]);
+
+  const nibOpacity = useDerivedValue(() => {
+    if (!active || trail.length < 2) return 0;
+    const p = progress.value;
+    if (p <= 0.015 || p >= 0.985) return 0;
+    const fadeIn = Math.min(1, (p - 0.015) / 0.06);
+    const fadeOut = Math.min(1, (0.985 - p) / 0.07);
+    return Math.max(0, Math.min(1, Math.min(fadeIn, fadeOut)));
+  }, [trail, active]);
+
+  const nibTransform = useDerivedValue(() => [
+    { translateX: tipX.value },
+    { translateY: tipY.value },
+  ]);
+
+  if (!active || trail.length < 2) {
+    return null;
+  }
+
+  return (
+    <Group transform={nibTransform} opacity={nibOpacity}>
+      {/* Soft luminous indigo/blue aura under the live pen tip */}
+      <Circle cx={0} cy={0} r={11} color="rgba(59, 130, 246, 0.24)" />
+      {/* Slanted stylus barrel rising up-right from the nib */}
+      <Group transform={[{ rotate: -0.78 }]}>
+        <RoundedRect
+          x={2}
+          y={-3}
+          width={14}
+          height={6}
+          r={3}
+          color="#1E293B"
+        />
+        <RoundedRect
+          x={5}
+          y={-2}
+          width={8}
+          height={2}
+          r={1}
+          color="rgba(255, 255, 255, 0.45)"
+        />
+      </Group>
+      {/* Crisp active ink nib point */}
+      <Circle cx={0} cy={0} r={3.6} color={color} />
+      <Circle cx={0} cy={0} r={1.6} color="#FFFFFF" />
+    </Group>
+  );
+});
+
 const AnimatedCardFrame: React.FC<{
   x: number;
   y: number;
@@ -1975,12 +2530,12 @@ const AnimatedCardFrame: React.FC<{
     animate,
     borderProgress,
   }) => {
-    const borderPath = useMemo(() => {
+    const borderWithTrail = useMemo(() => {
       const rect = { x, y, width, height };
       if (isCode) {
-        return buildRoundedRectStrokePath(rect, radius);
+        return { path: buildRoundedRectStrokePath(rect, radius), trail: [] as PenTrailPoint[] };
       }
-      return createRoughRectPath(rect, radius, seed, isNote ? 0.85 : 1);
+      return createRoughRectWithTrail(rect, radius, seed, isNote ? 0.85 : 1);
     }, [x, y, width, height, radius, seed, isCode, isNote]);
 
     const underlinePath = useMemo(() => {
@@ -2032,7 +2587,7 @@ const AnimatedCardFrame: React.FC<{
           opacity={fillOpacity}
         />
         <Path
-          path={borderPath}
+          path={borderWithTrail.path}
           style="stroke"
           strokeWidth={isNote ? 1.2 : strokeWidth}
           strokeCap="round"
@@ -2064,6 +2619,14 @@ const AnimatedCardFrame: React.FC<{
             color={strokeColor}
             start={0}
             end={animate ? borderProgress : 1}
+          />
+        )}
+        {animate && !isCode && borderWithTrail.trail.length >= 2 && (
+          <AnimatedPenNib
+            trail={borderWithTrail.trail}
+            progress={borderProgress}
+            active={animate}
+            color={strokeColor}
           />
         )}
       </>
@@ -2409,6 +2972,7 @@ const AnimatedDiagramNodeShape: React.FC<{
   width: number;
   height: number;
   kind: "container" | "box" | "pill" | "decision";
+  stencil?: DiagramStencil | null;
   seed: number;
   fillColor: string;
   strokeColor: string;
@@ -2422,6 +2986,7 @@ const AnimatedDiagramNodeShape: React.FC<{
     width,
     height,
     kind,
+    stencil,
     seed,
     fillColor,
     strokeColor,
@@ -2440,6 +3005,11 @@ const AnimatedDiagramNodeShape: React.FC<{
       const radius = kind === "pill" ? Math.min(height / 2, 24) : 12;
       return createRoughRectPath(rect, radius, seed, 0.92);
     }, [x, y, width, height, kind, seed]);
+
+    const stencilPaths = useMemo(() => {
+      if (!stencil) return null;
+      return createDiagramStencilPaths(stencil, { x, y, width, height }, seed);
+    }, [stencil, x, y, width, height, seed]);
 
     const diamondFillPath = useMemo(
       () =>
@@ -2478,8 +3048,47 @@ const AnimatedDiagramNodeShape: React.FC<{
       instantComplete ? 1 : Math.min(1, strokeProgress.value * 1.25)
     );
 
+    // Multi-layer stencil choreography: outline traces first, then pastel fill fades in
+    const stencilFillOpacity = useDerivedValue(() => {
+      if (instantComplete) return 0.9;
+      const p = strokeProgress.value;
+      if (p <= 0.35) return 0;
+      return Math.min(0.9, ((p - 0.35) / 0.65) * 0.9);
+    });
+
     const radius =
       kind === "container" ? 14 : kind === "pill" ? Math.min(height / 2, 24) : 12;
+
+    if (stencilPaths) {
+      return (
+        <>
+          <Path
+            path={stencilPaths.fillPath}
+            style="fill"
+            color={fillColor}
+            opacity={stencilFillOpacity}
+          />
+          <Path
+            path={stencilPaths.outlinePath}
+            style="stroke"
+            strokeWidth={2}
+            strokeCap="round"
+            strokeJoin="round"
+            color={strokeColor}
+            start={0}
+            end={instantComplete ? 1 : strokeProgress}
+          />
+          {!instantComplete && triggered && stencilPaths.trail.length >= 2 && (
+            <AnimatedPenNib
+              trail={stencilPaths.trail}
+              progress={strokeProgress}
+              active={triggered && !instantComplete}
+              color={strokeColor}
+            />
+          )}
+        </>
+      );
+    }
 
     return (
       <>
@@ -2763,7 +3372,7 @@ const DiagramBlockView: React.FC<{
           );
         })}
 
-        {/* 2. Inner box / pill / decision nodes (double-stroke rough borders) */}
+        {/* 2. Inner box / pill / decision / multi-layer stencil nodes */}
         {metrics.innerNodes.map(({ node, rect }) => {
           const tint = getDiagramTintToken(node.tint, action.color);
           const triggered = nodeTriggeredMap.get(node.id) ?? true;
@@ -2777,6 +3386,7 @@ const DiagramBlockView: React.FC<{
               width={rect.width}
               height={rect.height}
               kind={kind}
+              stencil={node.stencil}
               seed={hashSeed(`diag-${blockId}-${node.id}`)}
               fillColor={tint.fill}
               strokeColor={tint.stroke}
@@ -3317,6 +3927,722 @@ const TableBlockView: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
+// Stage 15: Live Pen-Nib PlotBlockView (wb_plot), Boxless HeadingBlockView &
+// Yellow Highlighter Sweep Block (wb_equation / wb_highlight / wb_text)
+// ---------------------------------------------------------------------------
+const PlotBlockView: React.FC<{
+  blockId: string;
+  action: VisualAction;
+  slotWidth: number;
+  isCurrentStep: boolean;
+  isStaticComplete: boolean;
+  stepResetKey: string;
+  stepProgress: number;
+  handwrittenFontsReady: boolean;
+}> = React.memo(
+  ({
+    blockId,
+    action,
+    slotWidth,
+    isCurrentStep,
+    isStaticComplete,
+    stepResetKey,
+    stepProgress,
+    handwrittenFontsReady,
+  }) => {
+    const metrics = useMemo(
+      () => computePlotMetrics(action, slotWidth),
+      [action, slotWidth]
+    );
+    const token = getColorToken(action.color);
+    const clampedStep = clamp01(stepProgress);
+    const plotInstant = !isCurrentStep || isStaticComplete || clampedStep >= 0.995;
+
+    const axesProgress = useSharedValue(plotInstant ? 1 : 0);
+    const curveProgress = useSharedValue(plotInstant ? 1 : 0);
+
+    useEffect(() => {
+      if (plotInstant) {
+        axesProgress.value = 1;
+        curveProgress.value = 1;
+        return;
+      }
+      axesProgress.value = 0;
+      curveProgress.value = 0;
+      axesProgress.value = withTiming(1, {
+        duration: 420,
+        easing: Easing.out(Easing.cubic),
+      });
+      curveProgress.value = withDelay(
+        390,
+        withTiming(1, {
+          duration: 640,
+          easing: Easing.out(Easing.cubic),
+        })
+      );
+    }, [stepResetKey, plotInstant, axesProgress, curveProgress]);
+
+    const axesWithTrail = useMemo(
+      () =>
+        createPlotAxesWithTrail(
+          metrics.plotRect,
+          metrics.originX,
+          metrics.originY,
+          metrics.xTicks.map((t) => t.screenPos),
+          metrics.yTicks.map((t) => t.screenPos),
+          hashSeed(`plot-axes-${blockId}`)
+        ),
+      [
+        metrics.plotRect,
+        metrics.originX,
+        metrics.originY,
+        metrics.xTicks,
+        metrics.yTicks,
+        blockId,
+      ]
+    );
+
+    const curveDraws = useMemo(
+      () =>
+        metrics.curves.map((c, idx) => ({
+          ...c,
+          draw: createPlotCurveWithTrail(
+            c.segments,
+            hashSeed(`plot-curve-${blockId}-${idx}`),
+            0.7
+          ),
+        })),
+      [metrics.curves, blockId]
+    );
+
+    const plotFramePath = useMemo(
+      () =>
+        createRoughRectPath(
+          {
+            x: 3,
+            y: 3,
+            width: Math.max(20, metrics.canvasWidth - 6),
+            height: Math.max(20, metrics.canvasHeight - 6),
+          },
+          14,
+          hashSeed(`plot-frame-${blockId}`),
+          0.72
+        ),
+      [metrics.canvasWidth, metrics.canvasHeight, blockId]
+    );
+
+    const dashedDropPaths = useMemo(() => {
+      return metrics.markers.map((m) =>
+        makePathFromBuilder((b) => {
+          const steps = 6;
+          // Vertical dashed guide to X-axis
+          const dy = metrics.originY - m.screenY;
+          for (let i = 0; i < steps; i += 2) {
+            b.moveTo(m.screenX, m.screenY + (dy * i) / steps);
+            b.lineTo(
+              m.screenX,
+              m.screenY + (dy * Math.min(steps, i + 1)) / steps
+            );
+          }
+          // Horizontal dashed guide to Y-axis
+          const dx = metrics.originX - m.screenX;
+          for (let i = 0; i < steps; i += 2) {
+            b.moveTo(m.screenX + (dx * i) / steps, m.screenY);
+            b.lineTo(
+              m.screenX + (dx * Math.min(steps, i + 1)) / steps,
+              m.screenY
+            );
+          }
+        })
+      );
+    }, [metrics.markers, metrics.originX, metrics.originY]);
+
+    const markerOpacity = useDerivedValue(() => {
+      if (plotInstant) return 1;
+      return Math.max(0, Math.min(1, (curveProgress.value - 0.55) / 0.45));
+    });
+
+    const primaryCurve = curveDraws[0];
+    const titleRtl = isArabicDominant(metrics.title);
+
+    // Clamp axis labels strictly inside the plot card bounds (Safeguard #2)
+    const yLabelMaxW = Math.min(110, metrics.canvasWidth * 0.42);
+    const yLabelLeft = Math.max(
+      6,
+      Math.min(metrics.canvasWidth - yLabelMaxW - 6, metrics.originX - 18)
+    );
+    const xLabelMaxW = Math.min(110, metrics.canvasWidth * 0.42);
+    const xLabelLeft = Math.max(
+      6,
+      Math.min(
+        metrics.canvasWidth - xLabelMaxW - 6,
+        metrics.plotRect.x + metrics.plotRect.width - xLabelMaxW
+      )
+    );
+    const xLabelTop = Math.max(
+      6,
+      Math.min(metrics.canvasHeight - 18, metrics.originY + 14)
+    );
+
+    return (
+      <View style={styles.plotBlockRoot}>
+        {metrics.hasTitle && (
+          <View style={styles.plotTitleWrap}>
+            <Text
+              numberOfLines={1}
+              style={[
+                styles.plotTitleText,
+                getHandwrittenFontStyle(
+                  metrics.title,
+                  "heading",
+                  handwrittenFontsReady
+                ),
+                titleRtl && styles.rtlTextAlign,
+                { color: token.text },
+              ]}
+            >
+              {metrics.title}
+            </Text>
+          </View>
+        )}
+
+        <View
+          style={{
+            width: metrics.canvasWidth,
+            height: metrics.canvasHeight,
+          }}
+        >
+          {/* Skia Layer: Paper Card + Axes + Curves + Markers + Live Pen Nib */}
+          <Canvas
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              width: metrics.canvasWidth,
+              height: metrics.canvasHeight,
+            }}
+            pointerEvents="none"
+          >
+            <RoundedRect
+              x={3}
+              y={3}
+              width={Math.max(20, metrics.canvasWidth - 6)}
+              height={Math.max(20, metrics.canvasHeight - 6)}
+              r={14}
+              color="rgba(255, 255, 255, 0.88)"
+            />
+            <Path
+              path={plotFramePath}
+              style="stroke"
+              strokeWidth={1.35}
+              strokeCap="round"
+              strokeJoin="round"
+              color="rgba(148, 163, 184, 0.55)"
+            />
+
+            {/* Coordinate axes + arrowheads + ticks */}
+            <Path
+              path={axesWithTrail.path}
+              style="stroke"
+              strokeWidth={1.9}
+              strokeCap="round"
+              strokeJoin="round"
+              color="#334155"
+              start={0}
+              end={plotInstant ? 1 : axesProgress}
+            />
+            {!plotInstant && axesWithTrail.trail.length >= 2 && (
+              <AnimatedPenNib
+                trail={axesWithTrail.trail}
+                progress={axesProgress}
+                active={!plotInstant}
+                color="#334155"
+              />
+            )}
+
+            {/* Plotted curves */}
+            {curveDraws.map((c, idx) => (
+              <Path
+                key={`pcurve-${idx}`}
+                path={c.draw.path}
+                style="stroke"
+                strokeWidth={2.8}
+                strokeCap="round"
+                strokeJoin="round"
+                color={c.strokeColor}
+                start={0}
+                end={plotInstant ? 1 : curveProgress}
+              />
+            ))}
+            {!plotInstant &&
+              primaryCurve &&
+              primaryCurve.draw.trail.length >= 2 && (
+                <AnimatedPenNib
+                  trail={primaryCurve.draw.trail}
+                  progress={curveProgress}
+                  active={!plotInstant}
+                  color={primaryCurve.strokeColor}
+                />
+              )}
+
+            {/* Dashed drop-lines & marker points */}
+            {metrics.markers.map((m, idx) => (
+              <Group key={`pmark-${idx}`} opacity={markerOpacity}>
+                <Path
+                  path={dashedDropPaths[idx]}
+                  style="stroke"
+                  strokeWidth={1.2}
+                  color="rgba(100, 116, 139, 0.6)"
+                />
+                <Circle
+                  cx={m.screenX}
+                  cy={m.screenY}
+                  r={5}
+                  color="#DC2626"
+                />
+                <Circle
+                  cx={m.screenX}
+                  cy={m.screenY}
+                  r={2.2}
+                  color="#FFFFFF"
+                />
+              </Group>
+            ))}
+          </Canvas>
+
+          {/* Clamped RN Labels: Y-axis label, X-axis label, Tick numbers, Marker badges */}
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.plotAxisLabel,
+              {
+                left: yLabelLeft,
+                top: 6,
+                maxWidth: yLabelMaxW,
+              },
+            ]}
+          >
+            {metrics.yLabel}
+          </Text>
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.plotAxisLabel,
+              {
+                left: xLabelLeft,
+                top: xLabelTop,
+                maxWidth: xLabelMaxW,
+                textAlign: "right",
+              },
+            ]}
+          >
+            {metrics.xLabel}
+          </Text>
+
+          {/* X Tick Numbers (clamped strictly inside canvas) */}
+          {metrics.xTicks.map((tick, tIdx) => {
+            if (Math.abs(tick.screenPos - metrics.originX) < 10) return null;
+            const left = Math.max(
+              6,
+              Math.min(metrics.canvasWidth - 36, tick.screenPos - 15)
+            );
+            const top = Math.max(
+              6,
+              Math.min(metrics.canvasHeight - 16, metrics.originY + 5)
+            );
+            return (
+              <Text
+                key={`xt-${tIdx}`}
+                numberOfLines={1}
+                style={[styles.plotTickText, { left, top, width: 30 }]}
+              >
+                {tick.label}
+              </Text>
+            );
+          })}
+
+          {/* Y Tick Numbers (clamped strictly inside canvas) */}
+          {metrics.yTicks.map((tick, tIdx) => {
+            if (Math.abs(tick.screenPos - metrics.originY) < 10) return null;
+            const left = Math.max(4, Math.min(metrics.originX - 34, metrics.canvasWidth - 36));
+            const top = Math.max(
+              6,
+              Math.min(metrics.canvasHeight - 16, tick.screenPos - 7)
+            );
+            return (
+              <Text
+                key={`yt-${tIdx}`}
+                numberOfLines={1}
+                style={[
+                  styles.plotTickText,
+                  { left, top, width: 28, textAlign: "right" },
+                ]}
+              >
+                {tick.label}
+              </Text>
+            );
+          })}
+
+          {/* Clamped Marker Badges */}
+          {metrics.markers.map((m, idx) =>
+            m.label ? (
+              <View
+                key={`pmbadge-${idx}`}
+                style={[
+                  styles.plotMarkerBadge,
+                  {
+                    left: m.badgeX,
+                    top: m.badgeY,
+                    maxWidth: m.badgeW + 8,
+                  },
+                ]}
+              >
+                <Text numberOfLines={1} style={styles.plotMarkerBadgeText}>
+                  {m.label}
+                </Text>
+              </View>
+            ) : null
+          )}
+        </View>
+
+        {/* Compact Legend Row */}
+        {metrics.hasLegend && (
+          <View style={styles.plotLegendRow}>
+            {metrics.curves.map((c, idx) =>
+              c.label ? (
+                <View key={`pleg-${idx}`} style={styles.plotLegendItem}>
+                  <View
+                    style={[
+                      styles.plotLegendSwatch,
+                      { backgroundColor: c.strokeColor },
+                    ]}
+                  />
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.plotLegendText,
+                      { color: c.strokeColor },
+                    ]}
+                  >
+                    {c.label}
+                  </Text>
+                </View>
+              ) : null
+            )}
+          </View>
+        )}
+      </View>
+    );
+  }
+);
+
+/**
+ * Boxless open-paper heading with measured-width rough underline + live Pen-Nib (Safeguard #1).
+ */
+const HeadingBlockView: React.FC<{
+  blockId: string;
+  text: string;
+  color: VisualAction["color"];
+  hasIcon: boolean;
+  slotWidth: number;
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+  handwrittenFontsReady: boolean;
+}> = React.memo(
+  ({
+    blockId,
+    text,
+    color,
+    hasIcon,
+    slotWidth,
+    triggered,
+    instantComplete,
+    resetKey,
+    handwrittenFontsReady,
+  }) => {
+    const [measuredTextW, setMeasuredTextW] = useState(0);
+    const rtl = isArabicDominant(text);
+    const token = getColorToken(color);
+    const underlineColor =
+      color === "green"
+        ? "#0D9488"
+        : color === "red"
+        ? "#DC2626"
+        : "#2563EB";
+
+    const maxUnderlineW = Math.max(80, slotWidth - (hasIcon ? 52 : 24));
+    const fallbackW = Math.min(maxUnderlineW, Math.max(76, text.length * 10.5));
+    const underlineCanvasW = Math.min(
+      maxUnderlineW,
+      Math.max(68, (measuredTextW > 0 ? measuredTextW : fallbackW) + 18)
+    );
+
+    const underlineWithTrail = useMemo(
+      () =>
+        createRoughUnderlineWithTrail(
+          4,
+          Math.max(18, underlineCanvasW - 4),
+          6,
+          hashSeed(`hd-ul-${blockId}`),
+          0.95
+        ),
+      [blockId, underlineCanvasW]
+    );
+
+    const ulProgress = useSharedValue(instantComplete ? 1 : 0);
+    useEffect(() => {
+      if (instantComplete) {
+        ulProgress.value = 1;
+        return;
+      }
+      if (triggered) {
+        ulProgress.value = 0;
+        ulProgress.value = withDelay(
+          110,
+          withTiming(1, {
+            duration: 380,
+            easing: Easing.out(Easing.cubic),
+          })
+        );
+      } else {
+        ulProgress.value = 0;
+      }
+    }, [resetKey, triggered, instantComplete, ulProgress]);
+
+    return (
+      <View
+        style={[
+          styles.headingBox,
+          rtl ? styles.headingBoxRtl : styles.headingBoxLtr,
+          hasIcon && styles.headingBoxWithIcon,
+        ]}
+      >
+        <InkSweepReveal
+          triggered={triggered}
+          instantComplete={instantComplete}
+          isRtl={rtl}
+          resetKey={resetKey}
+          durationMs={INK_SWEEP_HEADING_MS}
+        >
+          <View
+            style={[
+              styles.headingTextWrap,
+              rtl ? styles.alignEnd : styles.alignStart,
+            ]}
+          >
+            <Text
+              onLayout={(e) => {
+                const w = Math.ceil(e.nativeEvent.layout.width);
+                if (w > 0 && Math.abs(w - measuredTextW) > 2) {
+                  setMeasuredTextW(w);
+                }
+              }}
+              style={[
+                styles.headingText,
+                getHandwrittenFontStyle(text, "heading", handwrittenFontsReady),
+                rtl ? styles.rtlTextAlign : styles.ltrTextAlign,
+                { color: token.text },
+              ]}
+            >
+              {text}
+            </Text>
+          </View>
+        </InkSweepReveal>
+
+        <Canvas
+          style={{
+            width: underlineCanvasW,
+            height: 15,
+            marginTop: 2,
+          }}
+          pointerEvents="none"
+        >
+          <Path
+            path={underlineWithTrail.path}
+            style="stroke"
+            strokeWidth={2.6}
+            strokeCap="round"
+            strokeJoin="round"
+            color={underlineColor}
+            start={0}
+            end={instantComplete ? 1 : ulProgress}
+          />
+          {!instantComplete && triggered && underlineWithTrail.trail.length >= 2 && (
+            <AnimatedPenNib
+              trail={underlineWithTrail.trail}
+              progress={ulProgress}
+              active={triggered && !instantComplete}
+              color={underlineColor}
+            />
+          )}
+        </Canvas>
+      </View>
+    );
+  }
+);
+
+/**
+ * Boxless open-paper equation / highlight / prose block with optional animated
+ * yellow highlighter sweep left-to-right behind the ink (Safeguard #1: equations stay LTR).
+ */
+const HighlightedTextBlockView: React.FC<{
+  blockId: string;
+  text: string;
+  color: VisualAction["color"];
+  variant: "equation" | "highlight" | "text";
+  forceLtr?: boolean;
+  highlightEnabled: boolean;
+  slotWidth: number;
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+  handwrittenFontsReady: boolean;
+}> = React.memo(
+  ({
+    blockId,
+    text,
+    color,
+    variant,
+    forceLtr = false,
+    highlightEnabled,
+    slotWidth,
+    triggered,
+    instantComplete,
+    resetKey,
+    handwrittenFontsReady,
+  }) => {
+    const [boxSize, setBoxSize] = useState({ width: 0, height: 0 });
+    const token = getColorToken(color);
+    const lines = text ? text.split("\n") : [""];
+
+    const hlW = Math.min(
+      Math.max(96, slotWidth - 16),
+      boxSize.width > 12 ? boxSize.width + 16 : Math.max(120, slotWidth * 0.72)
+    );
+    const hlH = Math.max(28, boxSize.height > 12 ? boxSize.height + 6 : 34);
+
+    const hlWithTrail = useMemo(() => {
+      if (!highlightEnabled) {
+        return { path: makeEmptySkiaPath(), trail: [] as PenTrailPoint[] };
+      }
+      return createRoughHighlighterPath(
+        { x: 4, y: 2, width: Math.max(24, hlW - 8), height: hlH - 4 },
+        hashSeed(`hl-${blockId}`)
+      );
+    }, [highlightEnabled, blockId, hlW, hlH]);
+
+    const hlProgress = useSharedValue(instantComplete ? 1 : 0);
+    useEffect(() => {
+      if (!highlightEnabled) {
+        hlProgress.value = 0;
+        return;
+      }
+      if (instantComplete) {
+        hlProgress.value = 1;
+        return;
+      }
+      if (triggered) {
+        hlProgress.value = 0;
+        hlProgress.value = withDelay(
+          260,
+          withTiming(1, {
+            duration: 420,
+            easing: Easing.out(Easing.cubic),
+          })
+        );
+      } else {
+        hlProgress.value = 0;
+      }
+    }, [highlightEnabled, resetKey, triggered, instantComplete, hlProgress]);
+
+    const isEquation = variant === "equation";
+    const isProse = variant === "text";
+
+    return (
+      <View
+        style={[
+          styles.openPaperBlock,
+          isEquation ? styles.equationBox : styles.proseBox,
+        ]}
+      >
+        <View
+          style={[
+            styles.highlightWrap,
+            isEquation && styles.highlightWrapCenter,
+          ]}
+          onLayout={(e) => {
+            const { width, height } = e.nativeEvent.layout;
+            if (
+              Math.abs(width - boxSize.width) > 3 ||
+              Math.abs(height - boxSize.height) > 3
+            ) {
+              setBoxSize({ width, height });
+            }
+          }}
+        >
+          {highlightEnabled && (
+            <Canvas
+              style={[
+                styles.highlighterCanvas,
+                { width: hlW, height: hlH },
+              ]}
+              pointerEvents="none"
+            >
+              <Path
+                path={hlWithTrail.path}
+                style="stroke"
+                strokeWidth={Math.min(30, Math.max(20, hlH * 0.62))}
+                strokeCap="round"
+                strokeJoin="round"
+                color="rgba(250, 204, 21, 0.42)"
+                start={0}
+                end={instantComplete ? 1 : hlProgress}
+              />
+            </Canvas>
+          )}
+
+          {lines.map((line, lIdx) => {
+            const rtl = forceLtr ? false : isArabicDominant(line);
+            const role = isEquation ? "equation" : isProse ? "bullet" : "flowCard";
+            return (
+              <InkSweepReveal
+                key={`ht-${lIdx}`}
+                triggered={triggered}
+                instantComplete={instantComplete}
+                isRtl={rtl}
+                resetKey={`${resetKey}-l${lIdx}`}
+                durationMs={INK_SWEEP_CARD_MS}
+                delayMs={lIdx * 90}
+              >
+                <Text
+                  style={[
+                    isEquation
+                      ? styles.equationText
+                      : isProse
+                      ? styles.openText
+                      : styles.highlightKeyText,
+                    getHandwrittenFontStyle(line, role, handwrittenFontsReady),
+                    forceLtr
+                      ? styles.equationLtrText
+                      : rtl
+                      ? styles.rtlTextAlign
+                      : styles.ltrTextAlign,
+                    { color: token.text },
+                  ]}
+                >
+                  {line}
+                </Text>
+              </InkSweepReveal>
+            );
+          })}
+        </View>
+      </View>
+    );
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Progressive RN Typewriter & Live Syntax-Highlighted Code Block
 // ---------------------------------------------------------------------------
 const CodeBlockView: React.FC<{
@@ -3326,7 +4652,7 @@ const CodeBlockView: React.FC<{
   isCompact: boolean;
 }> = ({ action, revealRatio, showCursor, isCompact }) => {
   const rawCode = action.code || action.text || "";
-  const normalized = normalizeBlockText(rawCode);
+  const normalized = normalizeCodeText(rawCode);
   const fullLines = normalized ? normalized.split("\n") : ["# (no code provided)"];
   const highlighted = new Set(action.highlight_lines ?? []);
   const token = getColorToken(action.color);
@@ -3549,6 +4875,21 @@ const SlotContentView: React.FC<{
       ? syncedTimeMs >= primaryWordTriggerMs
       : clampedStep >= 0.02);
 
+  if (primary.type === "wb_plot") {
+    return (
+      <PlotBlockView
+        blockId={blockId}
+        action={primary}
+        slotWidth={slotWidth}
+        isCurrentStep={primaryItem.isCurrentStep}
+        isStaticComplete={isStaticComplete}
+        stepResetKey={stepResetKey}
+        stepProgress={stepProgress}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
+    );
+  }
+
   if (primary.type === "wb_diagram") {
     return (
       <DiagramBlockView
@@ -3643,75 +4984,72 @@ const SlotContentView: React.FC<{
   }
 
   if (primary.type === "wb_heading") {
-    const token = getColorToken(primary.color);
-    const rtl = isArabicDominant(primaryFullText);
-    const hasIcon = Boolean(primary.icon);
     return (
-      <View
-        style={[
-          styles.headingBox,
-          hasIcon && styles.headingBoxWithIcon,
-        ]}
-      >
-        <InkSweepReveal
-          triggered={primaryTriggered}
-          instantComplete={primaryInstant}
-          isRtl={rtl}
-          resetKey={`${stepResetKey}-${primaryItem.key}`}
-          durationMs={INK_SWEEP_HEADING_MS}
-        >
-          <Text
-            style={[
-              styles.headingText,
-              getHandwrittenFontStyle(
-                primaryFullText,
-                "heading",
-                handwrittenFontsReady
-              ),
-              { color: token.text },
-            ]}
-          >
-            {primaryFullText}
-          </Text>
-        </InkSweepReveal>
-      </View>
+      <HeadingBlockView
+        blockId={blockId}
+        text={primaryFullText}
+        color={primary.color}
+        hasIcon={Boolean(primary.icon)}
+        slotWidth={slotWidth}
+        triggered={primaryTriggered}
+        instantComplete={primaryInstant}
+        resetKey={`${stepResetKey}-${primaryItem.key}`}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
     );
   }
 
   if (primary.type === "wb_equation") {
-    const token = getColorToken(primary.color);
-    const lines = primaryFullText ? primaryFullText.split("\n") : [""];
+    // Safeguard #1: Keep pure math expressions LTR even inside Arabic lectures,
+    // with animated yellow highlighter sweep behind key formulas.
     return (
-      <View style={styles.equationBox}>
-        {lines.map((line, lIdx) => {
-          const rtl = isArabicDominant(line);
-          return (
-            <InkSweepReveal
-              key={`eq-${lIdx}`}
-              triggered={primaryTriggered}
-              instantComplete={primaryInstant}
-              isRtl={rtl}
-              resetKey={`${stepResetKey}-${primaryItem.key}-l${lIdx}`}
-              durationMs={INK_SWEEP_CARD_MS}
-              delayMs={lIdx * 90}
-            >
-              <Text
-                style={[
-                  styles.equationText,
-                  getHandwrittenFontStyle(
-                    line,
-                    "equation",
-                    handwrittenFontsReady
-                  ),
-                  { color: token.text },
-                ]}
-              >
-                {line}
-              </Text>
-            </InkSweepReveal>
-          );
-        })}
-      </View>
+      <HighlightedTextBlockView
+        blockId={blockId}
+        text={primaryFullText}
+        color={primary.color}
+        variant="equation"
+        forceLtr
+        highlightEnabled={primary.highlight !== false}
+        slotWidth={slotWidth}
+        triggered={primaryTriggered}
+        instantComplete={primaryInstant}
+        resetKey={`${stepResetKey}-${primaryItem.key}`}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
+    );
+  }
+
+  if (primary.type === "wb_highlight") {
+    return (
+      <HighlightedTextBlockView
+        blockId={blockId}
+        text={primaryFullText}
+        color={primary.color}
+        variant="highlight"
+        highlightEnabled
+        slotWidth={slotWidth}
+        triggered={primaryTriggered}
+        instantComplete={primaryInstant}
+        resetKey={`${stepResetKey}-${primaryItem.key}`}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
+    );
+  }
+
+  if (primary.type === "wb_text") {
+    return (
+      <HighlightedTextBlockView
+        blockId={blockId}
+        text={primaryFullText}
+        color={primary.color}
+        variant="text"
+        highlightEnabled={Boolean(primary.highlight)}
+        slotWidth={slotWidth}
+        triggered={primaryTriggered}
+        instantComplete={primaryInstant}
+        resetKey={`${stepResetKey}-${primaryItem.key}`}
+        handwrittenFontsReady={handwrittenFontsReady}
+      />
     );
   }
 
@@ -4084,10 +5422,23 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     [currentPdfActions, currentStep, wordTimings]
   );
 
-  // Compute cumulative multi-band whiteboard blocks & dynamic rects
+  // Effective bottom clearance guarantees >= 140px so floating dock/chat never overlaps ink
+  const effectiveBottomInset = Math.max(140, bottomInset);
+
+  // Safeguard #3: Reset manual pan override whenever a new follow-up /api/ask or
+  // /api/ask-free turn appends steps so the Auto-Follow Camera smoothly tracks new ink
+  const prevStepsLenRef = useRef(safeSteps.length);
+  useEffect(() => {
+    if (safeSteps.length > prevStepsLenRef.current) {
+      userHasManuallyPanned.value = false;
+    }
+    prevStepsLenRef.current = safeSteps.length;
+  }, [safeSteps.length, userHasManuallyPanned]);
+
+  // Compute cumulative multi-band whiteboard blocks & dynamic rects (tablet 2D clusters)
   const wbBlocks = useMemo(
-    () => resolveWhiteboardBlocks(safeSteps, safeIndex),
-    [safeSteps, safeIndex]
+    () => resolveWhiteboardBlocks(safeSteps, safeIndex, isTablet),
+    [safeSteps, safeIndex, isTablet]
   );
 
   const cumulativeLayout = useMemo(
@@ -4097,23 +5448,84 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
         viewportHeight,
         wbBlocks,
         topInset,
-        bottomInset,
+        effectiveBottomInset,
         isTablet
       ),
-    [viewportWidth, viewportHeight, wbBlocks, topInset, bottomInset, isTablet]
+    [
+      viewportWidth,
+      viewportHeight,
+      wbBlocks,
+      topInset,
+      effectiveBottomInset,
+      isTablet,
+    ]
   );
 
-  // Gesture-Safe Auto-Pan Camera Follow: smoothly centers on active blocks below viewport
+  const isLectureFinished =
+    safeSteps.length > 0 &&
+    safeIndex === safeSteps.length - 1 &&
+    !isPlaying &&
+    clampedProgress >= 0.99;
+
+  // Stage 15 Smooth Auto-Follow Camera & End-of-Lecture Overview Zoom-Out
   useEffect(() => {
     if (
       !currentStep ||
       currentStep.mode !== "whiteboard" ||
-      viewportHeight <= 0
+      viewportHeight <= 0 ||
+      viewportWidth <= 0
     ) {
       return;
     }
     if (userHasManuallyPanned.value) return;
 
+    const visibleTop = topInset + 8;
+    const visibleBottom = viewportHeight - effectiveBottomInset - 12;
+    const visibleHeight = Math.max(120, visibleBottom - visibleTop);
+    const visibleCenterY = (visibleTop + visibleBottom) / 2;
+
+    // 1. End-of-lecture overview zoom-out: frame the full accumulated whiteboard cleanly
+    if (isLectureFinished) {
+      let allMinY = Infinity;
+      let allMaxY = -Infinity;
+      for (const block of wbBlocks) {
+        const r = cumulativeLayout.blockRects.get(block.blockId);
+        if (r && r.height > 0) {
+          allMinY = Math.min(allMinY, r.y);
+          allMaxY = Math.max(allMaxY, r.y + r.height);
+        }
+      }
+      if (!Number.isFinite(allMinY) || !Number.isFinite(allMaxY)) return;
+      const totalH = Math.max(1, allMaxY - allMinY);
+      const overviewScale = Math.max(
+        0.62,
+        Math.min(1.0, (visibleHeight - 16) / totalH)
+      );
+      const contentMidY = (allMinY + allMaxY) / 2;
+      const targetOverviewY =
+        overviewScale >= 0.99
+          ? Math.min(0, visibleTop - allMinY)
+          : visibleCenterY - viewportHeight / 2 - (contentMidY - viewportHeight / 2) * overviewScale;
+
+      scale.value = withTiming(overviewScale, {
+        duration: 560,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedScale.value = overviewScale;
+      translateX.value = withTiming(0, {
+        duration: 560,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedX.value = 0;
+      translateY.value = withTiming(targetOverviewY, {
+        duration: 560,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedY.value = targetOverviewY;
+      return;
+    }
+
+    // 2. Active-step focus: gently pan & frame the newly drawn/updated step cluster
     const activeRects: RectFrame[] = [];
     for (const block of wbBlocks) {
       if (block.lastUpdatedStepIdx === safeIndex) {
@@ -4125,16 +5537,27 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     }
     if (activeRects.length === 0) return;
 
+    let minX = Infinity;
+    let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
     for (const r of activeRects) {
+      minX = Math.min(minX, r.x);
+      maxX = Math.max(maxX, r.x + r.width);
       minY = Math.min(minY, r.y);
       maxY = Math.max(maxY, r.y + r.height);
     }
 
-    const visibleTop = topInset + 8;
-    const visibleBottom = viewportHeight - bottomInset - 12;
-    const visibleCenterY = (visibleTop + visibleBottom) / 2;
+    const activeW = maxX - minX;
+    const isSingleTabletColumn = isTablet && activeW < viewportWidth * 0.58;
+    const targetScale = isSingleTabletColumn ? 1.05 : 1.0;
+
+    let targetX = 0;
+    if (isSingleTabletColumn) {
+      const activeCx = (minX + maxX) / 2;
+      const desiredX = (viewportWidth / 2 - activeCx) * targetScale;
+      targetX = Math.max(-140, Math.min(140, desiredX));
+    }
 
     let targetY = translateY.value;
     if (maxY + translateY.value > visibleBottom) {
@@ -4146,6 +5569,20 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
       targetY = 0;
     }
 
+    if (Math.abs(targetScale - scale.value) > 0.01) {
+      scale.value = withTiming(targetScale, {
+        duration: 460,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedScale.value = targetScale;
+    }
+    if (Math.abs(targetX - translateX.value) > 4) {
+      translateX.value = withTiming(targetX, {
+        duration: 460,
+        easing: Easing.out(Easing.cubic),
+      });
+      savedX.value = targetX;
+    }
     if (Math.abs(targetY - translateY.value) > 4) {
       translateY.value = withTiming(targetY, {
         duration: 460,
@@ -4158,10 +5595,17 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     currentStep,
     wbBlocks,
     cumulativeLayout.blockRects,
+    viewportWidth,
     viewportHeight,
     topInset,
-    bottomInset,
+    effectiveBottomInset,
+    isTablet,
+    isLectureFinished,
     userHasManuallyPanned,
+    scale,
+    savedScale,
+    translateX,
+    savedX,
     translateY,
     savedY,
   ]);
@@ -4392,16 +5836,19 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   ]}
                 />
 
-                {/* Progressive Rough Card Frames, Heading Underlines & Sketch Icons (0% -> 35%) */}
+                {/* Progressive Rough Card Frames & Sketch Icons (Boxed ONLY for Flow Cards, Notes & Code) */}
                 {wbBlocks.map((block) => {
                   const rect = blockRects.get(block.blockId);
                   if (!rect || rect.width <= 0 || rect.height <= 0) return null;
                   const primary = block.items[0]?.action;
                   if (!primary) return null;
 
-                  // wb_table and wb_diagram render their own memoized rough Skia canvases
-                  // so horizontal scrolling keeps vector strokes locked 1:1 with RN overlays
-                  if (primary.type === "wb_table" || primary.type === "wb_diagram") {
+                  // wb_table, wb_diagram, and wb_plot render their own memoized rough Skia canvases
+                  if (
+                    primary.type === "wb_table" ||
+                    primary.type === "wb_diagram" ||
+                    primary.type === "wb_plot"
+                  ) {
                     return null;
                   }
 
@@ -4410,9 +5857,10 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   const isHeading = primary.type === "wb_heading";
                   const isNote = primary.type === "wb_note";
                   const isFlowCard = primary.type === "wb_flow_card";
+                  const isBoxedCard = isCode || isNote || isFlowCard;
                   const isCompact =
                     block.slot === "left_col" || block.slot === "right_col";
-                  const radius = isHeading ? 12 : isNote ? 10 : 16;
+                  const radius = isNote ? 10 : 16;
                   const isNewCard = block.createdAtStepIdx === safeIndex;
                   const cardSeed = hashSeed(`frame-${block.blockId}`);
 
@@ -4424,32 +5872,40 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   const iconSize = isHeading ? 24 : isCompact ? 18 : 22;
                   const iconCx = shiftedX + (isCompact ? 20 : 25);
                   const iconCy =
-                    shiftedY + (isHeading ? (rect.height - 6) / 2 : rect.height / 2);
+                    shiftedY + (isHeading ? Math.min(26, rect.height / 2) : rect.height / 2);
+
+                  // Boxless open-paper primitives (wb_heading, wb_bullet, wb_text, wb_equation, wb_highlight)
+                  // draw NO heavy blue card frame — only optional sketch icon on headings.
+                  if (!isBoxedCard && !showSketchIcon) {
+                    return null;
+                  }
 
                   return (
                     <React.Fragment key={`frame-${block.blockId}`}>
-                      <AnimatedCardFrame
-                        x={shiftedX}
-                        y={shiftedY}
-                        width={rect.width}
-                        height={rect.height}
-                        radius={radius}
-                        seed={cardSeed}
-                        fillColor={
-                          isCode
-                            ? "#0F172A"
-                            : isNote
-                            ? token.noteFill
-                            : token.fill
-                        }
-                        strokeColor={isCode ? "#334155" : token.stroke}
-                        strokeWidth={isFlowCard ? 2 : 1.55}
-                        isCode={isCode}
-                        isHeading={isHeading}
-                        isNote={isNote}
-                        animate={isNewCard}
-                        borderProgress={borderProgressSV}
-                      />
+                      {isBoxedCard && (
+                        <AnimatedCardFrame
+                          x={shiftedX}
+                          y={shiftedY}
+                          width={rect.width}
+                          height={rect.height}
+                          radius={radius}
+                          seed={cardSeed}
+                          fillColor={
+                            isCode
+                              ? "#0F172A"
+                              : isNote
+                              ? token.noteFill
+                              : token.fill
+                          }
+                          strokeColor={isCode ? "#334155" : token.stroke}
+                          strokeWidth={isFlowCard ? 2 : 1.55}
+                          isCode={isCode}
+                          isHeading={false}
+                          isNote={isNote}
+                          animate={isNewCard}
+                          borderProgress={borderProgressSV}
+                        />
+                      )}
                       {showSketchIcon && primary.icon && (
                         <AnimatedSketchIcon
                           icon={primary.icon}
@@ -4527,7 +5983,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
               </Canvas>
             )}
 
-            {/* Layer 2: Live Typewriter RN Text, Notes, Tables & Syntax-Highlighted Code */}
+            {/* Layer 2: Live Typewriter RN Text, Notes, Tables, Plots & Syntax-Highlighted Code */}
             {viewportWidth > 0 &&
               wbBlocks.map((block) => {
                 const rect = blockRects.get(block.blockId);
@@ -4536,6 +5992,13 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                 const isCode = primaryType === "wb_code";
                 const isTable = primaryType === "wb_table";
                 const isDiagram = primaryType === "wb_diagram";
+                const isPlot = primaryType === "wb_plot";
+                const isBoxless =
+                  primaryType === "wb_heading" ||
+                  primaryType === "wb_bullet" ||
+                  primaryType === "wb_text" ||
+                  primaryType === "wb_equation" ||
+                  primaryType === "wb_highlight";
                 const isCompact =
                   block.slot === "left_col" || block.slot === "right_col";
 
@@ -4545,7 +6008,8 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                     style={[
                       styles.slotContainer,
                       isCode && styles.codeSlotContainer,
-                      (isTable || isDiagram) && styles.tableSlotContainer,
+                      (isTable || isDiagram || isPlot) && styles.tableSlotContainer,
+                      isBoxless && styles.boxlessSlotContainer,
                       {
                         left: rect.x,
                         top: rect.y,
@@ -4580,7 +6044,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
       <Animated.View
         style={[
           styles.resetBtnWrap,
-          { bottom: bottomInset + 14 },
+          { bottom: effectiveBottomInset + 14 },
           resetButtonAnimStyle,
         ]}
       >
@@ -4654,20 +6118,150 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
     justifyContent: "flex-start",
   },
+  boxlessSlotContainer: {
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    justifyContent: "center",
+  },
   headingBox: {
     justifyContent: "center",
-    alignItems: "center",
-    paddingBottom: 8,
+    paddingBottom: 2,
+  },
+  headingBoxRtl: {
+    alignItems: "flex-end",
+  },
+  headingBoxLtr: {
+    alignItems: "flex-start",
+  },
+  headingTextWrap: {
+    width: "100%",
+  },
+  alignEnd: {
+    alignItems: "flex-end",
+  },
+  alignStart: {
+    alignItems: "flex-start",
   },
   headingBoxWithIcon: {
-    paddingLeft: 32,
+    paddingLeft: 36,
     paddingRight: 10,
   },
   headingText: {
-    fontSize: 17.5,
+    fontSize: 18,
     fontWeight: "700",
+    lineHeight: 25,
+    includeFontPadding: false,
+  },
+  ltrTextAlign: {
+    textAlign: "left",
+    writingDirection: "ltr",
+  },
+  openPaperBlock: {
+    width: "100%",
+    justifyContent: "center",
+  },
+  proseBox: {
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  highlightWrap: {
+    position: "relative",
+    justifyContent: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    width: "100%",
+  },
+  highlightWrapCenter: {
+    alignItems: "center",
+  },
+  highlighterCanvas: {
+    position: "absolute",
+    alignSelf: "center",
+  },
+  equationLtrText: {
     textAlign: "center",
-    lineHeight: 24,
+    writingDirection: "ltr",
+  },
+  openText: {
+    fontSize: 14.5,
+    lineHeight: 22,
+    fontWeight: "500",
+    includeFontPadding: false,
+  },
+  highlightKeyText: {
+    fontSize: 15.5,
+    lineHeight: 23,
+    fontWeight: "700",
+    includeFontPadding: false,
+  },
+  plotBlockRoot: {
+    width: "100%",
+  },
+  plotTitleWrap: {
+    height: PLOT_TITLE_HEIGHT,
+    justifyContent: "center",
+    paddingHorizontal: 8,
+  },
+  plotTitleText: {
+    fontSize: 15.5,
+    fontWeight: "700",
+    lineHeight: 22,
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  plotAxisLabel: {
+    position: "absolute",
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334155",
+    includeFontPadding: false,
+  },
+  plotTickText: {
+    position: "absolute",
+    fontSize: 10,
+    fontWeight: "600",
+    color: "#64748B",
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  plotMarkerBadge: {
+    position: "absolute",
+    backgroundColor: "rgba(254, 242, 242, 0.94)",
+    borderWidth: 1,
+    borderColor: "rgba(220, 38, 38, 0.45)",
+    borderRadius: 6,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  plotMarkerBadgeText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#B91C1C",
+    includeFontPadding: false,
+  },
+  plotLegendRow: {
+    height: PLOT_LEGEND_HEIGHT,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    paddingHorizontal: 8,
+  },
+  plotLegendItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    maxWidth: "48%",
+  },
+  plotLegendSwatch: {
+    width: 14,
+    height: 3,
+    borderRadius: 2,
+  },
+  plotLegendText: {
+    fontSize: 11,
+    fontWeight: "700",
     includeFontPadding: false,
   },
   flowCardBox: {

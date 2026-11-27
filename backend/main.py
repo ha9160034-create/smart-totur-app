@@ -303,6 +303,91 @@ def _chunk_page_text(
 
 
 # ---------------------------------------------------------------------------
+# Math & LaTeX Symbol Sanitization (Fixes \times -> <TAB>imes, \approx, \sqrt, \vec)
+# ---------------------------------------------------------------------------
+_MATH_CONTROL_REPAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\t\s*imes\b"), " × "),
+    (re.compile(r"\t\s*heta\b"), "θ"),
+    (re.compile(r"\t\s*au\b"), "τ"),
+    (re.compile(r"\t\s*o\b"), " → "),
+    (re.compile(r"\x08eta\b"), "β"),
+    (re.compile(r"\x0crac\b"), "\\frac"),
+    (re.compile(r"\x07pprox\b"), " ≈ "),
+    (re.compile(r"\x07lpha\b"), "α"),
+)
+
+_MATH_LATEX_REPAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}"), r"(\1) / (\2)"),
+    (re.compile(r"\\sqrt\{([^{}]+)\}"), r"√(\1)"),
+    (re.compile(r"\\vec\{([^{}]+)\}"), r"\1⃗"),
+    (re.compile(r"\\times\b"), "×"),
+    (re.compile(r"\\cdot\b"), "·"),
+    (re.compile(r"\\div\b"), "÷"),
+    (re.compile(r"\\pm\b"), "±"),
+    (re.compile(r"\\mp\b"), "∓"),
+    (re.compile(r"\\neq\b|\\ne\b"), "≠"),
+    (re.compile(r"\\leq\b|\\le\b"), "≤"),
+    (re.compile(r"\\geq\b|\\ge\b"), "≥"),
+    (re.compile(r"\\approx\b"), "≈"),
+    (re.compile(r"\\equiv\b"), "≡"),
+    (re.compile(r"\\propto\b"), "∝"),
+    (re.compile(r"\\sqrt\b"), "√"),
+    (re.compile(r"\\vec\b"), "→"),
+    (re.compile(r"\\Rightarrow\b"), "⇒"),
+    (re.compile(r"\\rightarrow\b|\\to\b"), "→"),
+    (re.compile(r"\\leftarrow\b"), "←"),
+    (re.compile(r"\\infty\b"), "∞"),
+    (re.compile(r"\\degree\b|\^\{\\circ\}|\^\\circ"), "°"),
+    (re.compile(r"\\Delta\b"), "Δ"),
+    (re.compile(r"\\Omega\b"), "Ω"),
+    (re.compile(r"\\alpha\b"), "α"),
+    (re.compile(r"\\beta\b"), "β"),
+    (re.compile(r"\\gamma\b"), "γ"),
+    (re.compile(r"\\delta\b"), "δ"),
+    (re.compile(r"\\theta\b"), "θ"),
+    (re.compile(r"\\lambda\b"), "λ"),
+    (re.compile(r"\\mu\b"), "μ"),
+    (re.compile(r"\\pi\b"), "π"),
+    (re.compile(r"\\rho\b"), "ρ"),
+    (re.compile(r"\\sigma\b"), "σ"),
+    (re.compile(r"\\tau\b"), "τ"),
+    (re.compile(r"\\omega\b"), "ω"),
+)
+
+
+_BARE_EQ_MATH_REPAIRS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+times\s+(?=[A-Za-z0-9(\[]\b(?!\s+[A-Za-z]{2,}))"), " × "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+div\s+(?=[A-Za-z0-9(\[]\b)"), " ÷ "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+pm\s+(?=[A-Za-z0-9(\[]\b)"), " ± "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+neq\s+(?=[A-Za-z0-9(\[]\b)"), " ≠ "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+leq\s+(?=[A-Za-z0-9(\[]\b)"), " ≤ "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+geq\s+(?=[A-Za-z0-9(\[]\b)"), " ≥ "),
+    (re.compile(r"(?<=\b[A-Za-z0-9)\]])\s+approx\s+(?=[A-Za-z0-9(\[]\b)"), " ≈ "),
+)
+
+
+def _sanitize_math_text(raw: Optional[str]) -> Optional[str]:
+    """Repair JSON-corrupted LaTeX escapes (e.g. \\times -> <TAB>imes or bare 'times') into crisp Unicode math."""
+    if raw is None:
+        return None
+    text = str(raw)
+    if not text:
+        return text
+    for pattern, repl in _MATH_CONTROL_REPAIRS:
+        text = pattern.sub(repl, text)
+    for pattern, repl in _MATH_LATEX_REPAIRS:
+        text = pattern.sub(repl, text)
+    # Catch models that drop the backslash completely inside equations (e.g. "F = m times a")
+    for pattern, repl in _BARE_EQ_MATH_REPAIRS:
+        text = pattern.sub(repl, text)
+    # Strip stray inline $ wrappers around LaTeX formulas without touching currency like $100
+    text = re.sub(r"\$([^$\d][^$]*)\$", r"\1", text)
+    # Collapse duplicate spaces on each line while preserving explicit newlines
+    lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
 # Defensive Post-Sanitization (Preserves Exact LecturePlan Schema Contract)
 # ---------------------------------------------------------------------------
 def _sanitize_plan(
@@ -314,22 +399,33 @@ def _sanitize_plan(
     Fix minor geometric/field slips from fast models without changing the schema:
     - Ensure bounding boxes satisfy ymin <= ymax and xmin <= xmax.
     - Strip mismatched bbox/slot fields so Skia renderer never receives conflicting hints.
+    - Repair corrupted math/LaTeX escape sequences on all non-code whiteboard text.
     - Enforce Zero-Wipe Cumulative Whiteboard: strip stray clear_board actions in whiteboard/auto mode
-      so earlier cards, diagrams, and tables never vanish mid-lecture.
+      so earlier cards, diagrams, graphs, and tables never vanish mid-lecture.
     """
     pdf_action_types = {"pdf_highlight", "pdf_circle"}
     wb_action_types = {
         "wb_heading",
         "wb_bullet",
+        "wb_text",
+        "wb_highlight",
         "wb_equation",
         "wb_code",
         "wb_flow_card",
         "wb_table",
         "wb_note",
         "wb_diagram",
+        "wb_plot",
     }
 
     enforce_zero_wipe = strip_clear_board or board_mode in ("whiteboard", "auto")
+
+    if plan.title:
+        plan.title = _sanitize_math_text(plan.title) or plan.title
+    if plan.quiz_question_ar:
+        plan.quiz_question_ar = (
+            _sanitize_math_text(plan.quiz_question_ar) or plan.quiz_question_ar
+        )
 
     for step in plan.steps:
         if board_mode in ("whiteboard", "pdf_overlay"):
@@ -356,8 +452,44 @@ def _sanitize_plan(
                     if resolved_code:
                         action.code = resolved_code
                         action.text = resolved_code
-                elif action.type == "wb_diagram" and action.slot is None:
-                    action.slot = "main_top"
+                else:
+                    if action.text:
+                        action.text = _sanitize_math_text(action.text)
+                    if action.headers:
+                        action.headers = [_sanitize_math_text(h) or "" for h in action.headers]
+                    if action.rows:
+                        action.rows = [
+                            [_sanitize_math_text(cell) or "" for cell in row]
+                            for row in action.rows
+                        ]
+                    if action.diagram_title:
+                        action.diagram_title = _sanitize_math_text(action.diagram_title)
+                    if action.nodes:
+                        for node in action.nodes:
+                            node.label = _sanitize_math_text(node.label) or node.label
+                            if node.sublabel:
+                                node.sublabel = _sanitize_math_text(node.sublabel)
+                    if action.edges:
+                        for edge in action.edges:
+                            if edge.label:
+                                edge.label = _sanitize_math_text(edge.label)
+                    if action.type == "wb_diagram" and action.slot is None:
+                        action.slot = "main_top"
+                    elif action.type == "wb_plot":
+                        if action.slot is None:
+                            action.slot = "main_top"
+                        if action.x_label:
+                            action.x_label = _sanitize_math_text(action.x_label)
+                        if action.y_label:
+                            action.y_label = _sanitize_math_text(action.y_label)
+                        if action.curves:
+                            for curve in action.curves:
+                                if curve.label:
+                                    curve.label = _sanitize_math_text(curve.label)
+                        if action.markers:
+                            for mk in action.markers:
+                                if mk.label:
+                                    mk.label = _sanitize_math_text(mk.label)
 
     return plan
 

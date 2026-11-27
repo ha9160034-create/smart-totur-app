@@ -14,6 +14,8 @@ WhiteboardSlot = Literal[
 SketchIcon = Literal["lightbulb", "brain", "check", "warning", "code", "compare"]
 DiagramNodeKind = Literal["container", "box", "pill", "decision"]
 DiagramTint = Literal["blue", "teal", "amber", "rose", "slate"]
+DiagramStencil = Literal["force_block", "circuit", "cell", "atom", "wave", "tree_node"]
+PlotExprType = Literal["linear", "quadratic", "exponential", "sine", "points"]
 
 
 class DiagramNode(BaseModel):
@@ -39,6 +41,10 @@ class DiagramNode(BaseModel):
         default=None,
         description="Optional whiteboard marker tint: blue, teal, amber, rose, or slate.",
     )
+    stencil: Optional[DiagramStencil] = Field(
+        default=None,
+        description="Optional multi-layer hand-drawn vector stencil: force_block, circuit, cell, atom, wave, or tree_node.",
+    )
 
 
 class DiagramEdge(BaseModel):
@@ -54,6 +60,38 @@ class DiagramEdge(BaseModel):
     )
 
 
+class PlotCurve(BaseModel):
+    expr_type: PlotExprType = Field(
+        default="linear",
+        description="linear:[m,b], quadratic:[a,b,c], exponential:[a,b,c], sine:[A,w,phi,d], points:[x1,y1,x2,y2,...]",
+    )
+    params: List[float] = Field(
+        ...,
+        description="Numeric parameters matching expr_type.",
+    )
+    color: Optional[str] = Field(
+        default="blue",
+        description="blue, red, green, yellow, or black.",
+    )
+    label: Optional[str] = Field(
+        default=None,
+        description="Short curve legend label (e.g., 'F = 2 × a').",
+    )
+
+
+class PlotMarker(BaseModel):
+    x: float = Field(..., description="X coordinate in mathematical units.")
+    y: float = Field(..., description="Y coordinate in mathematical units.")
+    label: Optional[str] = Field(
+        default=None,
+        description="Short point label (e.g., '(3, 6 N)').",
+    )
+    dashed_guides: bool = Field(
+        default=True,
+        description="Draw faint dashed drop-lines to the X and Y axes.",
+    )
+
+
 class BoundingBox(BaseModel):
     ymin: int = Field(..., ge=0, le=1000, description="Top Y (0-1000)")
     xmin: int = Field(..., ge=0, le=1000, description="Left X (0-1000)")
@@ -65,14 +103,17 @@ class VisualAction(BaseModel):
         "clear_board",     # مسح السبورة البيضاء لبدء فكرة جديدة
         "pdf_highlight",   # تظليل أصفر/ملون فوق سطر أو فقرة بالملزمة
         "pdf_circle",      # رسم دائرة أو إطار حول رسمة تشريحية أو كلمة بالملزمة
-        "wb_heading",      # كتابة عنوان على السبورة
-        "wb_bullet",       # كتابة نقطة شرح على السبورة
-        "wb_equation",     # كتابة معادلة بصيغة LaTeX
+        "wb_heading",      # كتابة عنوان مفتوح على الورق مع خط تحتي مرسوم يدوياً
+        "wb_bullet",       # كتابة نقطة شرح مفتوحة على الورق
+        "wb_text",         # فقرة شرح مفتوحة بخط يدوي بدون صندوق
+        "wb_highlight",    # نتيجة أو عبارة رئيسية مع مسحة قلم تمييز أصفر خلفها
+        "wb_equation",     # كتابة معادلة رياضية أو فيزيائية برموز Unicode نظيفة
         "wb_code",         # عرض بلوك كود برمجي ملون
         "wb_flow_card",    # رسم بطاقة مخطط انسيابي (طبي أو خوارزمي)
         "wb_table",        # رسم جدول مقارنة منظم على السبورة (2-4 أعمدة)
         "wb_note",         # ملاحظة هامشية سريعة بخط يدوي (قاعدة، تنبيه، نصيحة)
-        "wb_diagram"       # إعادة رسم مخطط تفاعلي كامل (صناديق متداخلة، قرارات، أسهم)
+        "wb_diagram",      # إعادة رسم مخطط تفاعلي كامل (صناديق متداخلة، قرارات، أسهم)
+        "wb_plot"          # رسم بياني رياضي/فيزيائي ديكارتي (محاور، منحنيات، نقاط)
     ]
 
     color: Literal["blue", "red", "green", "yellow", "black"] = Field(
@@ -149,6 +190,41 @@ class VisualAction(BaseModel):
         description="Optional directed DiagramEdge connectors (0 to 24) referencing valid node ids."
     )
 
+    highlight: Optional[bool] = Field(
+        default=None,
+        description="Optional for wb_equation, wb_text, or wb_heading: sweeps a translucent yellow highlighter behind key results."
+    )
+
+    x_label: Optional[str] = Field(
+        default=None,
+        description="X-axis title for wb_plot (e.g., 'Time t (s)')."
+    )
+
+    y_label: Optional[str] = Field(
+        default=None,
+        description="Y-axis title for wb_plot (e.g., 'Force F (N)')."
+    )
+
+    x_range: Optional[List[float]] = Field(
+        default=None,
+        description="2-element [x_min, x_max] mathematical range for wb_plot (default [-5, 5])."
+    )
+
+    y_range: Optional[List[float]] = Field(
+        default=None,
+        description="2-element [y_min, y_max] mathematical range for wb_plot (default [-5, 5])."
+    )
+
+    curves: Optional[List[PlotCurve]] = Field(
+        default=None,
+        description="REQUIRED for wb_plot: 1 to 4 PlotCurve definitions evaluated client-side."
+    )
+
+    markers: Optional[List[PlotMarker]] = Field(
+        default=None,
+        description="Optional 0 to 6 PlotMarker key points with dashed axis guides for wb_plot."
+    )
+
     @model_validator(mode="after")
     def validate_action_payload(self) -> "VisualAction":
         if self.type == "wb_code":
@@ -216,6 +292,7 @@ class VisualAction(BaseModel):
                         w=cw,
                         h=ch,
                         tint=node.tint,
+                        stencil=node.stencil,
                     )
                 )
                 if len(cleaned_nodes) >= 18:
@@ -254,6 +331,63 @@ class VisualAction(BaseModel):
                 self.diagram_title = str(self.diagram_title).strip() or None
             self.nodes = cleaned_nodes
             self.edges = cleaned_edges
+        elif self.type == "wb_plot":
+            raw_curves = self.curves or []
+            cleaned_curves: List[PlotCurve] = []
+            for curve in raw_curves:
+                params = [float(v) for v in (curve.params or []) if isinstance(v, (int, float))]
+                if curve.expr_type == "points":
+                    if len(params) < 4:
+                        continue
+                    if len(params) % 2 == 1:
+                        params = params[:-1]
+                elif len(params) < 1:
+                    continue
+                cleaned_curves.append(
+                    PlotCurve(
+                        expr_type=curve.expr_type,
+                        params=params[:40],
+                        color=(str(curve.color or "blue").strip().lower() or "blue"),
+                        label=(str(curve.label).strip() if curve.label is not None else None) or None,
+                    )
+                )
+                if len(cleaned_curves) >= 4:
+                    break
+
+            if not cleaned_curves:
+                raise ValueError(
+                    "wb_plot action must provide at least 1 valid curve with numeric params."
+                )
+
+            def _normalize_range(rng: Optional[List[float]]) -> List[float]:
+                if isinstance(rng, list) and len(rng) >= 2:
+                    lo, hi = float(rng[0]), float(rng[1])
+                    if lo > hi:
+                        lo, hi = hi, lo
+                    if hi - lo < 1e-3:
+                        lo, hi = lo - 5.0, hi + 5.0
+                    return [lo, hi]
+                return [-5.0, 5.0]
+
+            self.x_range = _normalize_range(self.x_range)
+            self.y_range = _normalize_range(self.y_range)
+            self.x_label = (str(self.x_label).strip() if self.x_label is not None else None) or "x"
+            self.y_label = (str(self.y_label).strip() if self.y_label is not None else None) or "y"
+            self.curves = cleaned_curves
+
+            cleaned_markers: List[PlotMarker] = []
+            for mk in (self.markers or []):
+                cleaned_markers.append(
+                    PlotMarker(
+                        x=float(mk.x),
+                        y=float(mk.y),
+                        label=(str(mk.label).strip() if mk.label is not None else None) or None,
+                        dashed_guides=bool(mk.dashed_guides),
+                    )
+                )
+                if len(cleaned_markers) >= 6:
+                    break
+            self.markers = cleaned_markers
         return self
 
 class TeachingStep(BaseModel):

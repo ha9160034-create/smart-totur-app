@@ -1,6 +1,6 @@
 import { Skia } from "@shopify/react-native-skia";
 import type { SkPath } from "@shopify/react-native-skia";
-import type { SketchIcon } from "../types/schema";
+import type { DiagramStencil, SketchIcon } from "../types/schema";
 
 // ---------------------------------------------------------------------------
 // Public Types
@@ -10,6 +10,22 @@ export interface RoughRectFrame {
   y: number;
   width: number;
   height: number;
+}
+
+export interface PenTrailPoint {
+  x: number;
+  y: number;
+}
+
+export interface SkiaPathWithTrail {
+  path: SkPath;
+  trail: PenTrailPoint[];
+}
+
+export interface StencilLayerPaths {
+  outlinePath: SkPath;
+  fillPath: SkPath;
+  trail: PenTrailPoint[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,4 +1239,450 @@ export function createSmartDiagramArrowPath(
       );
     }
   });
+}
+
+// ---------------------------------------------------------------------------
+// 8. Stage 15: Pre-Sampled Worklet-Safe Pen Trails, Highlighter, Plotter & Stencils
+// ---------------------------------------------------------------------------
+
+function pushQuadTrail(
+  trail: PenTrailPoint[],
+  x0: number,
+  y0: number,
+  cx: number,
+  cy: number,
+  x1: number,
+  y1: number,
+  steps = 8
+): void {
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const omt = 1 - t;
+    trail.push({
+      x: omt * omt * x0 + 2 * omt * t * cx + t * t * x1,
+      y: omt * omt * y0 + 2 * omt * t * cy + t * t * y1,
+    });
+  }
+}
+
+/**
+ * Hand-drawn bold double-stroke underline with an exact pre-sampled PenTrailPoint[]
+ * so the live pen nib glides smoothly along the underline on the UI thread at 60fps.
+ */
+export function createRoughUnderlineWithTrail(
+  xStart: number,
+  xEnd: number,
+  baseY: number,
+  seed: number,
+  roughness = 1
+): SkiaPathWithTrail {
+  const span = xEnd - xStart;
+  if (span <= 4) {
+    return { path: makeEmptySkiaPath(), trail: [] };
+  }
+
+  const rng = mulberry32(seed);
+  const r = clampRoughness(roughness);
+  const bow1 = (1.4 + rng() * 1.3) * r * (rng() > 0.5 ? -1 : 1);
+  const bow2 = (1.1 + rng() * 1.1) * r * (bow1 > 0 ? -1 : 1);
+
+  const y1Start = baseY + jitter(rng, 0.7 * r);
+  const y1End = baseY + jitter(rng, 0.8 * r);
+  const mid1X = xStart + span * (0.45 + rng() * 0.1);
+  const mid1Y = baseY + bow1;
+
+  const extraInset = Math.min(12, span * 0.06);
+  const yOffset = 2.6 + rng() * 0.7;
+  const x2Start = xStart + extraInset + jitter(rng, 1.2 * r);
+  const x2End = xEnd - extraInset * 0.7 + jitter(rng, 1.2 * r);
+  const y2Start = baseY + yOffset + jitter(rng, 0.7 * r);
+  const y2End = baseY + yOffset + jitter(rng, 0.7 * r);
+  const mid2X = (x2Start + x2End) * (0.47 + rng() * 0.06);
+  const mid2Y = baseY + yOffset + bow2;
+
+  const trail: PenTrailPoint[] = [];
+  pushQuadTrail(trail, xStart, y1Start, mid1X, mid1Y, xEnd, y1End, 14);
+  pushQuadTrail(trail, x2Start, y2Start, mid2X, mid2Y, x2End, y2End, 10);
+
+  const path = makePathFromBuilder((b) => {
+    b.moveTo(xStart, y1Start);
+    b.quadTo(mid1X, mid1Y, xEnd, y1End);
+    b.moveTo(x2Start, y2Start);
+    b.quadTo(mid2X, mid2Y, x2End, y2End);
+  });
+
+  return { path, trail };
+}
+
+/**
+ * Broad hand-drawn yellow highlighter sweep left-to-right behind key results/equations.
+ */
+export function createRoughHighlighterPath(
+  rect: RoughRectFrame,
+  seed: number
+): SkiaPathWithTrail {
+  if (!rect || rect.width <= 4 || rect.height <= 4) {
+    return { path: makeEmptySkiaPath(), trail: [] };
+  }
+  const rng = mulberry32(seed);
+  const x0 = rect.x + 2;
+  const x1 = rect.x + rect.width - 2;
+  const cy = rect.y + rect.height * 0.52;
+  const slant = jitter(rng, 1.6);
+  const bow = (1.2 + rng() * 1.4) * (rng() > 0.5 ? 1 : -1);
+  const cx = (x0 + x1) * (0.48 + rng() * 0.06);
+  const cpy = cy + bow;
+
+  const trail: PenTrailPoint[] = [];
+  pushQuadTrail(trail, x0, cy - slant, cx, cpy, x1, cy + slant, 14);
+
+  const path = makePathFromBuilder((b) => {
+    b.moveTo(x0, cy - slant);
+    b.quadTo(cx, cpy, x1, cy + slant);
+  });
+
+  return { path, trail };
+}
+
+/**
+ * Hand-drawn rounded rectangle paired with a clockwise perimeter PenTrailPoint[]
+ * so the live pen nib traces newly drawn cards smoothly.
+ */
+export function createRoughRectWithTrail(
+  rect: RoughRectFrame,
+  radius: number,
+  seed: number,
+  roughness = 1
+): SkiaPathWithTrail {
+  const path = createRoughRectPath(rect, radius, seed, roughness);
+  if (!rect || rect.width <= 0 || rect.height <= 0) {
+    return { path, trail: [] };
+  }
+  const { x, y, width: w, height: h } = rect;
+  const trail: PenTrailPoint[] = [];
+  pushQuadTrail(trail, x, y, x + w * 0.5, y - 1, x + w, y, 8);
+  pushQuadTrail(trail, x + w, y, x + w + 1, y + h * 0.5, x + w, y + h, 6);
+  pushQuadTrail(trail, x + w, y + h, x + w * 0.5, y + h + 1, x, y + h, 8);
+  pushQuadTrail(trail, x, y + h, x - 1, y + h * 0.5, x, y, 6);
+  return { path, trail };
+}
+
+/**
+ * Hand-drawn coordinate axes (Y-axis bottom->top + arrowhead, X-axis left->right + arrowhead,
+ * plus organic tick marks) with exact PenTrailPoint[] for wb_plot.
+ */
+export function createPlotAxesWithTrail(
+  plotRect: RoughRectFrame,
+  originX: number,
+  originY: number,
+  xTicks: number[],
+  yTicks: number[],
+  seed: number
+): SkiaPathWithTrail {
+  if (!plotRect || plotRect.width <= 20 || plotRect.height <= 20) {
+    return { path: makeEmptySkiaPath(), trail: [] };
+  }
+  const rng = mulberry32(seed);
+  const { x, y, width: w, height: h } = plotRect;
+  const clampedOX = Math.max(x, Math.min(x + w, originX));
+  const clampedOY = Math.max(y, Math.min(y + h, originY));
+
+  const trail: PenTrailPoint[] = [];
+  // Trace Y-axis from bottom to top, then X-axis from left to right
+  pushQuadTrail(
+    trail,
+    clampedOX,
+    y + h,
+    clampedOX + jitter(rng, 1.3),
+    y + h * 0.5,
+    clampedOX,
+    y,
+    12
+  );
+  pushQuadTrail(
+    trail,
+    x,
+    clampedOY,
+    x + w * 0.5,
+    clampedOY + jitter(rng, 1.3),
+    x + w,
+    clampedOY,
+    12
+  );
+
+  const path = makePathFromBuilder((b) => {
+    // Y-axis line + top arrowhead
+    addRoughLine(b, clampedOX, y + h, clampedOX, y, rng, 0.75, false);
+    addBowedSegment(b, clampedOX, y, clampedOX - 5.5, y + 9, rng, 0.55, true);
+    addBowedSegment(b, clampedOX, y, clampedOX + 5.5, y + 9, rng, 0.55, true);
+
+    // X-axis line + right arrowhead
+    addRoughLine(b, x, clampedOY, x + w, clampedOY, rng, 0.75, false);
+    addBowedSegment(b, x + w, clampedOY, x + w - 9, clampedOY - 5.5, rng, 0.55, true);
+    addBowedSegment(b, x + w, clampedOY, x + w - 9, clampedOY + 5.5, rng, 0.55, true);
+
+    // Short hand-sketched tick marks
+    for (const tx of xTicks) {
+      if (tx <= x + 4 || tx >= x + w - 10) continue;
+      b.moveTo(tx, clampedOY - 3.5);
+      b.lineTo(tx + jitter(rng, 0.5), clampedOY + 3.5);
+    }
+    for (const ty of yTicks) {
+      if (ty <= y + 10 || ty >= y + h - 4) continue;
+      b.moveTo(clampedOX - 3.5, ty);
+      b.lineTo(clampedOX + 3.5, ty + jitter(rng, 0.5));
+    }
+  });
+
+  return { path, trail };
+}
+
+/**
+ * Hand-drawn mathematical curve through sampled screen-space polyline segments
+ * with subtle organic Bezier perturbation + exact PenTrailPoint[].
+ */
+export function createPlotCurveWithTrail(
+  segments: ReadonlyArray<ReadonlyArray<PenTrailPoint>>,
+  seed: number,
+  roughness = 0.75
+): SkiaPathWithTrail {
+  const rng = mulberry32(seed);
+  const r = clampRoughness(roughness);
+  const trail: PenTrailPoint[] = [];
+
+  const path = makePathFromBuilder((b) => {
+    for (const seg of segments) {
+      if (!seg || seg.length < 2) continue;
+      const perturbed = seg.map((pt, idx) => ({
+        x: pt.x + (idx === 0 || idx === seg.length - 1 ? 0 : jitter(rng, 0.55 * r)),
+        y: pt.y + (idx === 0 || idx === seg.length - 1 ? 0 : jitter(rng, 0.55 * r)),
+      }));
+      addSmoothPolyCurve(b, perturbed);
+      for (const pt of perturbed) {
+        trail.push(pt);
+      }
+    }
+  });
+
+  return { path, trail };
+}
+
+/**
+ * Multi-layer colored vector stencils for wb_diagram nodes (outlines trace first,
+ * then soft pastel fills fade in). Supports: force_block, circuit, cell, atom, wave, tree_node.
+ */
+export function createDiagramStencilPaths(
+  stencil: DiagramStencil,
+  rect: RoughRectFrame,
+  seed: number
+): StencilLayerPaths {
+  if (!rect || rect.width <= 12 || rect.height <= 12) {
+    return {
+      outlinePath: makeEmptySkiaPath(),
+      fillPath: makeEmptySkiaPath(),
+      trail: [],
+    };
+  }
+
+  const rng = mulberry32((seed ^ hashSeed(`stencil-${stencil}`)) >>> 0);
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  const rx = rect.width * 0.44;
+  const ry = rect.height * 0.4;
+  const trail: PenTrailPoint[] = [];
+
+  const fillPath = makePathFromBuilder((b) => {
+    switch (stencil) {
+      case "force_block": {
+        const bx = cx - rx * 0.62;
+        const by = cy - ry * 0.48;
+        const bw = rx * 1.24;
+        const bh = ry * 0.96;
+        b.moveTo(bx, by);
+        b.lineTo(bx + bw, by);
+        b.lineTo(bx + bw, by + bh);
+        b.lineTo(bx, by + bh);
+        b.lineTo(bx, by);
+        break;
+      }
+      case "cell": {
+        // Organic outer membrane fill + inner nucleus oval
+        const steps = 20;
+        const pts: PenTrailPoint[] = [];
+        for (let i = 0; i <= steps; i++) {
+          const theta = (i / steps) * Math.PI * 2;
+          const wob = 1 + Math.sin(theta * 3) * 0.08;
+          pts.push({ x: cx + Math.cos(theta) * rx * wob, y: cy + Math.sin(theta) * ry * wob });
+        }
+        addSmoothPolyCurve(b, pts);
+        break;
+      }
+      case "atom":
+      case "tree_node": {
+        const rad = Math.min(rx, ry) * (stencil === "atom" ? 0.34 : 0.78);
+        const steps = 18;
+        const pts: PenTrailPoint[] = [];
+        for (let i = 0; i <= steps; i++) {
+          const theta = (i / steps) * Math.PI * 2;
+          pts.push({ x: cx + Math.cos(theta) * rad, y: cy + Math.sin(theta) * rad });
+        }
+        addSmoothPolyCurve(b, pts);
+        break;
+      }
+      case "circuit":
+      case "wave":
+      default: {
+        const bx = rect.x + 4;
+        const by = rect.y + 4;
+        const bw = rect.width - 8;
+        const bh = rect.height - 8;
+        b.moveTo(bx, by);
+        b.lineTo(bx + bw, by);
+        b.lineTo(bx + bw, by + bh);
+        b.lineTo(bx, by + bh);
+        b.lineTo(bx, by);
+        break;
+      }
+    }
+  });
+
+  const outlinePath = makePathFromBuilder((b) => {
+    switch (stencil) {
+      case "force_block": {
+        // Ground surface line + block + rightward force arrow
+        const bx = cx - rx * 0.62;
+        const by = cy - ry * 0.48;
+        const bw = rx * 1.24;
+        const bh = ry * 0.96;
+        addRoughRoundedRectPass(b, { x: bx, y: by, width: bw, height: bh }, 5, rng, 0.75, 2.5, 0);
+        // Surface baseline
+        addRoughLine(b, rect.x + 6, by + bh + 4, rect.x + rect.width - 6, by + bh + 4, rng, 0.7, false);
+        // Force vector arrow pulling right
+        const fx0 = bx + bw + 3;
+        const fx1 = rect.x + rect.width - 4;
+        if (fx1 - fx0 > 8) {
+          addRoughLine(b, fx0, cy, fx1, cy, rng, 0.7, false);
+          addBowedSegment(b, fx1, cy, fx1 - 6, cy - 4, rng, 0.5, true);
+          addBowedSegment(b, fx1, cy, fx1 - 6, cy + 4, rng, 0.5, true);
+        }
+        pushQuadTrail(trail, bx, by, bx + bw * 0.5, by, bx + bw, by, 6);
+        pushQuadTrail(trail, bx + bw, by, bx + bw, by + bh, bx, by + bh, 8);
+        break;
+      }
+      case "circuit": {
+        // Closed rectangular loop with top resistor zigzag & left battery plates
+        const lx = rect.x + 8;
+        const rx2 = rect.x + rect.width - 8;
+        const ty = rect.y + 10;
+        const by = rect.y + rect.height - 10;
+        const zigStart = lx + (rx2 - lx) * 0.28;
+        const zigEnd = lx + (rx2 - lx) * 0.72;
+        addRoughLine(b, lx, ty, zigStart, ty, rng, 0.65, false);
+        // Resistor zigzag (5 peaks)
+        const segW = (zigEnd - zigStart) / 6;
+        let zx = zigStart;
+        b.moveTo(zx, ty);
+        for (let k = 0; k < 6; k++) {
+          const nx = zx + segW;
+          const ny = k % 2 === 0 ? ty - 5 : ty + 5;
+          b.lineTo(k === 5 ? zigEnd : nx, k === 5 ? ty : ny);
+          trail.push({ x: nx, y: ny });
+          zx = nx;
+        }
+        addRoughLine(b, zigEnd, ty, rx2, ty, rng, 0.65, false);
+        addRoughLine(b, rx2, ty, rx2, by, rng, 0.65, false);
+        addRoughLine(b, rx2, by, lx, by, rng, 0.65, false);
+        // Battery symbol on left side
+        const midY = (ty + by) * 0.5;
+        addRoughLine(b, lx, by, lx, midY + 4, rng, 0.65, false);
+        addRoughLine(b, lx - 6, midY - 3, lx + 6, midY - 3, rng, 0.65, false);
+        addRoughLine(b, lx - 3.5, midY + 3, lx + 3.5, midY + 3, rng, 0.65, false);
+        addRoughLine(b, lx, midY - 4, lx, ty, rng, 0.65, false);
+        break;
+      }
+      case "cell": {
+        const steps = 22;
+        const outerPts: PenTrailPoint[] = [];
+        for (let i = 0; i <= steps; i++) {
+          const theta = (i / steps) * Math.PI * 2;
+          const wob = 1 + Math.sin(theta * 3) * 0.08 + jitter(rng, 0.02);
+          const pt = { x: cx + Math.cos(theta) * rx * wob, y: cy + Math.sin(theta) * ry * wob };
+          outerPts.push(pt);
+          trail.push(pt);
+        }
+        addSmoothPolyCurve(b, outerPts);
+        // Inner nucleus circle
+        const nucPts: PenTrailPoint[] = [];
+        for (let i = 0; i <= 14; i++) {
+          const theta = (i / 14) * Math.PI * 2;
+          nucPts.push({
+            x: cx - rx * 0.14 + Math.cos(theta) * rx * 0.28,
+            y: cy - ry * 0.08 + Math.sin(theta) * ry * 0.3,
+          });
+        }
+        addSmoothPolyCurve(b, nucPts);
+        break;
+      }
+      case "atom": {
+        // 3 tilted elliptical electron orbits + central nucleus
+        const orbits = [0, Math.PI / 3, (2 * Math.PI) / 3];
+        const a = Math.min(rx, ry) * 0.96;
+        const bRad = a * 0.38;
+        for (const rot of orbits) {
+          const cosR = Math.cos(rot);
+          const sinR = Math.sin(rot);
+          const pts: PenTrailPoint[] = [];
+          for (let i = 0; i <= 20; i++) {
+            const theta = (i / 20) * Math.PI * 2;
+            const ex = Math.cos(theta) * a;
+            const ey = Math.sin(theta) * bRad;
+            const pt = {
+              x: cx + ex * cosR - ey * sinR + jitter(rng, 0.4),
+              y: cy + ex * sinR + ey * cosR + jitter(rng, 0.4),
+            };
+            pts.push(pt);
+            if (rot === 0) trail.push(pt);
+          }
+          addSmoothPolyCurve(b, pts);
+        }
+        break;
+      }
+      case "wave": {
+        // Baseline + hand-drawn 2-cycle transverse sine wave
+        const x0 = rect.x + 8;
+        const x1 = rect.x + rect.width - 8;
+        const amp = Math.max(8, ry * 0.62);
+        addRoughLine(b, x0, cy, x1, cy, rng, 0.55, false);
+        const pts: PenTrailPoint[] = [];
+        for (let i = 0; i <= 28; i++) {
+          const t = i / 28;
+          const pt = {
+            x: x0 + t * (x1 - x0),
+            y: cy - Math.sin(t * Math.PI * 4) * amp + jitter(rng, 0.5),
+          };
+          pts.push(pt);
+          trail.push(pt);
+        }
+        addSmoothPolyCurve(b, pts);
+        break;
+      }
+      case "tree_node": {
+        const rad = Math.min(rx, ry) * 0.78;
+        const pts: PenTrailPoint[] = [];
+        for (let i = 0; i <= 20; i++) {
+          const theta = -Math.PI * 0.5 + (i / 20) * Math.PI * 2.08;
+          const pt = {
+            x: cx + Math.cos(theta) * rad + jitter(rng, 0.7),
+            y: cy + Math.sin(theta) * rad + jitter(rng, 0.7),
+          };
+          pts.push(pt);
+          trail.push(pt);
+        }
+        addSmoothPolyCurve(b, pts);
+        break;
+      }
+    }
+  });
+
+  return { outlinePath, fillPath, trail };
 }

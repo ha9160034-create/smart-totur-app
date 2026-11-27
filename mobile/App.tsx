@@ -1037,15 +1037,17 @@ function TutorWorkspace() {
   const isPdfOverlayActive = currentStep?.mode === "pdf_overlay";
 
   const topHudInset = insets.top + 62;
-  const bottomHudInset =
+  const bottomHudInset = Math.max(
+    insets.bottom + 140,
     insets.bottom +
-    (result && currentStep && showCaptions
-      ? askExpanded
-        ? 236
-        : 184
-      : askExpanded
-        ? 144
-        : 118);
+      (result && currentStep && showCaptions
+        ? askExpanded
+          ? 236
+          : 184
+        : askExpanded
+          ? 162
+          : 140)
+  );
 
   const activeDocLabel = pdfFile
     ? pdfFile.name.replace(/\.pdf$/i, "")
