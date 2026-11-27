@@ -9,6 +9,7 @@ import {
   ScrollView,
   StatusBar,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   useWindowDimensions,
@@ -27,7 +28,9 @@ import {
   useAudioPlayer,
   useAudioPlayerStatus,
 } from "expo-audio";
+import { CircularWheelPagePicker } from "./src/components/CircularWheelPagePicker";
 import { SmartBoardCanvas } from "./src/components/SmartBoardCanvas";
+import { extractLocalPdfPageCount } from "./src/utils/pdfPageCount";
 import type {
   ExplainSlideResponse,
   TeachingStep,
@@ -248,6 +251,64 @@ function postJson<T>(
   });
 }
 
+interface ActiveLectureMeta {
+  id: string;
+  title: string;
+  totalPages: number;
+  cachedPages: CachedPageSummary[];
+}
+
+interface PdfInfoResponse {
+  total_pages: number;
+  title: string;
+}
+
+/**
+ * Lightweight native XMLHttpRequest upload to POST /api/pdf-info (<20ms PyMuPDF check)
+ * returning authoritative total_pages even for PDF 1.5+ compressed object streams.
+ */
+function uploadPdfForInfo(asset: PickedPdf): Promise<PdfInfoResponse | null> {
+  return new Promise((resolve) => {
+    try {
+      const formData = new FormData();
+      formData.append("file", {
+        uri: asset.uri,
+        name: asset.name ?? "lecture.pdf",
+        type: "application/pdf",
+      } as any);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_BASE_URL}/api/pdf-info`);
+      xhr.timeout = 18_000;
+      xhr.setRequestHeader("Accept", "application/json");
+      if (APP_API_KEY) {
+        xhr.setRequestHeader("X-App-Key", APP_API_KEY);
+      }
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const parsed = JSON.parse(xhr.responseText ?? "") as PdfInfoResponse;
+            if (parsed && typeof parsed.total_pages === "number" && parsed.total_pages >= 1) {
+              resolve(parsed);
+              return;
+            }
+          } catch {
+            // Fall through to null
+          }
+        }
+        resolve(null);
+      };
+      xhr.onerror = () => resolve(null);
+      xhr.ontimeout = () => resolve(null);
+      xhr.onabort = () => resolve(null);
+      xhr.send(formData);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 function TutorWorkspace() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -263,7 +324,10 @@ function TutorWorkspace() {
   const handwrittenFontsReady = Boolean(fontsLoaded && !fontError);
 
   const [pdfFile, setPdfFile] = useState<PickedPdf | null>(null);
-  const [pageInput, setPageInput] = useState<string>("1");
+  const [activeLectureMeta, setActiveLectureMeta] =
+    useState<ActiveLectureMeta | null>(null);
+  const [selectedPage, setSelectedPage] = useState<number>(1);
+  const [totalPages, setTotalPages] = useState<number | null>(null);
   const [boardMode, setBoardMode] = useState<BoardMode>("auto");
   const [useDeepModel, setUseDeepModel] = useState<boolean>(false);
   const [showCaptions, setShowCaptions] = useState<boolean>(false);
@@ -275,20 +339,20 @@ function TutorWorkspace() {
   );
   const [stepIndex, setStepIndex] = useState<number>(0);
 
-  // Recent Lectures Modal State (Supabase persistence)
+  // Stage 16 Popover & Drawer States
+  const [optionsMenuOpen, setOptionsMenuOpen] = useState<boolean>(false);
+  const [pageWheelOpen, setPageWheelOpen] = useState<boolean>(false);
   const [recentModalVisible, setRecentModalVisible] = useState<boolean>(false);
   const [recentLoading, setRecentLoading] = useState<boolean>(false);
   const [recentError, setRecentError] = useState<string | null>(null);
   const [recentLectures, setRecentLectures] = useState<LectureSummary[]>([]);
   const [supabaseConfigured, setSupabaseConfigured] = useState<boolean>(true);
 
-  // Interactive Slide Q&A & Standalone Free-Form AI Tutor (No-PDF Mode) State
-  const [askExpanded, setAskExpanded] = useState<boolean>(false);
-  const [askInput, setAskInput] = useState<string>("");
+  // Unified Bottom Chat Dock State (Free Q&A + Slide Q&A + Explain)
+  const [chatInput, setChatInput] = useState<string>("");
   const [askLoading, setAskLoading] = useState<boolean>(false);
-  const [isFreeMode, setIsFreeMode] = useState<boolean>(false);
+  const [isFreeMode, setIsFreeMode] = useState<boolean>(true);
   const [freeSearchEnabled, setFreeSearchEnabled] = useState<boolean>(true);
-  const [homeAskInput, setHomeAskInput] = useState<string>("");
 
   // Audio-Visual Sync Engine State (expo-audio at 50ms update cadence for smooth progressive drawing)
   const player = useAudioPlayer(null, { updateInterval: 50 });
@@ -298,11 +362,12 @@ function TutorWorkspace() {
   const [playbackSpeed, setPlaybackSpeed] = useState<PlaybackSpeed>(1.0);
   const [replayToken, setReplayToken] = useState<number>(0);
 
-  // Atomic locks: prevent stale didJustFinish skipping & keep iOS AVPlayer auto-playing across steps
+  // Atomic locks: prevent stale didJustFinish skipping & stale PDF info responses
   const advancedFromStepRef = useRef<number | null>(null);
   const shouldAutoPlayRef = useRef<boolean>(false);
   const playbackSpeedRef = useRef<PlaybackSpeed>(1.0);
   const cacheSessionRef = useRef<number>(0);
+  const pdfPickSeqRef = useRef<number>(0);
   // Per-lecture page summary map for seamless cross-page continuity (Page N-1 -> Page N)
   const pageSummariesRef = useRef<Map<number, string>>(new Map());
   // Multi-turn history for standalone Free Q&A whiteboard sessions
@@ -353,7 +418,7 @@ function TutorWorkspace() {
     }
     if (status.duration > 0) {
       const ratio = status.currentTime / status.duration;
-      if (!status.playing && !isPlaying && ratio >= 0.98) {
+      if (!status.playing && !isPlaying && ratio >= 0.95) {
         return 1;
       }
       return Math.max(0, Math.min(1, ratio));
@@ -542,15 +607,51 @@ function TutorWorkspace() {
     }
   };
 
-  const handleCycleBoardMode = () => {
-    // Safeguard #1: Keep whiteboard locked in Free Q&A mode (no empty PDF canvas)
-    if (isFreeMode) return;
-    const idx = BOARD_MODE_CYCLE.indexOf(boardMode);
-    setBoardMode(BOARD_MODE_CYCLE[(idx + 1) % BOARD_MODE_CYCLE.length]);
+  const handleSelectBoardMode = (mode: BoardMode) => {
+    if (!pdfFile && !activeLectureMeta) {
+      setBoardMode("whiteboard");
+      return;
+    }
+    setBoardMode(mode);
+  };
+
+  const handleClearBoard = () => {
+    setOptionsMenuOpen(false);
+    setPageWheelOpen(false);
+    shouldAutoPlayRef.current = false;
+    setIsPlaying(false);
+    advancedFromStepRef.current = 0;
+    try {
+      player.pause();
+    } catch {
+      // Ignore if idle
+    }
+    // Refinement #3: Clear canvas drawings, audio state, result & freeHistoryRef
+    // while preserving any currently attached PDF chip (pdfFile / activeLectureMeta)
+    setResult(null);
+    setStepAudioUris([]);
+    setStepIndex(0);
+    setError(null);
+    setChatInput("");
+    freeHistoryRef.current = [];
+    setIsFreeMode(!pdfFile && !activeLectureMeta);
+  };
+
+  const handleDetachPdf = () => {
+    pdfPickSeqRef.current += 1;
+    setPdfFile(null);
+    setActiveLectureMeta(null);
+    setTotalPages(null);
+    setSelectedPage(1);
+    setPageWheelOpen(false);
+    setIsFreeMode(true);
+    setBoardMode("whiteboard");
   };
 
   const handlePickPdf = async () => {
     setError(null);
+    setOptionsMenuOpen(false);
+    setPageWheelOpen(false);
     try {
       const picked = await DocumentPicker.getDocumentAsync({
         type: "application/pdf",
@@ -563,11 +664,35 @@ function TutorWorkspace() {
       }
 
       const asset = picked.assets[0];
-      pageSummariesRef.current.clear();
-      setPdfFile({
+      const nextPdf: PickedPdf = {
         uri: asset.uri,
         name: asset.name ?? "lecture.pdf",
         mimeType: asset.mimeType ?? "application/pdf",
+      };
+
+      const pickSeq = ++pdfPickSeqRef.current;
+      pageSummariesRef.current.clear();
+      setPdfFile(nextPdf);
+      setActiveLectureMeta(null);
+      setIsFreeMode(false);
+      setSelectedPage(1);
+      setTotalPages(null);
+
+      // Run instant local PDF page estimator + authoritative <20ms PyMuPDF /api/pdf-info in parallel
+      let resolvedByServer = false;
+      void extractLocalPdfPageCount(nextPdf.uri).then((localCount) => {
+        if (pickSeq !== pdfPickSeqRef.current || resolvedByServer) return;
+        if (localCount && localCount >= 1) {
+          setTotalPages((prev) => prev ?? localCount);
+        }
+      });
+
+      void uploadPdfForInfo(nextPdf).then((info) => {
+        if (pickSeq !== pdfPickSeqRef.current) return;
+        if (info && info.total_pages >= 1) {
+          resolvedByServer = true;
+          setTotalPages(info.total_pages);
+        }
       });
     } catch (err) {
       setError(
@@ -634,25 +759,40 @@ function TutorWorkspace() {
       summaryParts.join(" | ").slice(0, 650)
     );
 
+    const stampedInitialData: ExplainSlideWithAudioResponse = {
+      ...data,
+      plan: {
+        ...data.plan,
+        steps: data.plan.steps.map((step) => ({
+          ...step,
+          turnIndex: step.turnIndex ?? 0,
+        })),
+      },
+    };
+
     const cachedUris = await preCacheStepAudios(
-      data.plan.steps,
-      data.step_audio
+      stampedInitialData.plan.steps,
+      stampedInitialData.step_audio
     );
 
-    setAskExpanded(false);
-    setAskInput("");
+    if (stampedInitialData.total_pages >= 1 && !isFreeMode) {
+      setTotalPages(stampedInitialData.total_pages);
+      setSelectedPage(stampedInitialData.page_number);
+    }
+
     shouldAutoPlayRef.current = true;
     advancedFromStepRef.current = 0;
     setIsPlaying(Boolean(cachedUris[0]));
     setStepAudioUris(cachedUris);
-    setResult(data);
+    setResult(stampedInitialData);
     setStepIndex(0);
     setReplayToken((t) => t + 1);
+    return stampedInitialData;
   };
 
-  const handleStartFreeAsk = async () => {
+  const handleStartFreeAsk = async (questionText?: string) => {
     if (loading || askLoading) return;
-    const cleanedQuestion = homeAskInput.trim();
+    const cleanedQuestion = (questionText ?? chatInput).trim();
     if (!cleanedQuestion) return;
 
     Keyboard.dismiss();
@@ -695,10 +835,9 @@ function TutorWorkspace() {
         .slice(0, 420);
       freeHistoryRef.current = [{ question: cleanedQuestion, summary: turnSummary }];
 
-      setHomeAskInput("");
+      setChatInput("");
       await activateSlideResponse(data);
     } catch (err) {
-      setIsFreeMode(false);
       setError(
         err instanceof Error ? err.message : "Failed to answer question."
       );
@@ -707,9 +846,14 @@ function TutorWorkspace() {
     }
   };
 
-  const handleAskQuestion = async () => {
-    if (!result || askLoading) return;
-    const cleanedQuestion = askInput.trim();
+  const handleAskQuestion = async (
+    questionOverride?: string,
+    baseResultOverride?: ExplainSlideWithAudioResponse | null,
+    targetPageOverride?: number
+  ) => {
+    const activeResult = baseResultOverride ?? result;
+    if (!activeResult || askLoading) return;
+    const cleanedQuestion = (questionOverride ?? chatInput).trim();
     if (!cleanedQuestion) return;
 
     Keyboard.dismiss();
@@ -726,10 +870,12 @@ function TutorWorkspace() {
     }
 
     try {
-      const existingSteps = result.plan.steps;
+      const existingSteps = activeResult.plan.steps;
+      const askFreeSession =
+        !baseResultOverride && isFreeMode && !pdfFile && !activeLectureMeta;
       let qaData: ExplainSlideWithAudioResponse;
 
-      if (isFreeMode) {
+      if (askFreeSession) {
         qaData = await postJson<ExplainSlideWithAudioResponse>(
           `${API_BASE_URL}/api/ask-free`,
           {
@@ -741,7 +887,7 @@ function TutorWorkspace() {
         );
       } else {
         const contextLines = [
-          `Slide Title: ${result.plan.title}`,
+          `Slide Title: ${activeResult.plan.title}`,
           ...existingSteps
             .slice(-6)
             .map((s) => `Step ${s.step_id}: ${s.speech_ar}`),
@@ -751,8 +897,8 @@ function TutorWorkspace() {
         qaData = await postJson<ExplainSlideWithAudioResponse>(
           `${API_BASE_URL}/api/ask`,
           {
-            lecture_id: result.lecture_id ?? null,
-            page_number: result.page_number,
+            lecture_id: activeResult.lecture_id ?? activeLectureMeta?.id ?? null,
+            page_number: targetPageOverride ?? activeResult.page_number ?? selectedPage,
             question: cleanedQuestion,
             board_mode: boardMode,
             current_plan_context: currentPlanContext,
@@ -765,7 +911,7 @@ function TutorWorkspace() {
         throw new Error("Server returned an empty Q&A explanation.");
       }
 
-      if (isFreeMode) {
+      if (askFreeSession) {
         const turnSummary = [
           qaData.plan.title,
           ...qaData.plan.steps.slice(0, 3).map((s) => s.speech_ar.trim().slice(0, 95)),
@@ -779,12 +925,15 @@ function TutorWorkspace() {
         ];
       }
 
-      // Renumber incoming Q&A step_ids sequentially after existing steps for clean canvas keys
+      // Renumber incoming Q&A step_ids sequentially and stamp chronological turnIndex
       const startIndex = existingSteps.length;
+      const nextTurnIndex =
+        (existingSteps[existingSteps.length - 1]?.turnIndex ?? 0) + 1;
       const renumberedSteps: TeachingStep[] = qaData.plan.steps.map(
         (step, idx) => ({
           ...step,
           step_id: startIndex + idx + 1,
+          turnIndex: nextTurnIndex,
         })
       );
       const alignedAudioPayloads: StepAudioPayload[] = renumberedSteps.map(
@@ -810,25 +959,25 @@ function TutorWorkspace() {
         alignedAudioPayloads
       );
 
-      setAskInput("");
-      setAskExpanded(false);
+      setChatInput("");
       shouldAutoPlayRef.current = true;
       advancedFromStepRef.current = startIndex;
       setIsPlaying(Boolean(newCachedUris[0]));
 
       setResult((prev) => {
-        if (!prev) return prev;
+        const base = prev ?? activeResult;
+        if (!base) return prev;
         return {
-          ...prev,
+          ...base,
           plan: {
-            ...prev.plan,
-            steps: [...prev.plan.steps, ...renumberedSteps],
+            ...base.plan,
+            steps: [...base.plan.steps, ...renumberedSteps],
             quiz_question_ar:
-              qaData.plan.quiz_question_ar || prev.plan.quiz_question_ar,
-            sources: qaData.plan.sources ?? prev.plan.sources,
+              qaData.plan.quiz_question_ar || base.plan.quiz_question_ar,
+            sources: qaData.plan.sources ?? base.plan.sources,
           },
           step_audio: [
-            ...(prev.step_audio ?? []),
+            ...(base.step_audio ?? []),
             ...alignedAudioPayloads,
           ],
         };
@@ -864,6 +1013,8 @@ function TutorWorkspace() {
   };
 
   const handleOpenRecentLectures = () => {
+    setOptionsMenuOpen(false);
+    setPageWheelOpen(false);
     setRecentModalVisible(true);
     void fetchRecentLectures();
   };
@@ -873,6 +1024,8 @@ function TutorWorkspace() {
     cachedPage: CachedPageSummary
   ) => {
     setRecentModalVisible(false);
+    setOptionsMenuOpen(false);
+    setPageWheelOpen(false);
     shouldAutoPlayRef.current = false;
     setIsPlaying(false);
     advancedFromStepRef.current = 0;
@@ -886,11 +1039,19 @@ function TutorWorkspace() {
       pageSummariesRef.current.clear();
     }
 
+    setPdfFile(null);
+    setActiveLectureMeta({
+      id: lecture.id,
+      title: lecture.title,
+      totalPages: Math.max(1, lecture.total_pages || 1),
+      cachedPages: lecture.cached_pages ?? [],
+    });
     setIsFreeMode(false);
     freeHistoryRef.current = [];
     setLoading(true);
     setError(null);
-    setPageInput(String(cachedPage.page_number));
+    setSelectedPage(cachedPage.page_number);
+    setTotalPages(Math.max(1, lecture.total_pages || 1));
     setBoardMode(cachedPage.board_mode);
     setUseDeepModel(cachedPage.use_deep_model);
 
@@ -914,17 +1075,15 @@ function TutorWorkspace() {
     }
   };
 
-  const handleExplain = async () => {
+  const handleExplain = async (
+    overridePage?: number
+  ): Promise<ExplainSlideWithAudioResponse | null> => {
     if (!pdfFile) {
-      setError("Please select a lecture PDF first.");
-      return;
+      setError("Please attach a lecture PDF first using +.");
+      return null;
     }
 
-    const pageNumber = parseInt(pageInput.trim(), 10);
-    if (!Number.isFinite(pageNumber) || pageNumber < 1) {
-      setError("Enter a valid 1-based page number (e.g. 1, 2, 3).");
-      return;
-    }
+    const pageNumber = Math.max(1, Math.floor(overridePage ?? selectedPage));
 
     // Pause any playing audio and lock auto-advance before fetching the new slide
     shouldAutoPlayRef.current = false;
@@ -1023,11 +1182,122 @@ function TutorWorkspace() {
         }
       );
 
-      await activateSlideResponse(data);
+      const activated = await activateSlideResponse(data);
+      return activated;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Network request failed.");
+      return null;
     } finally {
       setLoading(false);
+    }
+  };
+
+  /**
+   * Unified Smart Send Router (Stage 16 + Refinement #2):
+   * - No PDF attached & non-empty text -> /api/ask-free (initial or follow-up)
+   * - PDF attached & empty text -> Explain selectedPage (or load cached page)
+   * - PDF attached & non-empty text:
+   *     * If !result yet (or page changed on local PDF), run handleExplain(selectedPage)
+   *       first to initialize lecture/slide context and IMMEDIATELY chain POST /api/ask
+   *       with the user's typed question so no prompt is ever dropped!
+   */
+  const handleUnifiedSend = async () => {
+    if (loading || askLoading) return;
+    setOptionsMenuOpen(false);
+    setPageWheelOpen(false);
+    const trimmed = chatInput.trim();
+    const attached = Boolean(pdfFile || activeLectureMeta);
+
+    if (!attached) {
+      if (!trimmed) return;
+      if (!result || !isFreeMode) {
+        await handleStartFreeAsk(trimmed);
+      } else {
+        await handleAskQuestion(trimmed);
+      }
+      return;
+    }
+
+    // PDF or cached lecture attached + EMPTY input -> Explain selectedPage
+    if (!trimmed) {
+      if (pdfFile) {
+        await handleExplain(selectedPage);
+        return;
+      }
+      if (activeLectureMeta) {
+        const cachedMatch = activeLectureMeta.cachedPages.find(
+          (cp) => cp.page_number === selectedPage
+        );
+        if (cachedMatch) {
+          await handleSelectCachedPage(
+            {
+              id: activeLectureMeta.id,
+              title: activeLectureMeta.title,
+              total_pages: activeLectureMeta.totalPages,
+              cached_page_numbers: activeLectureMeta.cachedPages.map(
+                (p) => p.page_number
+              ),
+              cached_pages: activeLectureMeta.cachedPages,
+            },
+            cachedMatch
+          );
+          return;
+        }
+        setError(
+          `Page ${selectedPage} is not cached yet. Tap + to attach the PDF file to explain it, or type a question.`
+        );
+      }
+      return;
+    }
+
+    // PDF or cached lecture attached + NON-EMPTY question
+    if (pdfFile) {
+      // Refinement #2: Initialize slide/lecture context via handleExplain first when !result
+      // (or when switching to a new page), then immediately chain /api/ask with their question
+      const needsExplainFirst =
+        !result || isFreeMode || result.page_number !== selectedPage;
+      if (needsExplainFirst) {
+        const explained = await handleExplain(selectedPage);
+        if (explained) {
+          await handleAskQuestion(trimmed, explained, selectedPage);
+        }
+        return;
+      }
+      await handleAskQuestion(trimmed, result, selectedPage);
+      return;
+    }
+
+    // Cached lecture from Recent + typed question
+    if (activeLectureMeta) {
+      if (result && !isFreeMode) {
+        await handleAskQuestion(trimmed, result, selectedPage);
+      } else {
+        // Ask directly against the cached lecture's Supabase RAG chunks & page
+        Keyboard.dismiss();
+        setAskLoading(true);
+        setError(null);
+        try {
+          const qaData = await postJson<ExplainSlideWithAudioResponse>(
+            `${API_BASE_URL}/api/ask`,
+            {
+              lecture_id: activeLectureMeta.id,
+              page_number: selectedPage,
+              question: trimmed,
+              board_mode: boardMode,
+              current_plan_context: `Lecture: ${activeLectureMeta.title}, Page ${selectedPage}`,
+            },
+            REQUEST_TIMEOUT_MS
+          );
+          setChatInput("");
+          await activateSlideResponse(qaData);
+        } catch (err) {
+          setError(
+            err instanceof Error ? err.message : "Failed to answer question."
+          );
+        } finally {
+          setAskLoading(false);
+        }
+      }
     }
   };
 
@@ -1036,22 +1306,26 @@ function TutorWorkspace() {
   const isLastStep = steps.length > 0 && stepIndex === steps.length - 1;
   const isPdfOverlayActive = currentStep?.mode === "pdf_overlay";
 
-  const topHudInset = insets.top + 62;
+  const hasAttachedPdf = Boolean(pdfFile || activeLectureMeta);
+  const attachedPdfName = pdfFile?.name || activeLectureMeta?.title || "";
+  const effectiveTotalPages = Math.max(
+    1,
+    totalPages ?? activeLectureMeta?.totalPages ?? result?.total_pages ?? 1
+  );
+  const isBoardModeLocked = !hasAttachedPdf;
+  const isBusy = loading || askLoading;
+  const canSend = !isBusy && (hasAttachedPdf || chatInput.trim().length > 0);
+
+  const topHudInset = insets.top + 90;
+  const activeBottomStackHeight =
+    72 + // Unified chat dock
+    (hasAttachedPdf ? 42 : 0) + // Dynamic PDF filename + P. X / N chip row
+    (result && currentStep ? 48 : 0) + // Slim light playback strip
+    (result && currentStep && showCaptions ? 92 : 0); // Captions card
   const bottomHudInset = Math.max(
     insets.bottom + 140,
-    insets.bottom +
-      (result && currentStep && showCaptions
-        ? askExpanded
-          ? 236
-          : 184
-        : askExpanded
-          ? 162
-          : 140)
+    insets.bottom + activeBottomStackHeight
   );
-
-  const activeDocLabel = pdfFile
-    ? pdfFile.name.replace(/\.pdf$/i, "")
-    : result?.plan.title ?? "Pick PDF";
 
   return (
     <View style={styles.root}>
@@ -1060,7 +1334,7 @@ function TutorWorkspace() {
       />
 
       {/* ================================================================= */}
-      {/* LAYER 0: 100% Full-Screen Interactive Pan & Zoom Spatial Canvas   */}
+      {/* LAYER 0: 100% Full-Screen Clean #FAF8F5 Paper / Spatial Canvas    */}
       {/* ================================================================= */}
       <View style={styles.canvasFullScreen}>
         {result && currentStep ? (
@@ -1080,243 +1354,141 @@ function TutorWorkspace() {
             bottomInset={bottomHudInset}
           />
         ) : (
-          <KeyboardAvoidingView
-            behavior={Platform.OS === "ios" ? "padding" : "height"}
-            style={styles.emptyPaperStage}
-          >
-            <ScrollView
-              style={styles.emptyPaperScroll}
-              contentContainerStyle={styles.emptyPaperScrollContent}
-              keyboardShouldPersistTaps="handled"
-              showsVerticalScrollIndicator={false}
-            >
-              <View
-                style={[
-                  styles.welcomeCard,
-                  { maxWidth: isTablet ? 460 : 380 },
-                ]}
-              >
-                <Text style={styles.welcomeBadge}>SPATIAL AI WHITEBOARD</Text>
-                <Text style={styles.welcomeTitle}>AI Smart Whiteboard Tutor</Text>
-                <Text style={styles.welcomeSub}>
-                  Select a lecture PDF or open a cached lecture to explore
-                  step-by-step explanations on an interactive pan & zoom paper
-                  canvas.
-                </Text>
-
-                <View style={styles.welcomeActions}>
-                  <Pressable
-                    style={styles.welcomePrimaryBtn}
-                    onPress={handlePickPdf}
-                  >
-                    <Text style={styles.welcomePrimaryText}>
-                      {pdfFile ? "Change Lecture PDF" : "Select Lecture PDF"}
-                    </Text>
-                  </Pressable>
-
-                  <Pressable
-                    style={styles.welcomeSecondaryBtn}
-                    onPress={handleOpenRecentLectures}
-                  >
-                    <Text style={styles.welcomeSecondaryText}>
-                      Recent Lectures
-                    </Text>
-                  </Pressable>
-                </View>
-
-                {pdfFile && (
-                  <Text style={styles.welcomeSelectedNote} numberOfLines={1}>
-                    Ready: {pdfFile.name} • Page {pageInput || "1"}
-                  </Text>
-                )}
-              </View>
-
-              {/* Minimalist Free-Form AI Tutor Chat Bar (No PDF Required) */}
-              <View
-                style={[
-                  styles.homeAskPill,
-                  { maxWidth: isTablet ? 460 : 380 },
-                ]}
-              >
-                <Pressable
-                  style={[
-                    styles.webToggleBtn,
-                    freeSearchEnabled && styles.webToggleBtnActive,
-                  ]}
-                  onPress={() => setFreeSearchEnabled((v) => !v)}
-                  disabled={loading}
-                  accessibilityLabel="Toggle web search sources"
-                >
-                  <Text
-                    style={[
-                      styles.webToggleIcon,
-                      freeSearchEnabled && styles.webToggleIconActive,
-                    ]}
-                  >
-                    🌐
-                  </Text>
-                </Pressable>
-
-                <TextInput
-                  value={homeAskInput}
-                  onChangeText={setHomeAskInput}
-                  placeholder="اسأل أي سؤال"
-                  placeholderTextColor="#94A3B8"
-                  style={styles.homeAskInput}
-                  returnKeyType="send"
-                  editable={!loading}
-                  onSubmitEditing={() => void handleStartFreeAsk()}
-                />
-
-                <Pressable
-                  style={[
-                    styles.askSendBtn,
-                    (!homeAskInput.trim() || loading) && styles.dockDisabled,
-                  ]}
-                  onPress={() => void handleStartFreeAsk()}
-                  disabled={!homeAskInput.trim() || loading}
-                  accessibilityLabel="Send question"
-                >
-                  {loading ? (
-                    <ActivityIndicator size="small" color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.askSendBtnText}>↑</Text>
-                  )}
-                </Pressable>
-              </View>
-            </ScrollView>
-          </KeyboardAvoidingView>
+          <Pressable
+            style={styles.emptyCleanPaper}
+            onPress={() => {
+              Keyboard.dismiss();
+              setOptionsMenuOpen(false);
+              setPageWheelOpen(false);
+            }}
+            accessibilityLabel="Open whiteboard paper canvas"
+          />
         )}
       </View>
 
       {/* ================================================================= */}
-      {/* LAYER 1: Top Floating Spatial HUD (box-none passes pan/zoom)      */}
+      {/* LAYER 1: Decluttered 2-Pill Top Header (Recent | Options ▾)       */}
       {/* ================================================================= */}
       <View
         pointerEvents="box-none"
-        style={[styles.topHudOuter, { top: insets.top + 8 }]}
+        style={[styles.topHudOuter, { top: insets.top + 10 }]}
       >
         <View
           pointerEvents="box-none"
-          style={[
-            styles.topHudRow,
-            { maxWidth: hudMaxWidth },
-          ]}
+          style={[styles.topHudRow, { maxWidth: hudMaxWidth }]}
         >
-          {/* Top-Left Subtle Pill: PDF Title + Page Selector + Recent */}
-          <View style={styles.topLeftPill}>
-            <Pressable style={styles.docChip} onPress={handlePickPdf}>
-              <Text style={styles.docChipText} numberOfLines={1}>
-                {activeDocLabel}
-              </Text>
-            </Pressable>
+          {/* Top-Left: Single Sleek Recent Pill */}
+          <Pressable
+            style={styles.headerPillBtn}
+            onPress={handleOpenRecentLectures}
+            accessibilityLabel="Open recent lectures"
+          >
+            <Text style={styles.headerPillIcon}>◷</Text>
+            <Text style={styles.headerPillText}>Recent</Text>
+          </Pressable>
 
-            {result?.cached && (
-              <View style={styles.cachedPill}>
-                <Text style={styles.cachedPillText}>Cached ⚡</Text>
-              </View>
-            )}
-
-            <View style={styles.pillDivider} />
-
-            {isFreeMode ? (
-              <View style={styles.freeModeBadge}>
-                <Text style={styles.freeModeBadgeText}>Free Q&A</Text>
-              </View>
-            ) : (
-              <View style={styles.pageMiniGroup}>
-                <Text style={styles.pageMiniPrefix}>P.</Text>
-                <TextInput
-                  value={pageInput}
-                  onChangeText={setPageInput}
-                  keyboardType="number-pad"
-                  maxLength={4}
-                  style={styles.pageMiniInput}
-                  placeholder="1"
-                  placeholderTextColor="#94A3B8"
-                  returnKeyType="go"
-                  onSubmitEditing={() => {
-                    if (pdfFile && !loading) void handleExplain();
-                  }}
-                />
-              </View>
-            )}
-
-            <View style={styles.pillDivider} />
-
-            <Pressable
-              style={styles.recentMiniBtn}
-              onPress={handleOpenRecentLectures}
-            >
-              <Text style={styles.recentMiniText}>Recent</Text>
-            </Pressable>
-          </View>
-
-          {/* Top-Right Compact Circular Icons: Mode, Deep, Captions */}
-          <View style={styles.topRightIcons}>
-            <Pressable
-              style={[
-                styles.circleIconBtn,
-                (isFreeMode || boardMode !== "auto") && styles.circleIconBtnBlue,
-                isFreeMode && styles.circleIconBtnLocked,
-              ]}
-              onPress={handleCycleBoardMode}
-              disabled={isFreeMode}
-              accessibilityLabel={
-                isFreeMode
-                  ? "Whiteboard mode locked in Free Q&A"
-                  : "Toggle board mode"
-              }
-            >
-              <Text
-                style={[
-                  styles.circleIconLabel,
-                  (isFreeMode || boardMode !== "auto") &&
-                    styles.circleIconLabelActive,
-                ]}
-              >
-                {isFreeMode ? "WB" : BOARD_MODE_SHORT_LABELS[boardMode]}
-              </Text>
-            </Pressable>
-
-            <Pressable
-              style={[
-                styles.circleIconBtn,
-                useDeepModel && styles.circleIconBtnDeep,
-              ]}
-              onPress={() => setUseDeepModel((v) => !v)}
-              accessibilityLabel="Toggle deep reasoning mode"
-            >
-              <Text
-                style={[
-                  styles.circleIconSymbol,
-                  useDeepModel && styles.circleIconLabelActive,
-                ]}
-              >
-                ✦
-              </Text>
-            </Pressable>
-
-            <Pressable
-              style={[
-                styles.circleIconBtn,
-                showCaptions && styles.circleIconBtnDark,
-              ]}
-              onPress={() => setShowCaptions((v) => !v)}
-              accessibilityLabel="Toggle captions"
-            >
-              <Text
-                style={[
-                  styles.circleIconLabel,
-                  showCaptions && styles.circleIconLabelActive,
-                ]}
-              >
-                CC
-              </Text>
-            </Pressable>
-          </View>
+          {/* Top-Right: Single Sleek Options ▾ Pill */}
+          <Pressable
+            style={[
+              styles.headerPillBtn,
+              optionsMenuOpen && styles.headerPillBtnActive,
+            ]}
+            onPress={() => {
+              setPageWheelOpen(false);
+              setOptionsMenuOpen((v) => !v);
+            }}
+            accessibilityLabel="Open board options"
+          >
+            <Text style={styles.headerPillIcon}>☰</Text>
+            <Text style={styles.headerPillText}>Options</Text>
+            <Text style={styles.headerPillChevron}>
+              {optionsMenuOpen ? "▴" : "▾"}
+            </Text>
+          </Pressable>
         </View>
       </View>
+
+      {/* ================================================================= */}
+      {/* LAYER 1B: Floating White Options Popover (Auto-Closes Outside)    */}
+      {/* ================================================================= */}
+      {optionsMenuOpen && (
+        <View style={styles.popoverOverlayRoot} pointerEvents="box-none">
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => setOptionsMenuOpen(false)}
+            accessibilityLabel="Close options menu"
+          />
+          <View
+            pointerEvents="box-none"
+            style={[styles.optionsAnchorWrap, { top: insets.top + 54 }]}
+          >
+            <View style={styles.optionsPopoverCard}>
+              {/* Row 1: Board Mode (AUTO | WB | PDF, locked to WB when no PDF loaded) */}
+              <View style={styles.optionsRow}>
+                <View style={styles.optionsLabelCol}>
+                  <Text style={styles.optionsRowLabel}>Board Mode</Text>
+                  {isBoardModeLocked && (
+                    <Text style={styles.optionsSubHint}>WB locked (No PDF)</Text>
+                  )}
+                </View>
+                <View style={styles.modeSegmentWrap}>
+                  {BOARD_MODE_CYCLE.map((mode) => {
+                    const effectiveSelected = isBoardModeLocked
+                      ? mode === "whiteboard"
+                      : boardMode === mode;
+                    const disabled = isBoardModeLocked && mode !== "whiteboard";
+                    return (
+                      <Pressable
+                        key={mode}
+                        style={[
+                          styles.modeSegmentBtn,
+                          effectiveSelected && styles.modeSegmentBtnActive,
+                          disabled && styles.modeSegmentBtnDisabled,
+                        ]}
+                        onPress={() => handleSelectBoardMode(mode)}
+                        disabled={disabled}
+                      >
+                        <Text
+                          style={[
+                            styles.modeSegmentText,
+                            effectiveSelected && styles.modeSegmentTextActive,
+                            disabled && styles.modeSegmentTextDisabled,
+                          ]}
+                        >
+                          {BOARD_MODE_SHORT_LABELS[mode]}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+
+              {/* Row 2: Captions (CC) Toggle Switch */}
+              <View style={styles.optionsRow}>
+                <Text style={styles.optionsRowLabel}>Captions (CC)</Text>
+                <Switch
+                  value={showCaptions}
+                  onValueChange={setShowCaptions}
+                  trackColor={{ false: "#E2E8F0", true: "#93C5FD" }}
+                  thumbColor={showCaptions ? "#2563EB" : "#FFFFFF"}
+                  ios_backgroundColor="#E2E8F0"
+                />
+              </View>
+
+              {/* Thin Divider + Row 3: Clear Board Action */}
+              <View style={styles.optionsDivider} />
+              <Pressable
+                style={styles.clearBoardRow}
+                onPress={handleClearBoard}
+                accessibilityLabel="Clear whiteboard"
+              >
+                <Text style={styles.clearBoardIcon}>⌫</Text>
+                <Text style={styles.clearBoardText}>Clear Board</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      )}
 
       {/* Dismissible Floating Error Toast */}
       {error && (
@@ -1337,162 +1509,70 @@ function TutorWorkspace() {
       )}
 
       {/* ================================================================= */}
-      {/* LAYER 2: Collapsible Compact Captions Strip (Above Ask + Dock)    */}
+      {/* LAYER 2: Unified Bottom Stack (Captions, Slim Player, PDF Chip,   */}
+      {/*          & Unified Bottom Chat Dock with + and Smart Glowing ↑)   */}
       {/* ================================================================= */}
-      {result && currentStep && showCaptions && (
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        pointerEvents="box-none"
+        style={[styles.bottomStackOuter, { bottom: insets.bottom + 10 }]}
+      >
         <View
           pointerEvents="box-none"
-          style={[
-            styles.captionStripWrap,
-            { bottom: insets.bottom + (askExpanded ? 132 : 114) },
-          ]}
+          style={[styles.bottomStackInner, { maxWidth: hudMaxWidth }]}
         >
-          <View
-            style={[
-              styles.captionStripCard,
-              { maxWidth: hudMaxWidth },
-            ]}
-          >
-            <ScrollView
-              style={styles.captionScroll}
-              showsVerticalScrollIndicator={false}
-            >
-              <Text style={styles.captionSpeechAr}>
-                {formatBidiArabicCaption(currentStep.speech_ar)}
-              </Text>
-
-              {isLastStep && !!result.plan.quiz_question_ar && (
-                <View style={styles.captionQuizRow}>
-                  <Text style={styles.captionQuizText}>
-                    سؤال تطبيقي: {formatBidiArabicCaption(result.plan.quiz_question_ar)}
-                  </Text>
-                </View>
-              )}
-            </ScrollView>
-          </View>
-        </View>
-      )}
-
-      {/* ================================================================= */}
-      {/* LAYER 2B: Collapsible "Ask Anything..." Spatial Pill              */}
-      {/* ================================================================= */}
-      {result && currentStep && !loading && (
-        <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : "height"}
-          pointerEvents="box-none"
-          style={[styles.askOverlayWrap, { bottom: insets.bottom + 72 }]}
-        >
-          <View
-            pointerEvents="box-none"
-            style={[styles.askOverlayInner, { maxWidth: hudMaxWidth }]}
-          >
-            {askExpanded ? (
-              <View style={styles.askExpandedPill}>
-                {isFreeMode && (
-                  <Pressable
-                    style={[
-                      styles.webToggleBtn,
-                      freeSearchEnabled && styles.webToggleBtnActive,
-                    ]}
-                    onPress={() => setFreeSearchEnabled((v) => !v)}
-                    disabled={askLoading}
-                    accessibilityLabel="Toggle web search sources"
-                  >
-                    <Text
-                      style={[
-                        styles.webToggleIcon,
-                        freeSearchEnabled && styles.webToggleIconActive,
-                      ]}
-                    >
-                      🌐
-                    </Text>
-                  </Pressable>
-                )}
-                <TextInput
-                  value={askInput}
-                  onChangeText={setAskInput}
-                  placeholder={
-                    isFreeMode
-                      ? "اسأل سؤال متابعة..."
-                      : "Ask anything about this slide..."
-                  }
-                  placeholderTextColor="#94A3B8"
-                  style={styles.askTextInput}
-                  returnKeyType="send"
-                  editable={!askLoading}
-                  autoFocus
-                  onSubmitEditing={() => void handleAskQuestion()}
-                />
-                <Pressable
-                  style={[
-                    styles.askSendBtn,
-                    (!askInput.trim() || askLoading) && styles.dockDisabled,
-                  ]}
-                  onPress={() => void handleAskQuestion()}
-                  disabled={!askInput.trim() || askLoading}
-                >
-                  {askLoading ? (
-                    <ActivityIndicator size="small" color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.askSendBtnText}>↑</Text>
-                  )}
-                </Pressable>
-                <Pressable
-                  style={styles.askCloseBtn}
-                  onPress={() => {
-                    Keyboard.dismiss();
-                    setAskExpanded(false);
-                  }}
-                  disabled={askLoading}
-                >
-                  <Text style={styles.askCloseBtnText}>✕</Text>
-                </Pressable>
-              </View>
-            ) : (
-              <Pressable
-                style={styles.askCollapsedPill}
-                onPress={() => setAskExpanded(true)}
+          {/* 2A. Compact Arabic Captions Strip (Only when active & CC enabled) */}
+          {result && currentStep && showCaptions && (
+            <View style={styles.captionStripCard}>
+              <ScrollView
+                style={styles.captionScroll}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
               >
-                <Text style={styles.askCollapsedText}>✦ Ask anything...</Text>
-              </Pressable>
-            )}
-          </View>
-        </KeyboardAvoidingView>
-      )}
+                <Text style={styles.captionSpeechAr}>
+                  {formatBidiArabicCaption(currentStep.speech_ar)}
+                </Text>
 
-      {/* ================================================================= */}
-      {/* LAYER 3: Bottom Floating Dark Pill Bar (Playback + Upload/Explain)*/}
-      {/* ================================================================= */}
-      <View
-        pointerEvents="box-none"
-        style={[styles.bottomDockWrap, { bottom: insets.bottom + 10 }]}
-      >
-        <View style={[styles.bottomDarkPill, { maxWidth: hudMaxWidth }]}>
-          {loading ? (
-            <View style={styles.dockLoadingRow}>
-              <ActivityIndicator size="small" color="#F8FAFC" />
-              <Text style={styles.dockLoadingText}>
-                {isFreeMode
-                  ? freeSearchEnabled
-                    ? "Researching & voicing explanation..."
-                    : "Thinking & voicing explanation..."
-                  : `Analyzing & voicing page ${pageInput || "1"}...`}
+                {isLastStep && !!result.plan.quiz_question_ar && (
+                  <View style={styles.captionQuizRow}>
+                    <Text style={styles.captionQuizText}>
+                      سؤال تطبيقي:{" "}
+                      {formatBidiArabicCaption(result.plan.quiz_question_ar)}
+                    </Text>
+                  </View>
+                )}
+              </ScrollView>
+            </View>
+          )}
+
+          {/* 2B. Slim Light Playback / Status Strip (Only while loading or lecture active) */}
+          {isBusy ? (
+            <View style={styles.slimStatusPill}>
+              <ActivityIndicator size="small" color="#2563EB" />
+              <Text style={styles.slimStatusText} numberOfLines={1}>
+                {askLoading
+                  ? "Answering & voicing follow-up..."
+                  : hasAttachedPdf
+                    ? `Analyzing & voicing page ${selectedPage}...`
+                    : freeSearchEnabled
+                      ? "Researching & voicing explanation..."
+                      : "Thinking & voicing explanation..."}
               </Text>
             </View>
           ) : result && currentStep ? (
-            <>
+            <View style={styles.slimPlayerPill}>
               <Pressable
-                style={[styles.dockJumpBtn, !canGoPrev && styles.dockDisabled]}
+                style={[styles.playerJumpBtn, !canGoPrev && styles.dockDisabled]}
                 onPress={() => canGoPrev && handleSelectStep(stepIndex - 1)}
                 disabled={!canGoPrev}
                 accessibilityLabel="Previous step"
               >
-                <Text style={styles.dockJumpText}>‹</Text>
+                <Text style={styles.playerJumpText}>‹</Text>
               </Pressable>
 
               <Pressable
                 style={[
-                  styles.dockPlayBtn,
+                  styles.playerPlayBtn,
                   !currentStepAudioUri && styles.dockDisabled,
                 ]}
                 onPress={handleTogglePlayPause}
@@ -1501,25 +1581,25 @@ function TutorWorkspace() {
                   isPlaying || status.playing ? "Pause lecture" : "Play lecture"
                 }
               >
-                <Text style={styles.dockPlayText}>
+                <Text style={styles.playerPlayText}>
                   {isPlaying || status.playing ? "⏸" : "▶"}
                 </Text>
               </Pressable>
 
               <Pressable
-                style={styles.dockIconBtn}
+                style={styles.playerReplayBtn}
                 onPress={handleReplayStep}
                 accessibilityLabel="Replay current step"
               >
-                <Text style={styles.dockReplayText}>↺</Text>
+                <Text style={styles.playerReplayText}>↺</Text>
               </Pressable>
 
-              {/* Unified Continuous Lecture Progress Bar */}
-              <View style={styles.dockProgressWrap}>
-                <View style={styles.dockProgressTrack}>
+              {/* Continuous Lecture Progress Bar */}
+              <View style={styles.playerProgressWrap}>
+                <View style={styles.playerProgressTrack}>
                   <View
                     style={[
-                      styles.dockProgressFill,
+                      styles.playerProgressFill,
                       { width: `${(overallProgress * 100).toFixed(2)}%` },
                     ]}
                   />
@@ -1532,15 +1612,15 @@ function TutorWorkspace() {
                           key={`tick-${step.step_id}-${boundaryIdx}`}
                           pointerEvents="none"
                           style={[
-                            styles.dockProgressTick,
-                            isPassed && styles.dockProgressTickPassed,
+                            styles.playerProgressTick,
+                            isPassed && styles.playerProgressTickPassed,
                             { left: `${(ratio * 100).toFixed(2)}%` },
                           ]}
                         />
                       );
                     })}
                 </View>
-                <Text style={styles.dockProgressMicroLabel} numberOfLines={1}>
+                <Text style={styles.playerMicroLabel} numberOfLines={1}>
                   {isTablet
                     ? `${Math.round(overallProgress * 100)}% • ${stepIndex + 1}/${steps.length}`
                     : `${stepIndex + 1}/${steps.length}`}
@@ -1548,59 +1628,151 @@ function TutorWorkspace() {
               </View>
 
               <Pressable
-                style={[styles.dockJumpBtn, !canGoNext && styles.dockDisabled]}
+                style={[styles.playerJumpBtn, !canGoNext && styles.dockDisabled]}
                 onPress={() => canGoNext && handleSelectStep(stepIndex + 1)}
                 disabled={!canGoNext}
                 accessibilityLabel="Next step"
               >
-                <Text style={styles.dockJumpText}>›</Text>
+                <Text style={styles.playerJumpText}>›</Text>
               </Pressable>
 
               <Pressable
-                style={styles.dockSpeedBtn}
+                style={styles.playerSpeedBtn}
                 onPress={handleCycleSpeed}
               >
-                <Text style={styles.dockSpeedText}>
+                <Text style={styles.playerSpeedText}>
                   {playbackSpeed.toFixed(playbackSpeed === 1.25 ? 2 : 1)}x
                 </Text>
               </Pressable>
+            </View>
+          ) : null}
+
+          {/* 2C. Dynamic Real PDF Filename Chip & Real Page Counter Pill (Only when PDF/lecture loaded) */}
+          {hasAttachedPdf && (
+            <View style={styles.pdfAttachmentRow}>
+              <View style={styles.pdfFileChip}>
+                <View style={styles.pdfBadgeIcon}>
+                  <Text style={styles.pdfBadgeIconText}>PDF</Text>
+                </View>
+                <Text
+                  style={styles.pdfFileNameText}
+                  numberOfLines={1}
+                  ellipsizeMode="middle"
+                >
+                  {attachedPdfName}
+                </Text>
+                <Pressable
+                  style={styles.pdfDetachBtn}
+                  onPress={handleDetachPdf}
+                  disabled={isBusy}
+                  hitSlop={6}
+                  accessibilityLabel="Detach PDF and return to Free Q&A mode"
+                >
+                  <Text style={styles.pdfDetachBtnText}>×</Text>
+                </Pressable>
+              </View>
 
               <Pressable
-                style={styles.dockPrimaryTrigger}
-                onPress={pdfFile ? handleExplain : handlePickPdf}
+                style={[
+                  styles.pageCounterPill,
+                  pageWheelOpen && styles.pageCounterPillActive,
+                ]}
+                onPress={() => {
+                  Keyboard.dismiss();
+                  setOptionsMenuOpen(false);
+                  setPageWheelOpen((v) => !v);
+                }}
+                disabled={isBusy}
+                accessibilityLabel="Open circular page wheel picker"
               >
-                <Text style={styles.dockPrimaryTriggerText}>
-                  {pdfFile ? "Explain" : "+ PDF"}
+                <Text style={styles.pageCounterText}>
+                  P. {selectedPage} / {totalPages ?? effectiveTotalPages}
+                </Text>
+                <Text style={styles.pageCounterChevron}>
+                  {pageWheelOpen ? "▴" : "▾"}
                 </Text>
               </Pressable>
-            </>
-          ) : (
-            <>
-              <Pressable
-                style={styles.dockAskTrigger}
-                onPress={handlePickPdf}
+            </View>
+          )}
+
+          {/* 2D. Unified Bottom Chat Dock (🌐 + اسأل أي سؤال + Circular + + Smart Glowing ↑) */}
+          <View style={styles.unifiedChatPill}>
+            <Pressable
+              style={[
+                styles.webToggleBtn,
+                freeSearchEnabled && styles.webToggleBtnActive,
+              ]}
+              onPress={() => setFreeSearchEnabled((v) => !v)}
+              disabled={isBusy}
+              accessibilityLabel="Toggle web search sources"
+            >
+              <Text
+                style={[
+                  styles.webToggleIcon,
+                  freeSearchEnabled && styles.webToggleIconActive,
+                ]}
               >
-                <Text style={styles.dockAskText} numberOfLines={1}>
-                  {pdfFile
-                    ? `PDF: ${pdfFile.name}`
-                    : "Pick a lecture PDF to begin..."}
-                </Text>
+                🌐
+              </Text>
+            </Pressable>
+
+            <TextInput
+              value={chatInput}
+              onChangeText={setChatInput}
+              placeholder="اسأل أي سؤال"
+              placeholderTextColor="#94A3B8"
+              style={styles.unifiedChatInput}
+              returnKeyType="send"
+              editable={!isBusy}
+              onSubmitEditing={() => void handleUnifiedSend()}
+            />
+
+            {/* Side-by-side circular + (PDF Upload) & Smart Glowing ↑ (Send) */}
+            <View style={styles.dockRightActions}>
+              <Pressable
+                style={[styles.dockPlusBtn, isBusy && styles.dockDisabled]}
+                onPress={() => void handlePickPdf()}
+                disabled={isBusy}
+                accessibilityLabel="Attach lecture PDF"
+              >
+                <Text style={styles.dockPlusBtnText}>+</Text>
               </Pressable>
 
               <Pressable
                 style={[
-                  styles.dockPrimaryTrigger,
-                  !pdfFile && styles.dockDisabled,
+                  styles.dockSendBtn,
+                  canSend ? styles.dockSendBtnActive : styles.dockSendBtnDimmed,
                 ]}
-                onPress={handleExplain}
-                disabled={!pdfFile}
+                onPress={() => void handleUnifiedSend()}
+                disabled={!canSend}
+                accessibilityLabel={
+                  hasAttachedPdf && !chatInput.trim()
+                    ? `Explain page ${selectedPage}`
+                    : "Send question"
+                }
               >
-                <Text style={styles.dockPrimaryTriggerText}>Explain Page</Text>
+                {isBusy ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.dockSendBtnText}>↑</Text>
+                )}
               </Pressable>
-            </>
-          )}
+            </View>
+          </View>
         </View>
-      </View>
+      </KeyboardAvoidingView>
+
+      {/* ================================================================= */}
+      {/* LAYER 3: Floating 3D Cylindrical Circular Gear Page Wheel Picker  */}
+      {/* ================================================================= */}
+      <CircularWheelPagePicker
+        visible={pageWheelOpen && hasAttachedPdf}
+        totalPages={effectiveTotalPages}
+        selectedPage={selectedPage}
+        bottomOffset={insets.bottom + 114}
+        onChangePage={(page) => setSelectedPage(page)}
+        onClose={() => setPageWheelOpen(false)}
+      />
 
       {/* ================================================================= */}
       {/* Recent Lectures Slide-Up Modal Drawer (Stage 5 Supabase Cache)    */}
@@ -1727,171 +1899,16 @@ const styles = StyleSheet.create({
   canvasFullScreen: {
     flex: 1,
   },
-  emptyPaperStage: {
+  emptyCleanPaper: {
     flex: 1,
     backgroundColor: "#FAF8F5",
   },
-  emptyPaperScroll: {
-    flex: 1,
-  },
-  emptyPaperScrollContent: {
-    flexGrow: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 24,
-    paddingTop: 84,
-    paddingBottom: 112,
-    gap: 14,
-  },
-  homeAskPill: {
-    width: "100%",
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.98)",
-    borderWidth: 1,
-    borderColor: "#CBD5E1",
-    borderRadius: 999,
-    paddingLeft: 8,
-    paddingRight: 6,
-    paddingVertical: 5,
-    gap: 6,
-    shadowColor: "#0F172A",
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 4,
-  },
-  homeAskInput: {
-    flex: 1,
-    fontSize: 14,
-    color: "#0F172A",
-    paddingVertical: 6,
-    paddingHorizontal: 4,
-    textAlign: "right",
-    includeFontPadding: false,
-  },
-  webToggleBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: "#F1F5F9",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  webToggleBtnActive: {
-    backgroundColor: "#CCFBF1",
-    borderWidth: 1,
-    borderColor: "#5EEAD4",
-  },
-  webToggleIcon: {
-    fontSize: 14,
-    opacity: 0.45,
-    includeFontPadding: false,
-  },
-  webToggleIconActive: {
-    opacity: 1,
-  },
-  freeModeBadge: {
-    backgroundColor: "#F0FDFA",
-    borderWidth: 1,
-    borderColor: "#99F6E4",
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  freeModeBadgeText: {
-    fontSize: 10.5,
-    fontWeight: "800",
-    color: "#0F766E",
-    includeFontPadding: false,
-  },
-  circleIconBtnLocked: {
-    opacity: 0.85,
-  },
-  welcomeCard: {
-    width: "100%",
-    maxWidth: 380,
-    backgroundColor: "#FFFFFF",
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: "#E7E2D9",
-    padding: 22,
-    alignItems: "center",
-    gap: 10,
-    shadowColor: "#1E293B",
-    shadowOpacity: 0.06,
-    shadowRadius: 16,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 3,
-  },
-  welcomeBadge: {
-    fontSize: 10.5,
-    fontWeight: "800",
-    letterSpacing: 1.1,
-    color: "#0F766E",
-    backgroundColor: "#F0FDFA",
-    borderWidth: 1,
-    borderColor: "#CCFBF1",
-    paddingHorizontal: 10,
-    paddingVertical: 3,
-    borderRadius: 999,
-  },
-  welcomeTitle: {
-    fontSize: 19,
-    fontWeight: "800",
-    color: "#0F172A",
-    textAlign: "center",
-  },
-  welcomeSub: {
-    fontSize: 13.5,
-    lineHeight: 20,
-    color: "#64748B",
-    textAlign: "center",
-  },
-  welcomeActions: {
-    flexDirection: "row",
-    gap: 10,
-    marginTop: 6,
-    width: "100%",
-  },
-  welcomePrimaryBtn: {
-    flex: 1,
-    backgroundColor: "#18181B",
-    borderRadius: 12,
-    paddingVertical: 11,
-    alignItems: "center",
-  },
-  welcomePrimaryText: {
-    color: "#FAF8F5",
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  welcomeSecondaryBtn: {
-    flex: 1,
-    backgroundColor: "#F8FAFC",
-    borderWidth: 1,
-    borderColor: "#CBD5E1",
-    borderRadius: 12,
-    paddingVertical: 11,
-    alignItems: "center",
-  },
-  welcomeSecondaryText: {
-    color: "#1E293B",
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  welcomeSelectedNote: {
-    marginTop: 4,
-    fontSize: 12,
-    fontWeight: "600",
-    color: "#0F766E",
-  },
 
-  // Top Floating HUD
+  // Stage 16 Decluttered 2-Pill Top Header
   topHudOuter: {
     position: "absolute",
-    left: 12,
-    right: 12,
+    left: 14,
+    right: 14,
     zIndex: 30,
     alignItems: "center",
   },
@@ -1901,136 +1918,146 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 8,
   },
-  topLeftPill: {
-    flex: 1,
+  headerPillBtn: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.94)",
+    gap: 6,
+    backgroundColor: "rgba(255, 255, 255, 0.96)",
     borderWidth: 1,
     borderColor: "#E7E2D9",
     borderRadius: 999,
-    paddingLeft: 10,
-    paddingRight: 6,
-    paddingVertical: 5,
-    gap: 6,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
     shadowColor: "#0F172A",
     shadowOpacity: 0.08,
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 3 },
     elevation: 4,
   },
-  docChip: {
-    flex: 1,
-    minWidth: 50,
+  headerPillBtnActive: {
+    borderColor: "#BFDBFE",
+    backgroundColor: "#EFF6FF",
   },
-  docChipText: {
-    fontSize: 12.5,
+  headerPillIcon: {
+    fontSize: 13,
+    color: "#334155",
+    includeFontPadding: false,
+  },
+  headerPillText: {
+    fontSize: 13,
     fontWeight: "700",
     color: "#0F172A",
     includeFontPadding: false,
   },
-  cachedPill: {
-    backgroundColor: "#FEF3C7",
-    borderWidth: 1,
-    borderColor: "#FDE68A",
-    borderRadius: 999,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-  },
-  cachedPillText: {
-    fontSize: 10,
-    fontWeight: "800",
-    color: "#B45309",
+  headerPillChevron: {
+    fontSize: 11,
+    color: "#64748B",
+    marginLeft: -2,
     includeFontPadding: false,
   },
-  pillDivider: {
-    width: 1,
-    height: 16,
-    backgroundColor: "#E2E8F0",
+
+  // Floating Options Popover Card
+  popoverOverlayRoot: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 42,
   },
-  pageMiniGroup: {
+  optionsAnchorWrap: {
+    position: "absolute",
+    right: 14,
+    alignItems: "flex-end",
+  },
+  optionsPopoverCard: {
+    width: 264,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 12,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.14,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 10,
+  },
+  optionsRow: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
   },
-  pageMiniPrefix: {
-    fontSize: 11.5,
+  optionsLabelCol: {
+    flex: 1,
+    gap: 2,
+  },
+  optionsRowLabel: {
+    fontSize: 13.5,
     fontWeight: "700",
+    color: "#0F172A",
+    includeFontPadding: false,
+  },
+  optionsSubHint: {
+    fontSize: 10,
+    fontWeight: "600",
     color: "#64748B",
     includeFontPadding: false,
   },
-  pageMiniInput: {
-    minWidth: 26,
-    maxWidth: 38,
-    textAlign: "center",
-    fontSize: 12.5,
-    fontWeight: "800",
-    color: "#0F172A",
-    paddingVertical: 2,
-    paddingHorizontal: 2,
-    includeFontPadding: false,
+  modeSegmentWrap: {
+    flexDirection: "row",
+    backgroundColor: "#F1F5F9",
+    borderRadius: 10,
+    padding: 3,
+    gap: 2,
   },
-  recentMiniBtn: {
-    backgroundColor: "#F0FDF4",
-    borderWidth: 1,
-    borderColor: "#BBF7D0",
-    borderRadius: 999,
+  modeSegmentBtn: {
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingVertical: 5,
+    borderRadius: 7,
   },
-  recentMiniText: {
+  modeSegmentBtnActive: {
+    backgroundColor: "#2563EB",
+  },
+  modeSegmentBtnDisabled: {
+    opacity: 0.35,
+  },
+  modeSegmentText: {
     fontSize: 11,
-    fontWeight: "700",
-    color: "#15803D",
+    fontWeight: "800",
+    color: "#475569",
     includeFontPadding: false,
   },
-  topRightIcons: {
+  modeSegmentTextActive: {
+    color: "#FFFFFF",
+  },
+  modeSegmentTextDisabled: {
+    color: "#94A3B8",
+  },
+  optionsDivider: {
+    height: 1,
+    backgroundColor: "#E2E8F0",
+  },
+  clearBoardRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: 8,
+    paddingVertical: 2,
   },
-  circleIconBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: "rgba(255, 255, 255, 0.94)",
-    borderWidth: 1,
-    borderColor: "#E7E2D9",
-    alignItems: "center",
-    justifyContent: "center",
-    shadowColor: "#0F172A",
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 4,
-  },
-  circleIconBtnBlue: {
-    backgroundColor: "#2563EB",
-    borderColor: "#1D4ED8",
-  },
-  circleIconBtnDeep: {
-    backgroundColor: "#4F46E5",
-    borderColor: "#4338CA",
-  },
-  circleIconBtnDark: {
-    backgroundColor: "#18181B",
-    borderColor: "#27272A",
-  },
-  circleIconLabel: {
-    fontSize: 10,
-    fontWeight: "800",
-    color: "#334155",
+  clearBoardIcon: {
+    fontSize: 15,
+    color: "#DC2626",
     includeFontPadding: false,
   },
-  circleIconSymbol: {
-    fontSize: 14,
+  clearBoardText: {
+    fontSize: 13.5,
     fontWeight: "700",
-    color: "#334155",
+    color: "#DC2626",
     includeFontPadding: false,
-  },
-  circleIconLabelActive: {
-    color: "#FFFFFF",
   },
 
   // Floating Error Toast
@@ -2075,18 +2102,22 @@ const styles = StyleSheet.create({
     includeFontPadding: false,
   },
 
-  // Collapsible Compact Captions Strip
-  captionStripWrap: {
+  // Stage 16 Unified Bottom Stack
+  bottomStackOuter: {
     position: "absolute",
     left: 14,
     right: 14,
-    zIndex: 25,
+    zIndex: 30,
     alignItems: "center",
+  },
+  bottomStackInner: {
+    width: "100%",
+    alignSelf: "center",
+    gap: 8,
   },
   captionStripCard: {
     width: "100%",
-    alignSelf: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.94)",
+    backgroundColor: "rgba(255, 255, 255, 0.96)",
     borderWidth: 1,
     borderColor: "#E7E2D9",
     borderRadius: 16,
@@ -2126,39 +2157,238 @@ const styles = StyleSheet.create({
     includeFontPadding: false,
   },
 
-  // Collapsible "Ask Anything..." Spatial Pill
-  askOverlayWrap: {
-    position: "absolute",
-    left: 14,
-    right: 14,
-    zIndex: 28,
-    alignItems: "center",
-  },
-  askOverlayInner: {
-    width: "100%",
+  // Slim Light Playback & Status Pills (Replaces Dark Bottom Bar)
+  slimStatusPill: {
     alignSelf: "center",
-    alignItems: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "rgba(255, 255, 255, 0.96)",
+    borderWidth: 1,
+    borderColor: "#DBEAFE",
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
   },
-  askCollapsedPill: {
+  slimStatusText: {
+    fontSize: 12.5,
+    fontWeight: "600",
+    color: "#1E293B",
+    includeFontPadding: false,
+  },
+  slimPlayerPill: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
     backgroundColor: "rgba(255, 255, 255, 0.94)",
     borderWidth: 1,
     borderColor: "#E7E2D9",
     borderRadius: 999,
-    paddingHorizontal: 13,
-    paddingVertical: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    gap: 6,
     shadowColor: "#0F172A",
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
+    shadowOpacity: 0.07,
+    shadowRadius: 10,
     shadowOffset: { width: 0, height: 3 },
-    elevation: 4,
+    elevation: 3,
   },
-  askCollapsedText: {
-    fontSize: 12,
+  playerJumpBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F1F5F9",
+  },
+  playerJumpText: {
+    color: "#334155",
+    fontSize: 16,
     fontWeight: "700",
-    color: "#1E293B",
+    marginTop: -1,
     includeFontPadding: false,
   },
-  askExpandedPill: {
+  playerPlayBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#2563EB",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  playerPlayText: {
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "700",
+    includeFontPadding: false,
+  },
+  playerReplayBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F1F5F9",
+  },
+  playerReplayText: {
+    color: "#334155",
+    fontSize: 13,
+    fontWeight: "700",
+    includeFontPadding: false,
+  },
+  playerProgressWrap: {
+    flex: 1,
+    minWidth: 56,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: 4,
+    gap: 2,
+  },
+  playerProgressTrack: {
+    width: "100%",
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: "#E2E8F0",
+    overflow: "hidden",
+    justifyContent: "center",
+    position: "relative",
+  },
+  playerProgressFill: {
+    height: "100%",
+    borderRadius: 999,
+    backgroundColor: "#2563EB",
+  },
+  playerProgressTick: {
+    position: "absolute",
+    top: 1.25,
+    width: 2.5,
+    height: 2.5,
+    borderRadius: 1.25,
+    marginLeft: -1.25,
+    backgroundColor: "rgba(100, 116, 139, 0.35)",
+  },
+  playerProgressTickPassed: {
+    backgroundColor: "rgba(255, 255, 255, 0.85)",
+  },
+  playerMicroLabel: {
+    color: "#64748B",
+    fontSize: 9.5,
+    fontWeight: "700",
+    includeFontPadding: false,
+  },
+  playerSpeedBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: "#EFF6FF",
+  },
+  playerSpeedText: {
+    color: "#1D4ED8",
+    fontSize: 11,
+    fontWeight: "800",
+    includeFontPadding: false,
+  },
+
+  // Dynamic Real PDF Filename Chip & Page Counter Pill
+  pdfAttachmentRow: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  pdfFileChip: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    backgroundColor: "rgba(255, 255, 255, 0.96)",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    borderRadius: 999,
+    paddingLeft: 8,
+    paddingRight: 8,
+    paddingVertical: 6,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.06,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  pdfBadgeIcon: {
+    backgroundColor: "#FEE2E2",
+    borderRadius: 6,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  pdfBadgeIconText: {
+    fontSize: 9,
+    fontWeight: "900",
+    color: "#DC2626",
+    letterSpacing: 0.4,
+    includeFontPadding: false,
+  },
+  pdfFileNameText: {
+    flex: 1,
+    fontSize: 12.5,
+    fontWeight: "700",
+    color: "#0F172A",
+    includeFontPadding: false,
+  },
+  pdfDetachBtn: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: "#F1F5F9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pdfDetachBtnText: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#64748B",
+    marginTop: -1,
+    includeFontPadding: false,
+  },
+  pageCounterPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "rgba(255, 255, 255, 0.96)",
+    borderWidth: 1,
+    borderColor: "#BFDBFE",
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.07,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  pageCounterPillActive: {
+    backgroundColor: "#EFF6FF",
+    borderColor: "#2563EB",
+  },
+  pageCounterText: {
+    fontSize: 12.5,
+    fontWeight: "800",
+    color: "#1D4ED8",
+    includeFontPadding: false,
+  },
+  pageCounterChevron: {
+    fontSize: 10.5,
+    color: "#2563EB",
+    includeFontPadding: false,
+  },
+
+  // Unified Bottom Chat Dock
+  unifiedChatPill: {
     width: "100%",
     flexDirection: "row",
     alignItems: "center",
@@ -2166,214 +2396,94 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#CBD5E1",
     borderRadius: 999,
-    paddingLeft: 14,
-    paddingRight: 6,
-    paddingVertical: 5,
-    gap: 6,
+    paddingLeft: 8,
+    paddingRight: 7,
+    paddingVertical: 6,
+    gap: 7,
     shadowColor: "#0F172A",
-    shadowOpacity: 0.14,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 5 },
     elevation: 6,
   },
-  askTextInput: {
+  unifiedChatInput: {
     flex: 1,
-    fontSize: 13.5,
+    fontSize: 14.5,
     color: "#0F172A",
     paddingVertical: 6,
+    paddingHorizontal: 4,
+    textAlign: "right",
     includeFontPadding: false,
   },
-  askSendBtn: {
+  webToggleBtn: {
     width: 34,
     height: 34,
     borderRadius: 17,
-    backgroundColor: "#18181B",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  askSendBtnText: {
-    color: "#FFFFFF",
-    fontSize: 16,
-    fontWeight: "800",
-    includeFontPadding: false,
-  },
-  askCloseBtn: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
     backgroundColor: "#F1F5F9",
     alignItems: "center",
     justifyContent: "center",
   },
-  askCloseBtnText: {
-    color: "#475569",
-    fontSize: 12,
-    fontWeight: "800",
-    includeFontPadding: false,
-  },
-
-  // Bottom Floating Dark Pill Bar
-  bottomDockWrap: {
-    position: "absolute",
-    left: 12,
-    right: 12,
-    zIndex: 30,
-    alignItems: "center",
-  },
-  bottomDarkPill: {
-    width: "100%",
-    alignSelf: "center",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    backgroundColor: "rgba(24, 24, 27, 0.94)",
+  webToggleBtnActive: {
+    backgroundColor: "#CCFBF1",
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.12)",
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 7,
-    gap: 5,
-    shadowColor: "#000000",
-    shadowOpacity: 0.24,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 8,
+    borderColor: "#5EEAD4",
   },
-  dockLoadingRow: {
-    flex: 1,
+  webToggleIcon: {
+    fontSize: 15,
+    opacity: 0.45,
+    includeFontPadding: false,
+  },
+  webToggleIconActive: {
+    opacity: 1,
+  },
+  dockRightActions: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    paddingVertical: 6,
+    gap: 6,
   },
-  dockLoadingText: {
-    color: "#F8FAFC",
-    fontSize: 13,
-    fontWeight: "600",
-    includeFontPadding: false,
-  },
-  dockJumpBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
-  },
-  dockJumpText: {
-    color: "#E2E8F0",
-    fontSize: 16,
-    fontWeight: "700",
-    marginTop: -1,
-    includeFontPadding: false,
-  },
-  dockIconBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
-  },
-  dockReplayText: {
-    color: "#E2E8F0",
-    fontSize: 14.5,
-    fontWeight: "700",
-    includeFontPadding: false,
-  },
-  dockPlayBtn: {
+  dockPlusBtn: {
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: "#0F766E",
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
     alignItems: "center",
     justifyContent: "center",
   },
-  dockPlayText: {
-    color: "#FFFFFF",
-    fontSize: 13.5,
-    fontWeight: "700",
+  dockPlusBtnText: {
+    fontSize: 20,
+    fontWeight: "600",
+    color: "#334155",
+    marginTop: -1,
     includeFontPadding: false,
   },
-  dockProgressWrap: {
-    flex: 1,
-    minWidth: 56,
-    justifyContent: "center",
+  dockSendBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: "center",
-    paddingHorizontal: 4,
-    gap: 3,
-  },
-  dockProgressTrack: {
-    width: "100%",
-    height: 6,
-    borderRadius: 999,
-    backgroundColor: "rgba(255, 255, 255, 0.14)",
-    overflow: "hidden",
     justifyContent: "center",
-    position: "relative",
   },
-  dockProgressFill: {
-    height: "100%",
-    borderRadius: 999,
-    backgroundColor: "#14B8A6",
-  },
-  dockProgressTick: {
-    position: "absolute",
-    top: 1.75,
-    width: 2.5,
-    height: 2.5,
-    borderRadius: 1.25,
-    marginLeft: -1.25,
-    backgroundColor: "rgba(255, 255, 255, 0.30)",
-  },
-  dockProgressTickPassed: {
-    backgroundColor: "rgba(255, 255, 255, 0.78)",
-  },
-  dockProgressMicroLabel: {
-    color: "rgba(226, 232, 240, 0.72)",
-    fontSize: 9.5,
-    fontWeight: "700",
-    letterSpacing: 0.2,
-    includeFontPadding: false,
-  },
-  dockSpeedBtn: {
-    paddingHorizontal: 9,
-    paddingVertical: 7,
-    borderRadius: 999,
-    backgroundColor: "rgba(255, 255, 255, 0.1)",
-  },
-  dockSpeedText: {
-    color: "#93C5FD",
-    fontSize: 11.5,
-    fontWeight: "800",
-    includeFontPadding: false,
-  },
-  dockAskTrigger: {
-    flex: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  dockAskText: {
-    color: "#CBD5E1",
-    fontSize: 13,
-    fontWeight: "500",
-    includeFontPadding: false,
-  },
-  dockPrimaryTrigger: {
+  dockSendBtnActive: {
     backgroundColor: "#2563EB",
-    borderRadius: 999,
-    paddingHorizontal: 13,
-    paddingVertical: 8,
+    shadowColor: "#2563EB",
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
   },
-  dockPrimaryTriggerText: {
+  dockSendBtnDimmed: {
+    backgroundColor: "#CBD5E1",
+  },
+  dockSendBtnText: {
     color: "#FFFFFF",
-    fontSize: 12,
+    fontSize: 17,
     fontWeight: "800",
     includeFontPadding: false,
   },
   dockDisabled: {
-    opacity: 0.35,
+    opacity: 0.38,
   },
 
   // Recent Lectures Modal Drawer

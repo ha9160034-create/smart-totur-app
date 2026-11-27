@@ -1686,3 +1686,131 @@ export function createDiagramStencilPaths(
 
   return { outlinePath, fillPath, trail };
 }
+
+/**
+ * Stage 15.1: Hand-drawn organic scalloped cloud callout (10 gentle outward arcs:
+ * 3 top, 2 right, 3 bottom, 2 left) returning matching fillPath, rough outlinePath,
+ * and pre-sampled clockwise PenTrailPoint[] for AnimatedPenNib tracing.
+ */
+export function createRoughCloudWithTrail(
+  rect: RoughRectFrame,
+  seed: number
+): StencilLayerPaths {
+  if (!rect || rect.width <= 24 || rect.height <= 20) {
+    return {
+      outlinePath: makeEmptySkiaPath(),
+      fillPath: makeEmptySkiaPath(),
+      trail: [],
+    };
+  }
+
+  const rng = mulberry32((seed ^ 0x5c10cd01) >>> 0);
+  const { x, y, width: w, height: h } = rect;
+  const inset = Math.min(12, Math.min(w, h) * 0.14);
+  const lx = x + inset;
+  const rx = x + w - inset;
+  const ty = y + inset;
+  const by = y + h - inset;
+
+  const topCount = w >= 220 ? 4 : 3;
+  const sideCount = h >= 110 ? 2 : 1;
+
+  // Build clockwise perimeter anchor points around the inner inset frame
+  const anchors: PenTrailPoint[] = [];
+  // Top edge (left -> right)
+  for (let i = 0; i < topCount; i++) {
+    const t = i / topCount;
+    anchors.push({
+      x: lx + (rx - lx) * t + jitter(rng, 2.2),
+      y: ty + jitter(rng, 1.8),
+    });
+  }
+  // Right edge (top -> bottom)
+  for (let i = 0; i < sideCount; i++) {
+    const t = i / sideCount;
+    anchors.push({
+      x: rx + jitter(rng, 1.8),
+      y: ty + (by - ty) * t + jitter(rng, 2.0),
+    });
+  }
+  // Bottom edge (right -> left)
+  for (let i = 0; i < topCount; i++) {
+    const t = i / topCount;
+    anchors.push({
+      x: rx - (rx - lx) * t + jitter(rng, 2.2),
+      y: by + jitter(rng, 1.8),
+    });
+  }
+  // Left edge (bottom -> top)
+  for (let i = 0; i < sideCount; i++) {
+    const t = i / sideCount;
+    anchors.push({
+      x: lx + jitter(rng, 1.8),
+      y: by - (by - ty) * t + jitter(rng, 2.0),
+    });
+  }
+
+  // Compute outward scalloped quadratic control points for each segment (8-12 gentle arcs)
+  const bulgeBase = Math.max(7, Math.min(13, Math.min(w, h) * 0.12));
+  const arcs: Array<{ p0: PenTrailPoint; ctrl: PenTrailPoint; p1: PenTrailPoint }> = [];
+  const n = anchors.length;
+  for (let i = 0; i < n; i++) {
+    const p0 = anchors[i];
+    const p1 = anchors[(i + 1) % n];
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    // Clockwise perimeter -> outward unit normal is (dy/len, -dx/len)
+    const nx = dy / len;
+    const ny = -dx / len;
+    const bulge = bulgeBase * (0.85 + rng() * 0.32);
+    const midX = (p0.x + p1.x) * 0.5 + nx * bulge + jitter(rng, 1.2);
+    const midY = (p0.y + p1.y) * 0.5 + ny * bulge + jitter(rng, 1.2);
+    arcs.push({ p0, ctrl: { x: midX, y: midY }, p1 });
+  }
+
+  const trail: PenTrailPoint[] = [];
+  for (const arc of arcs) {
+    pushQuadTrail(
+      trail,
+      arc.p0.x,
+      arc.p0.y,
+      arc.ctrl.x,
+      arc.ctrl.y,
+      arc.p1.x,
+      arc.p1.y,
+      5
+    );
+  }
+
+  const fillPath = makePathFromBuilder((b) => {
+    if (arcs.length === 0) return;
+    b.moveTo(arcs[0].p0.x, arcs[0].p0.y);
+    for (const arc of arcs) {
+      b.quadTo(arc.ctrl.x, arc.ctrl.y, arc.p1.x, arc.p1.y);
+    }
+  });
+
+  const outlinePath = makePathFromBuilder((b) => {
+    if (arcs.length === 0) return;
+    // Primary hand-drawn scalloped cloud pass
+    b.moveTo(arcs[0].p0.x, arcs[0].p0.y);
+    for (const arc of arcs) {
+      b.quadTo(arc.ctrl.x, arc.ctrl.y, arc.p1.x, arc.p1.y);
+    }
+    // Subtle companion sketch pass for authentic hand-drawn feel
+    const ox = jitter(rng, 1.5);
+    const oy = jitter(rng, 1.5);
+    b.moveTo(arcs[0].p0.x + ox, arcs[0].p0.y + oy);
+    for (const arc of arcs) {
+      b.quadTo(
+        arc.ctrl.x + ox + jitter(rng, 1.1),
+        arc.ctrl.y + oy + jitter(rng, 1.1),
+        arc.p1.x + ox,
+        arc.p1.y + oy
+      );
+    }
+  });
+
+  return { outlinePath, fillPath, trail };
+}

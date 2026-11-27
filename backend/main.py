@@ -1442,6 +1442,59 @@ def _summarize_cached_plan(plan_json: Any) -> Optional[str]:
     return summary[:650] if summary else None
 
 
+class PdfInfoResponse(BaseModel):
+    total_pages: int
+    title: str
+
+
+@app.post(
+    "/api/pdf-info",
+    response_model=PdfInfoResponse,
+    summary="Inspect uploaded PDF in memory with PyMuPDF and return exact total_pages and title (<20ms)",
+)
+async def inspect_pdf_info(
+    file: UploadFile = File(..., description="Lecture PDF file"),
+) -> PdfInfoResponse:
+    if file.content_type and file.content_type not in (
+        "application/pdf",
+        "application/octet-stream",
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type '{file.content_type}'. Please upload a PDF file.",
+        )
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded PDF file is empty.",
+        )
+    if len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"PDF exceeds maximum size limit of {MAX_PDF_SIZE_MB} MB.",
+        )
+
+    def _read_meta(raw: bytes, fname: str) -> tuple[int, str]:
+        try:
+            with fitz.open(stream=raw, filetype="pdf") as doc:
+                count = max(1, int(len(doc)))
+                meta_title = str((doc.metadata or {}).get("title") or "").strip()
+                clean_title = meta_title or fname or "Lecture.pdf"
+                return count, clean_title
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not read PDF file: {exc}",
+            ) from exc
+
+    total_pages, title = await asyncio.to_thread(
+        _read_meta, pdf_bytes, file.filename or "Lecture.pdf"
+    )
+    return PdfInfoResponse(total_pages=total_pages, title=title)
+
+
 @app.post(
     "/api/explain",
     response_model=ExplainSlideWithAudioResponse,

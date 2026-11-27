@@ -127,6 +127,8 @@ export interface TeachingStep {
   speech_ar: string;
   en_terms: string[];
   actions: VisualAction[];
+  /** Client-stamped 0-based conversation turn index so follow-ups append chronologically below earlier turns */
+  turnIndex?: number;
 }
 
 export interface LecturePlan {

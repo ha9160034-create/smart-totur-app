@@ -52,6 +52,7 @@ import {
   createPlotCurveWithTrail,
   createRoughArrowPath,
   createRoughCirclePath,
+  createRoughCloudWithTrail,
   createRoughDashedRectPath,
   createRoughDiamondPath,
   createRoughHighlighterPath,
@@ -443,7 +444,25 @@ function sanitizeMathText(raw?: string | null): string {
   for (const [pattern, replacement] of BARE_EQ_MATH_REPAIRS) {
     out = out.replace(pattern, replacement);
   }
+  // Format ^2 and ^3 exponents cleanly into Unicode superscripts (e.g. m/s^2 -> m/s², cm^3 -> cm³)
+  out = out
+    .replace(/(\S)\^2(?![0-9A-Za-z])/g, "$1²")
+    .replace(/(\S)\^3(?![0-9A-Za-z])/g, "$1³");
   return out;
+}
+
+/**
+ * Distinguishes long multi-link source citation notes (which keep a clean card box)
+ * from standard pedagogical wb_note callouts (which render inside a hand-drawn scalloped cloud).
+ */
+function isCitationNoteText(raw?: string | null): boolean {
+  const clean = (raw ?? "").trim();
+  if (!clean) return false;
+  const linkCount = (clean.match(/https?:\/\//gi) ?? []).length;
+  if (linkCount >= 2) return true;
+  if (/^(المصادر|Sources?)\s*[:：]/i.test(clean) && clean.length > 70) return true;
+  if (clean.length > 220 && /https?:\/\/|\.edu|\.org|\.com/i.test(clean)) return true;
+  return false;
 }
 
 /** Preserves literal code characters & tab indents strictly for wb_code blocks */
@@ -1031,6 +1050,7 @@ interface ResolvedAction {
 interface WhiteboardBlock {
   blockId: string;
   bandIndex: number;
+  turnIndex: number;
   slot: WhiteboardSlot;
   createdAtStepIdx: number;
   lastUpdatedStepIdx: number;
@@ -1052,6 +1072,7 @@ function resolveWhiteboardBlocks(
   const safeSteps = Array.isArray(steps) ? steps : [];
   let blocks: WhiteboardBlock[] = [];
   let currentBand = 0;
+  let lastTurnIndex = -1;
   let bandSlots = new Map<WhiteboardSlot, WhiteboardBlock>();
   let latestBySlot = new Map<WhiteboardSlot, WhiteboardBlock>();
 
@@ -1064,6 +1085,15 @@ function resolveWhiteboardBlocks(
     if (step.mode !== "whiteboard") {
       continue;
     }
+
+    // Chronological turn boundary: always open a fresh band when a follow-up turn begins
+    // so Turn 1's wb_note stays at the end of Turn 1 and follow-ups (5/6, 6/6) append below
+    const stepTurn = step.turnIndex ?? 0;
+    if (lastTurnIndex !== -1 && stepTurn !== lastTurnIndex && bandSlots.size > 0) {
+      currentBand += 1;
+      bandSlots = new Map();
+    }
+    lastTurnIndex = stepTurn;
 
     const isCurrent = i === currentStepIndex;
     const actions = Array.isArray(step.actions) ? step.actions : [];
@@ -1123,19 +1153,23 @@ function resolveWhiteboardBlocks(
       const existingInBand = bandSlots.get(targetSlot);
 
       // Stack bullets cleanly inside the same slot if the current band's slot already holds bullets
+      // (and no closing bottom_summary/wb_note has already closed this section)
       if (
         action.type === "wb_bullet" &&
         existingInBand &&
-        existingInBand.items[0]?.action.type === "wb_bullet"
+        existingInBand.items[0]?.action.type === "wb_bullet" &&
+        !bandSlots.has("bottom_summary")
       ) {
         existingInBand.items.push(resolvedItem);
         existingInBand.lastUpdatedStepIdx = i;
         continue;
       }
 
-      // If this slot is already occupied in the current band, open a new band below
-      // instead of overwriting earlier steps' cards on the infinite canvas
-      if (existingInBand) {
+      // If this slot is already occupied OR a bottom_summary/wb_note already closed this band,
+      // open a new band below so earlier summaries never get pushed underneath later steps
+      const bandClosedByBottom =
+        bandSlots.has("bottom_summary") && targetSlot !== "bottom_summary";
+      if (existingInBand || bandClosedByBottom) {
         currentBand += 1;
         bandSlots = new Map();
       }
@@ -1147,6 +1181,7 @@ function resolveWhiteboardBlocks(
       const newBlock: WhiteboardBlock = {
         blockId: `b${currentBand}-${targetSlot}-s${step.step_id}-a${j}`,
         bandIndex: currentBand,
+        turnIndex: stepTurn,
         slot: targetSlot,
         createdAtStepIdx: i,
         lastUpdatedStepIdx: i,
@@ -1596,26 +1631,157 @@ function computeDiagramMetrics(
     }
 
     const unionSpanW = Math.max(1, unionMaxX - unionMinX);
-    if (unionSpanW > innerAvailW * 1.06) {
-      // Wide multi-cycle diagram on narrow phone: preserve readable boxes & 34px gaps via horizontal scroll
-      diagramWidth = Math.ceil(unionSpanW / 0.94);
-      needsHorizontalScroll = true;
-      const targetLeft = bleed + diagramWidth * 0.03;
-      const shiftX = targetLeft - unionMinX;
-      for (const r of allRects) {
-        r.x += shiftX;
+
+    // Stage 15.1 Zero-Overlap Guard on Narrow Phones (< 430px):
+    // If 3+ non-container nodes share a horizontal row and would crowd horizontally,
+    // gracefully convert to a crisp centered vertical flow layout in topological order.
+    const nonContainers = rawNodes.filter(
+      (n) => n && n.kind !== "container" && rectById.has(n.id)
+    );
+    const hasContainers = rawNodes.some(
+      (n) => n && n.kind === "container" && rectById.has(n.id)
+    );
+    let convertedToVerticalFlow = false;
+    if (availableWidth < 430 && !hasContainers && nonContainers.length >= 3) {
+      // Group nodes sharing a horizontal band (centerY within 46px)
+      const rowGroups: DiagramNode[][] = [];
+      for (const n of nonContainers) {
+        const nr = rectById.get(n.id)!;
+        const nCy = nr.y + nr.height / 2;
+        const found = rowGroups.find((grp) => {
+          const gr = rectById.get(grp[0].id)!;
+          return Math.abs(gr.y + gr.height / 2 - nCy) <= 46;
+        });
+        if (found) found.push(n);
+        else rowGroups.push([n]);
       }
-    } else {
-      // Normalize union width cleanly across 94% of diagramWidth so right half is never empty
-      const targetSpanW = diagramWidth * 0.94;
-      const targetLeft = bleed + diagramWidth * 0.03;
-      const scaleX = targetSpanW / unionSpanW;
-      for (const r of allRects) {
-        r.x = targetLeft + (r.x - unionMinX) * scaleX;
-        r.width = Math.max(DIAGRAM_MIN_NODE_W, r.width * scaleX);
+
+      const crowdedRow = rowGroups.find((grp) => {
+        if (grp.length < 3) return false;
+        const minNeededW =
+          grp.reduce((sum, n) => {
+            const lblLen = normalizeBlockText(n.label).length;
+            return sum + Math.max(88, Math.min(138, lblLen * 7.6 + 24));
+          }, 0) +
+          (grp.length - 1) * 20;
+        return minNeededW > innerAvailW * 0.96;
+      });
+
+      if (crowdedRow) {
+        // Order nodes causally (Kahn topological order) for top-to-bottom vertical flow
+        const idSet = new Set(nonContainers.map((n) => n.id));
+        const inDeg = new Map<string, number>();
+        const outAdj = new Map<string, string[]>();
+        for (const n of nonContainers) {
+          inDeg.set(n.id, 0);
+          outAdj.set(n.id, []);
+        }
+        for (const e of rawEdges) {
+          if (idSet.has(e.from_id) && idSet.has(e.to_id) && e.from_id !== e.to_id) {
+            outAdj.get(e.from_id)!.push(e.to_id);
+            inDeg.set(e.to_id, (inDeg.get(e.to_id) ?? 0) + 1);
+          }
+        }
+        const byPosRaw = (a: DiagramNode, b: DiagramNode) => {
+          const ra = rectById.get(a.id)!;
+          const rb = rectById.get(b.id)!;
+          return Math.abs(ra.y - rb.y) > 22 ? ra.y - rb.y : ra.x - rb.x;
+        };
+        const q = nonContainers.filter((n) => (inDeg.get(n.id) ?? 0) === 0).sort(byPosRaw);
+        const byIdRaw = new Map(nonContainers.map((n) => [n.id, n]));
+        const seenFlow = new Set<string>();
+        const orderedFlow: DiagramNode[] = [];
+        while (q.length > 0) {
+          const cur = q.shift()!;
+          if (seenFlow.has(cur.id)) continue;
+          seenFlow.add(cur.id);
+          orderedFlow.push(cur);
+          for (const nxt of outAdj.get(cur.id) ?? []) {
+            const d = (inDeg.get(nxt) ?? 1) - 1;
+            inDeg.set(nxt, d);
+            if (d <= 0 && !seenFlow.has(nxt) && byIdRaw.has(nxt)) {
+              q.push(byIdRaw.get(nxt)!);
+              q.sort(byPosRaw);
+            }
+          }
+        }
+        for (const n of nonContainers.sort(byPosRaw)) {
+          if (!seenFlow.has(n.id)) orderedFlow.push(n);
+        }
+
+        const vNodeW = Math.min(Math.round(innerAvailW * 0.84), 256);
+        const vGapY = 34;
+        let curY = bleed + 12;
+        for (const n of orderedFlow) {
+          const prev = rectById.get(n.id)!;
+          const vNodeH = Math.max(54, Math.min(84, prev.height));
+          rectById.set(n.id, {
+            x: bleed + (diagramWidth - vNodeW) / 2,
+            y: curY,
+            width: vNodeW,
+            height: vNodeH,
+          });
+          curY += vNodeH + vGapY;
+        }
+        convertedToVerticalFlow = true;
       }
-      // Keep container bounds tight after horizontal normalization
-      autoFitContainers();
+    }
+
+    if (!convertedToVerticalFlow) {
+      if (unionSpanW > innerAvailW * 1.06) {
+        // Wide multi-cycle diagram on narrow phone: preserve readable boxes & >= 20px gaps via horizontal scroll
+        diagramWidth = Math.ceil(unionSpanW / 0.94);
+        needsHorizontalScroll = true;
+        const targetLeft = bleed + diagramWidth * 0.03;
+        const shiftX = targetLeft - unionMinX;
+        for (const r of allRects) {
+          r.x += shiftX;
+        }
+      } else {
+        // Normalize union width cleanly across 94% of diagramWidth so right half is never empty
+        const targetSpanW = diagramWidth * 0.94;
+        const targetLeft = bleed + diagramWidth * 0.03;
+        const scaleX = targetSpanW / unionSpanW;
+        for (const r of allRects) {
+          r.x = targetLeft + (r.x - unionMinX) * scaleX;
+          r.width = Math.max(DIAGRAM_MIN_NODE_W, r.width * scaleX);
+        }
+
+        // Post-scale zero-overlap pass: guarantee >= 20px horizontal gap between any adjacent siblings
+        const MIN_SAFE_GAP = 20;
+        const nonContainerIds = nonContainers.map((n) => n.id);
+        const sortedLeft = [...nonContainerIds].sort((idA, idB) => {
+          const a = rectById.get(idA)!;
+          const b = rectById.get(idB)!;
+          return a.x !== b.x ? a.x - b.x : a.y - b.y;
+        });
+        for (let i = 0; i < sortedLeft.length; i++) {
+          const a = rectById.get(sortedLeft[i])!;
+          for (let j = i + 1; j < sortedLeft.length; j++) {
+            const b = rectById.get(sortedLeft[j])!;
+            const vOverlap =
+              Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+            if (vOverlap > 4) {
+              const hGap = b.x - (a.x + a.width);
+              if (hGap < MIN_SAFE_GAP) {
+                b.x = a.x + a.width + MIN_SAFE_GAP;
+              }
+            }
+          }
+        }
+        // Keep container bounds tight after horizontal normalization & gap pass
+        autoFitContainers();
+
+        // Expand canvas horizontally if post-scale gap guarantee pushed beyond innerAvailW
+        let postMaxX = 0;
+        for (const r of rectById.values()) {
+          postMaxX = Math.max(postMaxX, r.x + r.width);
+        }
+        if (postMaxX > bleed + diagramWidth - 6) {
+          diagramWidth = Math.ceil(postMaxX - bleed + 12);
+          needsHorizontalScroll = diagramWidth > innerAvailW + 4;
+        }
+      }
     }
   }
 
@@ -1691,12 +1857,22 @@ function computeDiagramMetrics(
   const sortedInner = [...topoInner, ...remaining];
   const orderedNodes = [...containers, ...sortedInner];
 
-  // 8. Resolve valid edges AFTER final normalized coordinates & compute bidirectional curveOffsets
+  // 8. Resolve valid edges AFTER final normalized coordinates & sort topologically
   const validEdges = rawEdges.filter(
     (e) => e && rectById.has(e.from_id) && rectById.has(e.to_id) && e.from_id !== e.to_id
   );
-  const pairSet = new Set(validEdges.map((e) => `${e.from_id}::${e.to_id}`));
-  const edges: ResolvedDiagramEdge[] = validEdges.map((edge) => {
+  const nodeOrderRank = new Map<string, number>();
+  orderedNodes.forEach(({ node }, idx) => nodeOrderRank.set(node.id, idx));
+  const sortedValidEdges = [...validEdges].sort((a, b) => {
+    const fa = nodeOrderRank.get(a.from_id) ?? 999;
+    const fb = nodeOrderRank.get(b.from_id) ?? 999;
+    if (fa !== fb) return fa - fb;
+    const ta = nodeOrderRank.get(a.to_id) ?? 999;
+    const tb = nodeOrderRank.get(b.to_id) ?? 999;
+    return ta - tb;
+  });
+  const pairSet = new Set(sortedValidEdges.map((e) => `${e.from_id}::${e.to_id}`));
+  const edges: ResolvedDiagramEdge[] = sortedValidEdges.map((edge) => {
     const fromRect = rectById.get(edge.from_id)!;
     const toRect = rectById.get(edge.to_id)!;
     const hasReverse = pairSet.has(`${edge.to_id}::${edge.from_id}`);
@@ -2096,13 +2272,17 @@ function estimateSlotHeight(
 
   if (primary.type === "wb_note") {
     const clean = normalizeBlockText(primary.text);
+    const isCitation = isCitationNoteText(clean);
     const charsPerLine = Math.max(
       10,
-      Math.floor((slotWidth - 48) / (8.2 * HANDWRITTEN_WIDTH_FACTOR))
+      Math.floor((slotWidth - (isCitation ? 48 : 68)) / (8.2 * HANDWRITTEN_WIDTH_FACTOR))
     );
     const lines = estimateWrappedLines(clean, charsPerLine);
-    // Accounts for NOTE badge row + handwritten glyph advance (1.12x) + +8px safe buffer
-    return Math.max(106, 74 + lines * 24);
+    // Standard notes render in a hand-drawn scalloped cloud (+48px scallop clearance);
+    // long multi-link source citations keep the NOTE card box
+    return isCitation
+      ? Math.max(106, 74 + lines * 24)
+      : Math.max(96, 66 + lines * 24);
   }
 
   if (primary.type === "wb_heading") {
@@ -3257,8 +3437,9 @@ const DiagramBlockView: React.FC<{
     [action, slotWidth]
   );
 
-  // Match each diagram node's label (+ sublabel) against WordBoundary timings,
-  // ensuring parent containers always trigger on or before their first child node.
+  // Stage 15.1 Monotonic Topological Causal Trigger Sequence:
+  // Nodes trace strictly in directed causal order (root/source -> outgoing arrow -> target),
+  // clamping WordBoundary triggers monotonically so middle boxes never draw before roots.
   const nodeTriggerMsMap = useMemo(() => {
     const map = new Map<string, number | null>();
     if (metrics.orderedNodes.length === 0) return map;
@@ -3266,19 +3447,32 @@ const DiagramBlockView: React.FC<{
     const texts = metrics.orderedNodes.map(({ node }) =>
       [node.label, node.sublabel ?? ""].join(" ").trim()
     );
-    const triggers = computeItemTriggerMsList(texts, wordTimings);
+    const rawTriggers = computeItemTriggerMsList(texts, wordTimings);
+
+    let lastMs = -1;
     metrics.orderedNodes.forEach(({ node }, idx) => {
-      map.set(node.id, triggers[idx] ?? null);
+      const raw = rawTriggers[idx] ?? null;
+      if (raw !== null) {
+        const clamped = lastMs >= 0 ? Math.max(raw, lastMs + 280) : raw;
+        map.set(node.id, clamped);
+        lastMs = clamped;
+      } else if (lastMs >= 0) {
+        const synthesized = lastMs + 340;
+        map.set(node.id, synthesized);
+        lastMs = synthesized;
+      } else {
+        map.set(node.id, null);
+      }
     });
 
-    // Pull parent container trigger earlier if any child matches before its container
+    // Pull parent container trigger earlier so enclosing boxes draw on or before their first child
     for (const { node } of metrics.orderedNodes) {
       if (!node.parent_id) continue;
       const childT = map.get(node.id);
       const parentT = map.get(node.parent_id);
       if (childT != null) {
         if (parentT == null || childT < parentT) {
-          map.set(node.parent_id, Math.max(0, childT - 120));
+          map.set(node.parent_id, Math.max(0, childT - 140));
         }
       }
     }
@@ -3299,19 +3493,28 @@ const DiagramBlockView: React.FC<{
       ? currentTimeMs + WORD_SYNC_LEAD_MS
       : 0;
 
+  // Enforce causal sequence: root/source node -> outgoing arrow -> downstream node
   const totalNodes = Math.max(1, metrics.orderedNodes.length);
   const nodeTriggeredMap = new Map<string, boolean>();
+  let allPrevTriggered = true;
   metrics.orderedNodes.forEach(({ node }, idx) => {
     if (diagramInstant || clampedStep >= 0.92) {
       nodeTriggeredMap.set(node.id, true);
       return;
     }
     const triggerMs = nodeTriggerMsMap.get(node.id) ?? null;
+    let readyNow: boolean;
     if (canUseWordTiming && triggerMs !== null) {
-      nodeTriggeredMap.set(node.id, syncedTimeMs >= triggerMs);
+      readyNow = syncedTimeMs >= triggerMs;
     } else {
       const threshold = 0.04 + (idx / totalNodes) * 0.68;
-      nodeTriggeredMap.set(node.id, clampedStep >= threshold);
+      readyNow = clampedStep >= threshold;
+    }
+    // Strictly preserve topological sequence: never jump ahead to a later node before earlier ones
+    const triggered = allPrevTriggered && readyNow;
+    nodeTriggeredMap.set(node.id, triggered);
+    if (!triggered) {
+      allPrevTriggered = false;
     }
   });
 
@@ -3397,12 +3600,10 @@ const DiagramBlockView: React.FC<{
           );
         })}
 
-        {/* 3. Directed rough connector arrows (triggered right after both endpoints appear) */}
+        {/* 3. Directed rough connector arrows (trace out of source node -> target in causal order) */}
         {metrics.edges.map((item, eIdx) => {
           const edgeTriggered =
-            diagramInstant ||
-            (Boolean(nodeTriggeredMap.get(item.edge.from_id)) &&
-              Boolean(nodeTriggeredMap.get(item.edge.to_id)));
+            diagramInstant || Boolean(nodeTriggeredMap.get(item.edge.from_id));
           return (
             <AnimatedDiagramEdgeArrow
               key={`dedge-${item.edge.from_id}-${item.edge.to_id}-${eIdx}`}
@@ -4483,8 +4684,10 @@ const HeadingBlockView: React.FC<{
 );
 
 /**
- * Boxless open-paper equation / highlight / prose block with optional animated
- * yellow highlighter sweep left-to-right behind the ink (Safeguard #1: equations stay LTR).
+ * Stage 15.1: Tight Text-Fitted Highlighter Block (wb_equation / wb_highlight / wb_text).
+ * Measures exact rendered inner text bounds (x, width, height) via onLayout and draws
+ * createRoughHighlighterPath strictly around that measured text box + 14px horizontal padding
+ * on each side — NEVER stretching 100% across the screen width.
  */
 const HighlightedTextBlockView: React.FC<{
   blockId: string;
@@ -4512,22 +4715,53 @@ const HighlightedTextBlockView: React.FC<{
     resetKey,
     handwrittenFontsReady,
   }) => {
-    const [boxSize, setBoxSize] = useState({ width: 0, height: 0 });
+    const [lineRects, setLineRects] = useState<
+      Record<number, { x: number; width: number; height: number }>
+    >({});
+    const [wrapHeight, setWrapHeight] = useState(0);
     const token = getColorToken(color);
     const lines = text ? text.split("\n") : [""];
 
-    const hlW = Math.min(
-      Math.max(96, slotWidth - 16),
-      boxSize.width > 12 ? boxSize.width + 16 : Math.max(120, slotWidth * 0.72)
+    const isEquation = variant === "equation";
+    const isProse = variant === "text";
+    const primaryRtl = forceLtr ? false : isArabicDominant(text);
+
+    // Aggregate tight measured text bounding box across rendered lines
+    const measuredEntries = Object.values(lineRects).filter((r) => r.width > 1);
+    const maxLineChars = Math.max(1, ...lines.map((l) => l.length));
+    const fallbackW = Math.min(
+      Math.max(64, slotWidth - 44),
+      Math.max(56, maxLineChars * 10.2)
     );
-    const hlH = Math.max(28, boxSize.height > 12 ? boxSize.height + 6 : 34);
+    const measuredTextW =
+      measuredEntries.length > 0
+        ? Math.max(...measuredEntries.map((r) => r.width))
+        : fallbackW;
+    const measuredTextX =
+      measuredEntries.length > 0
+        ? Math.min(...measuredEntries.map((r) => r.x))
+        : isEquation
+        ? Math.max(0, (slotWidth - 24 - fallbackW) / 2)
+        : primaryRtl
+        ? Math.max(0, slotWidth - 24 - fallbackW)
+        : 0;
+
+    // Strictly fit highlighter to measured text box + 14px horizontal padding on each side
+    const HL_PAD_X = 14;
+    const maxAvailW = Math.max(64, slotWidth - 8);
+    const hlLeft = Math.max(0, measuredTextX - HL_PAD_X);
+    const hlW = Math.min(
+      maxAvailW - hlLeft,
+      Math.max(48, measuredTextW + HL_PAD_X * 2)
+    );
+    const hlH = Math.max(28, wrapHeight > 12 ? wrapHeight + 4 : 34);
 
     const hlWithTrail = useMemo(() => {
       if (!highlightEnabled) {
         return { path: makeEmptySkiaPath(), trail: [] as PenTrailPoint[] };
       }
       return createRoughHighlighterPath(
-        { x: 4, y: 2, width: Math.max(24, hlW - 8), height: hlH - 4 },
+        { x: 2, y: 2, width: Math.max(20, hlW - 4), height: hlH - 4 },
         hashSeed(`hl-${blockId}`)
       );
     }, [highlightEnabled, blockId, hlW, hlH]);
@@ -4556,9 +4790,6 @@ const HighlightedTextBlockView: React.FC<{
       }
     }, [highlightEnabled, resetKey, triggered, instantComplete, hlProgress]);
 
-    const isEquation = variant === "equation";
-    const isProse = variant === "text";
-
     return (
       <View
         style={[
@@ -4572,20 +4803,17 @@ const HighlightedTextBlockView: React.FC<{
             isEquation && styles.highlightWrapCenter,
           ]}
           onLayout={(e) => {
-            const { width, height } = e.nativeEvent.layout;
-            if (
-              Math.abs(width - boxSize.width) > 3 ||
-              Math.abs(height - boxSize.height) > 3
-            ) {
-              setBoxSize({ width, height });
+            const h = Math.ceil(e.nativeEvent.layout.height);
+            if (h > 0 && Math.abs(h - wrapHeight) > 2) {
+              setWrapHeight(h);
             }
           }}
         >
           {highlightEnabled && (
             <Canvas
               style={[
-                styles.highlighterCanvas,
-                { width: hlW, height: hlH },
+                styles.highlighterCanvasTight,
+                { left: hlLeft, width: hlW, height: hlH },
               ]}
               pointerEvents="none"
             >
@@ -4615,27 +4843,234 @@ const HighlightedTextBlockView: React.FC<{
                 durationMs={INK_SWEEP_CARD_MS}
                 delayMs={lIdx * 90}
               >
-                <Text
+                <View
                   style={[
+                    styles.headingTextWrap,
                     isEquation
-                      ? styles.equationText
-                      : isProse
-                      ? styles.openText
-                      : styles.highlightKeyText,
-                    getHandwrittenFontStyle(line, role, handwrittenFontsReady),
-                    forceLtr
-                      ? styles.equationLtrText
+                      ? styles.alignCenter
                       : rtl
-                      ? styles.rtlTextAlign
-                      : styles.ltrTextAlign,
-                    { color: token.text },
+                      ? styles.alignEnd
+                      : styles.alignStart,
                   ]}
                 >
-                  {line}
-                </Text>
+                  <Text
+                    onLayout={(e) => {
+                      const { x, width, height } = e.nativeEvent.layout;
+                      const rx = Math.floor(x);
+                      const rw = Math.ceil(width);
+                      const rh = Math.ceil(height);
+                      setLineRects((prev) => {
+                        const existing = prev[lIdx];
+                        if (
+                          existing &&
+                          Math.abs(existing.x - rx) <= 2 &&
+                          Math.abs(existing.width - rw) <= 2 &&
+                          Math.abs(existing.height - rh) <= 2
+                        ) {
+                          return prev;
+                        }
+                        return { ...prev, [lIdx]: { x: rx, width: rw, height: rh } };
+                      });
+                    }}
+                    style={[
+                      isEquation
+                        ? styles.equationText
+                        : isProse
+                        ? styles.openText
+                        : styles.highlightKeyText,
+                      getHandwrittenFontStyle(line, role, handwrittenFontsReady),
+                      forceLtr
+                        ? styles.equationLtrText
+                        : rtl
+                        ? styles.rtlTextAlign
+                        : styles.ltrTextAlign,
+                      { color: token.text },
+                    ]}
+                  >
+                    {line}
+                  </Text>
+                </View>
               </InkSweepReveal>
             );
           })}
+        </View>
+      </View>
+    );
+  }
+);
+
+/**
+ * Stage 15.1: Hand-Drawn Scalloped Cloud Callout for standard wb_note blocks.
+ * Writes handwritten note text first, then traces an organic 8-12 arc scalloped
+ * cloud outline around measured text bounds (+22px padding) with live AnimatedPenNib,
+ * fading in a subtle warm cream tint (rgba(254, 243, 199, 0.32)).
+ */
+const NoteCloudBlockView: React.FC<{
+  blockId: string;
+  text: string;
+  color: VisualAction["color"];
+  slotWidth: number;
+  triggered: boolean;
+  instantComplete: boolean;
+  resetKey: string;
+  handwrittenFontsReady: boolean;
+}> = React.memo(
+  ({
+    blockId,
+    text,
+    color,
+    slotWidth,
+    triggered,
+    instantComplete,
+    resetKey,
+    handwrittenFontsReady,
+  }) => {
+    const [textBox, setTextBox] = useState({ width: 0, height: 0 });
+    const token = getColorToken(color);
+    const lines = text ? text.split("\n") : [""];
+
+    const CLOUD_PAD = 22;
+    const maxCloudW = Math.max(140, slotWidth - 8);
+    const cloudW = Math.min(
+      maxCloudW,
+      textBox.width > 12
+        ? Math.max(132, textBox.width + CLOUD_PAD * 2)
+        : Math.min(maxCloudW, Math.max(180, slotWidth * 0.84))
+    );
+    const cloudH = Math.max(
+      68,
+      textBox.height > 12 ? textBox.height + CLOUD_PAD * 2 : 76
+    );
+
+    const cloudPaths = useMemo(
+      () =>
+        createRoughCloudWithTrail(
+          { x: 4, y: 4, width: Math.max(40, cloudW - 8), height: Math.max(36, cloudH - 8) },
+          hashSeed(`cloud-${blockId}`)
+        ),
+      [blockId, cloudW, cloudH]
+    );
+
+    const cloudProgress = useSharedValue(instantComplete ? 1 : 0);
+    useEffect(() => {
+      if (instantComplete) {
+        cloudProgress.value = 1;
+        return;
+      }
+      if (triggered) {
+        cloudProgress.value = 0;
+        // Write text first (~300ms), then trace scalloped cloud outline around it
+        cloudProgress.value = withDelay(
+          300,
+          withTiming(1, {
+            duration: 560,
+            easing: Easing.out(Easing.cubic),
+          })
+        );
+      } else {
+        cloudProgress.value = 0;
+      }
+    }, [resetKey, triggered, instantComplete, cloudProgress]);
+
+    const cloudFillOpacity = useDerivedValue(() => {
+      if (instantComplete) return 1;
+      const p = cloudProgress.value;
+      if (p <= 0.35) return 0;
+      return Math.min(1, (p - 0.35) / 0.65);
+    });
+
+    const cloudStrokeColor =
+      color === "blue"
+        ? "#2563EB"
+        : color === "green"
+        ? "#0D9488"
+        : color === "red"
+        ? "#DC2626"
+        : "#D97706";
+
+    return (
+      <View style={styles.noteCloudOuter}>
+        <View
+          style={[
+            styles.noteCloudStage,
+            { width: cloudW, minHeight: cloudH },
+          ]}
+        >
+          <Canvas
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              width: cloudW,
+              height: cloudH,
+            }}
+            pointerEvents="none"
+          >
+            <Path
+              path={cloudPaths.fillPath}
+              style="fill"
+              color="rgba(254, 243, 199, 0.32)"
+              opacity={cloudFillOpacity}
+            />
+            <Path
+              path={cloudPaths.outlinePath}
+              style="stroke"
+              strokeWidth={1.85}
+              strokeCap="round"
+              strokeJoin="round"
+              color={cloudStrokeColor}
+              start={0}
+              end={instantComplete ? 1 : cloudProgress}
+            />
+            {!instantComplete && triggered && cloudPaths.trail.length >= 2 && (
+              <AnimatedPenNib
+                trail={cloudPaths.trail}
+                progress={cloudProgress}
+                active={triggered && !instantComplete}
+                color={cloudStrokeColor}
+              />
+            )}
+          </Canvas>
+
+          <View
+            style={styles.noteCloudTextInner}
+            onLayout={(e) => {
+              const w = Math.ceil(e.nativeEvent.layout.width);
+              const h = Math.ceil(e.nativeEvent.layout.height);
+              if (
+                (w > 0 && Math.abs(w - textBox.width) > 3) ||
+                (h > 0 && Math.abs(h - textBox.height) > 3)
+              ) {
+                setTextBox({ width: w, height: h });
+              }
+            }}
+          >
+            {lines.map((line, lIdx) => {
+              const rtl = isArabicDominant(line);
+              return (
+                <InkSweepReveal
+                  key={`cnote-${lIdx}`}
+                  triggered={triggered}
+                  instantComplete={instantComplete}
+                  isRtl={rtl}
+                  resetKey={`${resetKey}-cl${lIdx}`}
+                  durationMs={INK_SWEEP_NOTE_MS}
+                  delayMs={lIdx * 85}
+                >
+                  <Text
+                    style={[
+                      styles.noteCloudText,
+                      getHandwrittenFontStyle(line, "note", handwrittenFontsReady),
+                      rtl ? styles.rtlTextAlign : styles.ltrTextAlign,
+                      { color: token.text },
+                    ]}
+                  >
+                    {line}
+                  </Text>
+                </InkSweepReveal>
+              );
+            })}
+          </View>
         </View>
       </View>
     );
@@ -4943,6 +5378,20 @@ const SlotContentView: React.FC<{
   }
 
   if (primary.type === "wb_note") {
+    if (!isCitationNoteText(primaryFullText)) {
+      return (
+        <NoteCloudBlockView
+          blockId={blockId}
+          text={primaryFullText}
+          color={primary.color}
+          slotWidth={slotWidth}
+          triggered={primaryTriggered}
+          instantComplete={primaryInstant}
+          resetKey={`${stepResetKey}-${primaryItem.key}`}
+          handwrittenFontsReady={handwrittenFontsReady}
+        />
+      );
+    }
     const token = getColorToken(primary.color);
     const lines = primaryFullText ? primaryFullText.split("\n") : [""];
     return (
@@ -5370,17 +5819,20 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     ],
   }));
 
-  // Floating "Reset View" button smoothly appears whenever zoomed/panned away from center
+  // Floating "Reset View" button appears ONLY when the user manually pans/pinches
+  // so Auto-Follow Camera motion and end-of-lecture overview never overlap the bottom note
   const resetButtonAnimStyle = useAnimatedStyle(() => {
-    const isMoved =
-      Math.abs(scale.value - 1) > 0.04 ||
-      Math.abs(translateX.value) > 14 ||
-      Math.abs(translateY.value) > 14;
+    const showReset =
+      userHasManuallyPanned.value &&
+      (Math.abs(scale.value - 1) > 0.04 ||
+        Math.abs(translateX.value) > 14 ||
+        Math.abs(translateY.value) > 14);
     return {
-      opacity: withTiming(isMoved ? 1 : 0, { duration: 180 }),
+      opacity: withTiming(showReset ? 1 : 0, { duration: 180 }),
+      pointerEvents: showReset ? ("auto" as const) : ("none" as const),
       transform: [
-        { translateY: withTiming(isMoved ? 0 : 80, { duration: 200 }) },
-        { scale: withTiming(isMoved ? 1 : 0.88, { duration: 180 }) },
+        { translateY: withTiming(showReset ? 0 : 96, { duration: 200 }) },
+        { scale: withTiming(showReset ? 1 : 0.88, { duration: 180 }) },
       ],
     };
   });
@@ -5465,9 +5917,9 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     safeSteps.length > 0 &&
     safeIndex === safeSteps.length - 1 &&
     !isPlaying &&
-    clampedProgress >= 0.99;
+    clampedProgress >= 0.95;
 
-  // Stage 15 Smooth Auto-Follow Camera & End-of-Lecture Overview Zoom-Out
+  // Stage 15.1 Smooth Auto-Follow Camera & End-of-Turn Overview Zoom-Out
   useEffect(() => {
     if (
       !currentStep ||
@@ -5484,7 +5936,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
     const visibleHeight = Math.max(120, visibleBottom - visibleTop);
     const visibleCenterY = (visibleTop + visibleBottom) / 2;
 
-    // 1. End-of-lecture overview zoom-out: frame the full accumulated whiteboard cleanly
+    // 1. End-of-lecture / end-of-follow-up-turn overview zoom-out
     if (isLectureFinished) {
       let allMinY = Infinity;
       let allMaxY = -Infinity;
@@ -5498,7 +5950,7 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
       if (!Number.isFinite(allMinY) || !Number.isFinite(allMaxY)) return;
       const totalH = Math.max(1, allMaxY - allMinY);
       const overviewScale = Math.max(
-        0.62,
+        0.52,
         Math.min(1.0, (visibleHeight - 16) / totalH)
       );
       const contentMidY = (allMinY + allMaxY) / 2;
@@ -5856,8 +6308,12 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                   const isCode = primary.type === "wb_code";
                   const isHeading = primary.type === "wb_heading";
                   const isNote = primary.type === "wb_note";
+                  const isCitationNote =
+                    isNote && isCitationNoteText(normalizeBlockText(primary.text));
                   const isFlowCard = primary.type === "wb_flow_card";
-                  const isBoxedCard = isCode || isNote || isFlowCard;
+                  // Standard wb_note renders in its own hand-drawn scalloped cloud;
+                  // only code, flow cards, and long source-citation notes draw rectangular card frames
+                  const isBoxedCard = isCode || isCitationNote || isFlowCard;
                   const isCompact =
                     block.slot === "left_col" || block.slot === "right_col";
                   const radius = isNote ? 10 : 16;
@@ -5993,12 +6449,16 @@ export const SmartBoardCanvas: React.FC<SmartBoardCanvasProps> = ({
                 const isTable = primaryType === "wb_table";
                 const isDiagram = primaryType === "wb_diagram";
                 const isPlot = primaryType === "wb_plot";
+                const isCloudNote =
+                  primaryType === "wb_note" &&
+                  !isCitationNoteText(normalizeBlockText(block.items[0]?.action.text));
                 const isBoxless =
                   primaryType === "wb_heading" ||
                   primaryType === "wb_bullet" ||
                   primaryType === "wb_text" ||
                   primaryType === "wb_equation" ||
-                  primaryType === "wb_highlight";
+                  primaryType === "wb_highlight" ||
+                  isCloudNote;
                 const isCompact =
                   block.slot === "left_col" || block.slot === "right_col";
 
@@ -6142,6 +6602,9 @@ const styles = StyleSheet.create({
   alignStart: {
     alignItems: "flex-start",
   },
+  alignCenter: {
+    alignItems: "center",
+  },
   headingBoxWithIcon: {
     paddingLeft: 36,
     paddingRight: 10,
@@ -6177,6 +6640,32 @@ const styles = StyleSheet.create({
   highlighterCanvas: {
     position: "absolute",
     alignSelf: "center",
+  },
+  highlighterCanvasTight: {
+    position: "absolute",
+    top: 0,
+  },
+  noteCloudOuter: {
+    width: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  noteCloudStage: {
+    position: "relative",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 22,
+    paddingVertical: 22,
+  },
+  noteCloudTextInner: {
+    maxWidth: "100%",
+    gap: 4,
+  },
+  noteCloudText: {
+    fontSize: 14,
+    lineHeight: 21,
+    fontWeight: "500",
+    includeFontPadding: false,
   },
   equationLtrText: {
     textAlign: "center",
